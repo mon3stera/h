@@ -1,0 +1,18 @@
+[package]
+name = "h"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-openai = { version = "0.41.1", features = ["_api", "model", "responses", "image"] }
+async-trait = "0.1.91"
+crossterm = "0.29.0"
+futures = "0.3.33"
+parking_lot = "0.12.5"
+ratatui = "0.30.2"
+ratatui-textarea = "0.9.2"
+run = "0.5.2"
+tokio = { version = "1.53.0", features = ["full"] }
+unicode-width = "0.2.2"
+
