@@ -3,9 +3,7 @@ use std::collections::BTreeMap;
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    types::responses::{
-        CreateResponseArgs, EasyInputMessage, InputItem, OutputItem, ResponseStreamEvent,
-    },
+    types::responses::{CreateResponseArgs, EasyInputMessage, InputItem, ResponseStreamEvent},
 };
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
@@ -99,6 +97,17 @@ impl OpenAIProvider {
         (prompt, pending)
     }
 
+    fn build_input(&self, prompt: impl AsRef<str>) -> Vec<InputItem> {
+        let prompt = prompt.as_ref();
+
+        let mut inputs = Vec::<InputItem>::new();
+
+        inputs.push(EasyInputMessage::from(prompt).into());
+        inputs.extend(self.context.histories().iter().cloned());
+
+        inputs
+    }
+
     fn record_history(&mut self, event: &ResponseStreamEvent) -> anyhow::Result<()> {
         match event {
             ResponseStreamEvent::ResponseOutputItemDone(item) => {
@@ -116,7 +125,10 @@ impl OpenAIProvider {
 
                 let histories = self.context.histories_mut();
 
-                histories.push(EasyInputMessage::from(prompt).into());
+                if !prompt.is_empty() {
+                    histories.push(EasyInputMessage::from(prompt).into());
+                }
+
                 histories.extend(items);
             }
             _ => {}
@@ -131,11 +143,14 @@ impl Provider for OpenAIProvider {
     type StreamEvent = async_openai::types::responses::ResponseStreamEvent;
 
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+        self.record_history(&event)?;
+
         match &event {
             ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                 return Ok(ProviderSignal::TextDelta(delta.delta.clone()));
             }
-            _ => anyhow::bail!("Unsupported Stream Event"),
+            ResponseStreamEvent::ResponseCompleted(_) => Ok(ProviderSignal::Completed),
+            _ => Ok(ProviderSignal::Unsupported),
         }
     }
 
@@ -147,7 +162,7 @@ impl Provider for OpenAIProvider {
 
         let request = CreateResponseArgs::default()
             .model(&self.config.model)
-            .input(&prompt)
+            .input(self.build_input(&prompt))
             .stream(true)
             .build()?;
 

@@ -1,25 +1,46 @@
-use std::io::{Read, stdout};
+use std::sync::Arc;
 
-use anyhow::Context;
-use async_openai::{traits::EventType, types::responses::ResponseStreamEvent};
-use futures::StreamExt;
-use std::io::Write;
+use iocraft::{ElementExt, element};
+use tokio::sync::Mutex;
 
 use crate::{
-    agent::Agent,
-    ui::{render_ui, run_ui},
+    agent::{Agent, NextTurn},
+    provider::openai::{OpenAIProvider, OpenAIProviderConfig},
+    ui2::UI,
 };
-
-use crossterm::event as crossterm_event;
 
 mod agent;
 mod bus;
 mod context;
 mod event;
 mod provider;
-mod ui;
+// mod ui;
+mod marcos;
+mod ui2;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run_ui()
+    let provider = OpenAIProvider::from_config(OpenAIProviderConfig::from_env()?);
+
+    let mut agent = Agent::new(provider);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    let bus_rx = agent.subscribe();
+
+    tokio::spawn(async move {
+        while let Some(prompt) = rx.recv().await {
+            if let Err(e) = agent.next_turn(NextTurn::Prompt(prompt)).await {
+                panic!("Failed to do next turn {e}")
+            };
+        }
+
+        anyhow::Ok(())
+    });
+
+    element!(UI(committer: Some(tx), event_rx: Arc::new(Mutex::new(Some(bus_rx)))))
+        .render_loop()
+        .await?;
+
+    Ok(())
 }

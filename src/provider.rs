@@ -4,7 +4,7 @@ use futures::Stream;
 
 use crate::event::ProviderSignal;
 
-mod openai;
+pub mod openai;
 
 type ProviderEventStream<C> = Pin<Box<dyn Stream<Item = anyhow::Result<C>> + Send>>;
 

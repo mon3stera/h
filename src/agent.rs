@@ -1,10 +1,11 @@
-use crate::{bus::EventBus, context::Context, event::AgentEvent, provider::Provider};
-use anyhow::Context as AnyhowContext;
-use futures::{Stream, StreamExt};
-use tokio::sync::{
-    broadcast::{self, Receiver, Sender},
-    mpsc::UnboundedReceiver,
-};
+use crate::{bus::EventBus, event::AgentEvent, provider::Provider};
+use futures::StreamExt;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+pub enum NextTurn {
+    Prompt(String),
+    Continue,
+}
 
 pub struct Agent<P> {
     bus: EventBus<AgentEvent>,
@@ -24,5 +25,30 @@ where
 
     pub fn subscribe(&self) -> UnboundedReceiver<AgentEvent> {
         self.bus.subscribe()
+    }
+
+    pub async fn next_turn(&mut self, turn: NextTurn) -> anyhow::Result<()> {
+        match turn {
+            NextTurn::Prompt(prompt) => {
+                let mut stream = self.provider.stream(prompt).await?;
+
+                loop {
+                    match stream.next().await {
+                        Some(Ok(event)) => {
+                            let signal = self.provider.handle(event).await?;
+
+                            let agent_event: AgentEvent = signal.into();
+
+                            self.bus.broadcast(agent_event);
+                        }
+                        Some(e) => {
+                            e?;
+                        }
+                        None => break Ok(()),
+                    }
+                }
+            }
+            NextTurn::Continue => todo!(),
+        }
     }
 }

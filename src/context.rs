@@ -1,10 +1,3 @@
-use std::{fmt::Write, str::FromStr};
-
-use async_openai::types::responses::{
-    EasyInputMessage, FunctionToolCall, InputItem, InputParam, Item, ItemReference,
-    ItemReferenceType, MessageItem, OutputItem, OutputMessage, Role,
-};
-
 pub struct Context<M> {
     buf: String,
     histories: Vec<M>,
