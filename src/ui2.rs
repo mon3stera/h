@@ -111,10 +111,10 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
         })
     });
 
-    let (width, _) = hooks.use_terminal_size();
+    let (width, height) = hooks.use_terminal_size();
 
     element! {
-        View(width: width, flex_direction: FlexDirection::Column) {
+        View(width: width, height: height, flex_direction: FlexDirection::Column) {
             View(width: 100pct, flex_grow: 1.0_f32, overflow: Overflow::Hidden) {
                 DisplayArea(units: units.read().iter().cloned().collect::<Vec<_>>())
             }
@@ -139,7 +139,7 @@ fn DisplayArea<'a>(mut hooks: Hooks, props: &DisplayAreaProp) -> impl Into<AnyEl
     let (width, _) = hooks.use_terminal_size();
 
     element! {
-        View(flex_direction: FlexDirection::Column) {
+        View(width: 100pct, flex_direction: FlexDirection::Column, row_gap: 1) {
             #(props.units.iter().map(|unit| {
                 match unit {
                     RenderUnit::Text(text) => element! { Text(content: format!("{}", text.as_str()), color: Some(Color::Cyan)) },

@@ -16,6 +16,7 @@ mod event;
 mod provider;
 // mod ui;
 mod marcos;
+mod tool;
 mod ui2;
 
 #[tokio::main]
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     element!(UI(committer: Some(tx), event_rx: Arc::new(Mutex::new(Some(bus_rx)))))
         .render_loop()
+        .fullscreen()
         .await?;
 
     Ok(())

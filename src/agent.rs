@@ -1,4 +1,8 @@
-use crate::{bus::EventBus, event::AgentEvent, provider::Provider};
+use crate::{
+    bus::EventBus,
+    event::AgentEvent,
+    provider::{Provider, TurnStart},
+};
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -30,7 +34,10 @@ where
     pub async fn next_turn(&mut self, turn: NextTurn) -> anyhow::Result<()> {
         match turn {
             NextTurn::Prompt(prompt) => {
-                let mut stream = self.provider.stream(prompt).await?;
+                let mut stream = self
+                    .provider
+                    .stream(TurnStart::UserMessage(prompt.into()))
+                    .await?;
 
                 loop {
                     match stream.next().await {
