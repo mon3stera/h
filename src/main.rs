@@ -4,38 +4,51 @@ use iocraft::{ElementExt, element};
 use tokio::sync::Mutex;
 
 use crate::{
-    agent::{Agent, NextTurn},
+    agent::Agent,
     provider::openai::{OpenAIProvider, OpenAIProviderConfig},
-    ui2::UI,
+    ui::UI,
 };
 
 mod agent;
 mod bus;
 mod context;
 mod event;
+mod logger;
 mod provider;
-// mod ui;
-mod marcos;
 mod tool;
-mod ui2;
+mod ui;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _logging_guard = logger::init(".h")?;
+    tracing::info!(event = "app.starting");
+
     let provider = OpenAIProvider::from_config(OpenAIProviderConfig::from_env()?);
 
     let mut agent = Agent::new(provider);
+    agent
+        .with_internal_tools()
+        .with_global_prompts()
+        .await?
+        .initialize()?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
 
-    let bus_rx = agent.subscribe();
+    let bus_rx = agent.subscribe_view();
+    tracing::info!(event = "app.ready");
 
     tokio::spawn(async move {
         while let Some(prompt) = rx.recv().await {
-            if let Err(e) = agent.next_turn(NextTurn::Prompt(prompt)).await {
-                panic!("Failed to do next turn {e}")
-            };
+            if agent.continue_turn(prompt).await.is_err() {
+                tracing::error!(
+                    event = "agent.worker.failed",
+                    operation = "continue_turn",
+                    error_class = "agent_turn_error"
+                );
+            }
         }
 
+        tracing::info!(event = "agent.worker.closed");
         anyhow::Ok(())
     });
 
@@ -44,5 +57,6 @@ async fn main() -> anyhow::Result<()> {
         .fullscreen()
         .await?;
 
+    tracing::info!(event = "app.ui.closed");
     Ok(())
 }

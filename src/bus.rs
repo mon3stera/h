@@ -21,6 +21,10 @@ impl<T> EventBus<T> {
         let mut guard = self.subscribers.lock();
 
         guard.push(tx);
+        tracing::debug!(
+            event = "event_bus.subscriber_added",
+            subscriber_count = guard.len()
+        );
 
         rx
     }
@@ -29,12 +33,34 @@ impl<T> EventBus<T> {
     where
         T: Clone,
     {
-        let guard = self.subscribers.lock();
+        let mut guard = self.subscribers.lock();
+        let before = guard.len();
 
-        for subscriber in guard.iter() {
-            subscriber
-                .send(event.clone())
-                .expect("Failed to broadcast event");
+        guard.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+
+        let dropped = before - guard.len();
+        if dropped > 0 {
+            tracing::warn!(
+                event = "event_bus.subscribers_pruned",
+                dropped_subscriber_count = dropped,
+                subscriber_count = guard.len()
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventBus;
+
+    #[test]
+    fn dropped_subscribers_are_pruned_without_panicking() {
+        let bus = EventBus::new();
+        let receiver = bus.subscribe();
+        drop(receiver);
+
+        bus.broadcast(1_u8);
+
+        assert!(bus.subscribers.lock().is_empty());
     }
 }

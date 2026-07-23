@@ -3,9 +3,14 @@ use std::collections::BTreeMap;
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::responses::{
-        CreateResponseArgs, EasyInputMessage, FunctionTool, InputItem, ResponseStreamEvent,
-        Tool as OpenAITool,
+        CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
+        FunctionCallOutputItemParam, FunctionTool, FunctionToolCall,
+        FunctionToolCallOutputResource,
+        InputItem::{self, EasyMessage},
+        Item, MessageType, OutputItem, OutputMessageContent, OutputStatus, ResponseStreamEvent,
+        Role, Tool as OpenAITool,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -13,16 +18,27 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value};
 
 use crate::{
-    context::Context,
-    event::ProviderSignal,
-    provider::{Provider, ProviderEventStream, TurnStart, UserMessage},
-    tool::{ToolDefinition, ToolResult},
+    context::{Context, Message},
+    event::{CompletedReason, ProviderSignal},
+    provider::{Provider, ProviderEventStream},
+    tool::{ToolCall, ToolCallResult, ToolDefinition},
 };
 
 macro_rules! expect_env {
     ($value:expr) => {
         std::env::var($value)?
     };
+}
+
+fn is_ignorable_stream_event(error: &OpenAIError) -> bool {
+    let OpenAIError::JSONDeserialize(_, raw) = error else {
+        return false;
+    };
+
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|event_type| event_type == "response.metadata")
 }
 
 pub struct OpenAIProviderConfig {
@@ -63,17 +79,10 @@ impl OpenAIProviderConfig {
     }
 }
 
-struct PendingItem {
-    item: InputItem,
-}
-
 pub struct OpenAIProvider {
     config: OpenAIProviderConfig,
     client: Client<OpenAIConfig>,
-    context: Context<InputItem>,
     tools: Vec<OpenAITool>,
-    prompt: Mutex<String>,
-    pending: BTreeMap<u32, PendingItem>,
 }
 
 impl OpenAIProvider {
@@ -87,10 +96,7 @@ impl OpenAIProvider {
         Self {
             config,
             client,
-            context: Context::new(),
             tools: Vec::new(),
-            prompt: Mutex::new(String::new()),
-            pending: BTreeMap::new(),
         }
     }
 
@@ -304,60 +310,95 @@ impl OpenAIProvider {
         }
         .into()
     }
+}
 
-    fn take_pending(&mut self) -> (String, BTreeMap<u32, PendingItem>) {
-        let mut prompt = String::new();
-        let mut pending = BTreeMap::new();
-
-        std::mem::swap(&mut prompt, &mut self.prompt.lock());
-        std::mem::swap(&mut pending, &mut self.pending);
-
-        (prompt, pending)
-    }
-
-    fn build_input(&self, messages: &UserMessage) -> Vec<InputItem> {
-        let mut inputs = Vec::<InputItem>::new();
-
-        inputs.extend(self.context.histories().iter().cloned());
-
-        for message in &messages.contents {
-            match message {
-                crate::provider::Message::Text(text) => {
-                    inputs.push(EasyInputMessage::from(text.as_str()).into());
-                }
+impl From<Message> for InputItem {
+    fn from(value: Message) -> Self {
+        match value {
+            Message::User(text) => EasyInputMessage::from(text).into(),
+            Message::System(text) => EasyInputMessage {
+                r#type: MessageType::Message,
+                role: Role::System,
+                content: EasyInputContent::Text(text),
+                phase: None,
+            }
+            .into(),
+            Message::Assistant(text) => EasyInputMessage {
+                r#type: MessageType::Message,
+                role: Role::Assistant,
+                content: EasyInputContent::Text(text),
+                phase: None,
+            }
+            .into(),
+            Message::ToolCall {
+                call_id,
+                arguments,
+                name,
+            } => InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                call_id: call_id,
+                arguments: arguments,
+                namespace: None,
+                name: name,
+                id: None,
+                status: Some(OutputStatus::Completed),
+            })),
+            Message::ToolCallResult { call_id, output } => {
+                InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
+                    call_id: call_id,
+                    output: FunctionCallOutput::Text(output),
+                    id: None,
+                    status: Some(OutputStatus::Completed),
+                }))
             }
         }
-
-        inputs
     }
+}
 
-    fn record_history(&mut self, event: &ResponseStreamEvent) -> anyhow::Result<()> {
-        match event {
-            ResponseStreamEvent::ResponseOutputItemDone(item) => {
-                self.pending.insert(
-                    item.output_index,
-                    PendingItem {
-                        item: item.item.clone().into(),
-                    },
-                );
+impl TryFrom<OutputItem> for Message {
+    type Error = anyhow::Error;
+
+    fn try_from(value: OutputItem) -> Result<Self, Self::Error> {
+        match value {
+            OutputItem::Message(message) => {
+                let text = message
+                    .content
+                    .into_iter()
+                    .map(|o| match o {
+                        OutputMessageContent::OutputText(text) => text.text,
+                        OutputMessageContent::Refusal(text) => text.refusal,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+
+                Ok(Message::Assistant(text))
             }
-            ResponseStreamEvent::ResponseCompleted(_) => {
-                let (prompt, pending) = self.take_pending();
+            OutputItem::FunctionCall(FunctionToolCall {
+                arguments,
+                call_id,
+                name,
+                ..
+            }) => Ok(Message::ToolCall {
+                call_id,
+                name,
+                arguments,
+            }),
+            OutputItem::FunctionCallOutput(FunctionToolCallOutputResource {
+                call_id,
+                output,
+                ..
+            }) => {
+                let text = match output {
+                    FunctionCallOutput::Text(text) => text,
+                    FunctionCallOutput::Content(_) => todo!(),
+                };
 
-                let items = pending.into_values().map(|e| e.item);
-
-                let histories = self.context.histories_mut();
-
-                if !prompt.is_empty() {
-                    histories.push(EasyInputMessage::from(prompt).into());
-                }
-
-                histories.extend(items);
+                Ok(Message::ToolCallResult {
+                    call_id,
+                    output: text,
+                })
             }
-            _ => {}
+            _ => anyhow::bail!("Unsupported Message"),
         }
-
-        Ok(())
     }
 }
 
@@ -366,45 +407,91 @@ impl Provider for OpenAIProvider {
     type StreamEvent = async_openai::types::responses::ResponseStreamEvent;
 
     fn define_tools(&mut self, specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+        let tool_count = specs.len();
         self.tools = specs.into_iter().map(Self::compile_tool).collect();
+        tracing::info!(
+            event = "provider.tools.defined",
+            provider = "openai",
+            tool_count
+        );
         Ok(())
     }
 
-    fn submit_tool_result(&mut self, _result: ToolResult) -> anyhow::Result<()> {
-        todo!("store the OpenAI function call output in the provider context")
-    }
-
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-        self.record_history(&event)?;
-
         match &event {
+            /* ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
+                delta.
+            } */
+            ResponseStreamEvent::ResponseOutputItemDone(done) => match &done.item {
+                OutputItem::FunctionCall(call) => {
+                    tracing::info!(
+                        event = "provider.tool_call.requested",
+                        provider = "openai",
+                        tool_name = call.name
+                    );
+                    let arguments = serde_json::from_str(&call.arguments)?;
+
+                    Ok(ProviderSignal::ToolCallStarted(ToolCall::new(
+                        call.call_id.clone(),
+                        call.name.clone(),
+                        arguments,
+                    )))
+                }
+                OutputItem::FunctionCallOutput(call) => {
+                    let output = match &call.output {
+                        FunctionCallOutput::Text(text) => serde_json::from_str(text)
+                            .unwrap_or_else(|_| Value::String(text.clone())),
+                        FunctionCallOutput::Content(content) => serde_json::to_value(content)?,
+                    };
+
+                    Ok(ProviderSignal::ToolCallCompleted(ToolCallResult::success(
+                        call.call_id.clone(),
+                        output,
+                    )))
+                }
+                _ => Ok(ProviderSignal::Unsupported),
+            },
             ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                 return Ok(ProviderSignal::TextDelta(delta.delta.clone()));
             }
-            ResponseStreamEvent::ResponseCompleted(_) => Ok(ProviderSignal::Completed),
+            ResponseStreamEvent::ResponseCompleted(completed) => {
+                let need_call = completed
+                    .response
+                    .output
+                    .iter()
+                    .any(|e| matches!(e, OutputItem::FunctionCall(_)));
+
+                tracing::info!(
+                    event = "provider.response.completed",
+                    provider = "openai",
+                    completion_reason = if need_call {
+                        "needs_tool_call"
+                    } else {
+                        "final"
+                    }
+                );
+
+                Ok(ProviderSignal::Completed(if need_call {
+                    CompletedReason::NeedCall
+                } else {
+                    CompletedReason::Final
+                }))
+            }
             _ => Ok(ProviderSignal::Unsupported),
         }
     }
 
     async fn stream(
         &self,
-        start: TurnStart,
+        messages: &[Message],
     ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
-        let (input, prompt) = match start {
-            TurnStart::UserMessage(message) => {
-                let prompt = message
-                    .contents
-                    .iter()
-                    .map(|content| match content {
-                        crate::provider::Message::Text(text) => text.as_str(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                (self.build_input(&message), prompt)
-            }
-            TurnStart::Continue => (self.context.histories().to_vec(), String::new()),
-        };
+        let message_count = messages.len();
+        let tool_count = self.tools.len();
+        let input = messages
+            .iter()
+            .cloned()
+            .map(|e| e.into())
+            .collect::<Vec<InputItem>>();
 
         let request = CreateResponseArgs::default()
             .model(&self.config.model)
@@ -418,10 +505,21 @@ impl Provider for OpenAIProvider {
             .responses()
             .create_stream(request)
             .await?
-            .map_err(anyhow::Error::from)
+            .filter_map(|result| async move {
+                match result {
+                    Ok(event) => Some(Ok(event)),
+                    Err(err) if is_ignorable_stream_event(&err) => None,
+                    Err(error) => Some(Err(anyhow::Error::from(error))),
+                }
+            })
             .boxed();
 
-        *self.prompt.lock() = prompt;
+        tracing::info!(
+            event = "provider.stream.opened",
+            provider = "openai",
+            message_count,
+            tool_count
+        );
 
         Ok(stream)
     }

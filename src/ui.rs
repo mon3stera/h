@@ -1,270 +1,62 @@
-use std::{any, time::Duration, vec};
-
-use crossterm::event::{self, Event, KeyCode};
-use ratatui::{
-    Frame, layout::{Constraint, Direction, Layout, Rect}, style::{Color, Style, Styled}, widgets::{Block, Borders, List, Paragraph, Wrap},
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
 };
-use ratatui_textarea::{TextArea, WrapMode};
-use tokio::{
-    sync::mpsc::{Sender, UnboundedReceiver, error::TryRecvError},
-    task::JoinHandle,
+
+use iocraft::prelude::*;
+use tokio::sync::{
+    Mutex,
+    mpsc::{Sender, UnboundedReceiver},
 };
-use unicode_width::UnicodeWidthStr;
 
-use crate::event::AgentEvent;
+use crate::{
+    event::AgentViewEvent,
+    tool::{DisplayBlock, Presentation, ToolCallStatus},
+};
 
-enum RenderUnit {
-    Text(String),
-    Separator,
-    Prompt(String),
-}
-
-impl TryFrom<AgentEvent> for RenderUnit {
+impl TryFrom<AgentViewEvent> for RenderUnit {
     type Error = anyhow::Error;
 
-    fn try_from(value: AgentEvent) -> Result<Self, Self::Error> {
+    fn try_from(value: AgentViewEvent) -> Result<Self, Self::Error> {
         match value {
-            AgentEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
-            AgentEvent::Completed => Ok(RenderUnit::Separator),
-            _ => anyhow::bail!("cannot convert to RenderUnit"),
+            AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
+            AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
+            AgentViewEvent::Completed => Ok(RenderUnit::Separator),
         }
     }
 }
 
-impl TryFrom<&AgentEvent> for RenderUnit {
+impl TryFrom<&AgentViewEvent> for RenderUnit {
     type Error = anyhow::Error;
 
-    fn try_from(value: &AgentEvent) -> Result<Self, Self::Error> {
+    fn try_from(value: &AgentViewEvent) -> Result<Self, Self::Error> {
         value.clone().try_into()
     }
 }
 
-fn is_need_rendered_event(event: &AgentEvent) -> bool {
-    matches!(event, AgentEvent::TextDelta(_) | AgentEvent::Completed)
-}
-
-fn render_ui(
-    frame: &mut Frame<'_>,
-    textarea: &TextArea,
-    units: &[RenderUnit],
+fn parse_units(
+    events: &mut Vec<AgentViewEvent>,
+    units: &mut Vec<RenderUnit>,
 ) -> anyhow::Result<()> {
-    let area = frame.area();
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![
-            Constraint::Min(1),
-            Constraint::Length(textarea_height(textarea, area.width)),
-        ])
-        .split(frame.area());
-
-    render_units(frame, layout[0], units);
-    render_textarea(frame, layout[1], textarea);
-
-    Ok(())
-}
-
-fn preprocess_events(events: &[AgentEvent]) -> anyhow::Result<Vec<RenderUnit>> {
-    let mut units = Vec::new();
-
-    let mut buf = String::new();
-
-    for event in events {
-        match event {
-            AgentEvent::TextDelta(delta) => buf = format!("{}{}", buf, delta),
-            _ if !is_need_rendered_event(event) => {}
-            x => {
-                if !buf.is_empty() {
-                    units.push(RenderUnit::Text(buf.clone()));
-                }
-
-                units.push(x.try_into()?);
-
-                buf = String::new();
-            }
-        }
-    }
-
-    if !buf.is_empty() {
-        units.push(RenderUnit::Text(buf));
-    }
-
-    Ok(units)
-}
-
-fn text_height(width: u16, text: impl AsRef<str>) -> u16 { 
-    text
-        .as_ref()
-        .lines() 
-        .map(|line| {
-            let line_width = UnicodeWidthStr::width(line) as u16;
-            line_width.max(1).div_ceil(width)
-        })
-        .sum()
-} 
-
-fn wrap_str(text: impl AsRef<str>, width: u16) -> Vec<String> {
-    textwrap::wrap(text.as_ref(), width as usize)
-        .into_iter()
-        .map(|c| c.into_owned())
-        .collect()
-}
-
-fn text_unit_constraint(text: impl AsRef<str>, width: u16) -> Constraint {
-    Constraint::Length(text_height(width, text))
-}
-
-fn build_constraints(units: &[RenderUnit], width: u16) -> impl Iterator<Item = Constraint> {
-    units.iter().map(move |e| match e {
-        RenderUnit::Text(text) => text_unit_constraint(text, width),
-        RenderUnit::Separator => Constraint::Length(1),
-        RenderUnit::Prompt(_) => Constraint::Length(3),
-        _ => todo!(),
-    })
-}
-
-fn render_text(frame: &mut Frame<'_>, layout: Rect, text: impl Into<String>) {
-    frame.render_widget(
-        Paragraph::new(text.into()).set_style(Style::default().cyan()).wrap(Wrap { trim: false }),
-        layout,
-    );
-}
-
-fn render_prompt(frame: &mut Frame<'_>, layout: Rect, text: impl Into<String>) {
-    let text = format!("❯ {}", text.into());
-
-    frame.render_widget(
-        Paragraph::new(text)
-            .set_style(Style::default().yellow())
-            .wrap(Wrap { trim: false })
-            .block(Block::new().borders(Borders::ALL)),
-        layout,
-    );
-}
-
-fn render_sep(frame: &mut Frame<'_>, layout: Rect) {
-    let sep = "─".repeat(frame.area().width as usize);
-
-    frame.render_widget(
-        Paragraph::new(sep).set_style(Style::default().cyan()),
-        layout,
-    );
-}
-
-fn render_unit(frame: &mut Frame<'_>, layout: Rect, unit: &RenderUnit) {
-    match unit {
-        RenderUnit::Text(text) => render_text(frame, layout, text),
-        RenderUnit::Separator => render_sep(frame, layout),
-        RenderUnit::Prompt(text) => render_prompt(frame, layout, text),
-        _ => {}
-    }
-}
-
-fn build_list(units: &[RenderUnit], width: u16) -> List {
-    let items = Vec::new();
-
-    
-
-    List::new(items);
-}
-
-fn render_units(frame: &mut Frame<'_>, layout: Rect, units: &[RenderUnit]) {
-    let constrains = build_constraints(&units, frame.area().width);
-
-    let list_units = Vec::new();
-
-    let list = List::new(list_units);
-
-    frame.render_stateful_widget(list, layout, state);
-
-    let sub_layouts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constrains)
-        .split(layout);
-
-    for (unit, sub_layout) in units.iter().zip(sub_layouts.iter()) {
-        render_unit(frame, *sub_layout, unit);
-    }
-}
-
-fn render_textarea(frame: &mut Frame<'_>, layout: Rect, textarea: &TextArea) {
-    let block = Block::new()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    let inner_area = block.inner(layout);
-
-    frame.render_widget(block, layout);
-
-    let [prompt_area, textarea_area] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Length(2), Constraint::Min(1)])
-        .areas(inner_area);
-
-    frame.render_widget(
-        Paragraph::new("❯").style(Style::default().fg(Color::Cyan)),
-        prompt_area,
-    );
-    frame.render_widget(textarea, textarea_area);
-}
-
-fn textarea<'a>() -> TextArea<'a> {
-    let mut textarea = TextArea::default();
-
-    textarea.set_cursor_line_style(Style::default());
-    textarea.set_tab_length(4);
-
-    textarea.set_placeholder_text("Welcome to h!");
-
-    textarea.set_wrap_mode(WrapMode::WordOrGlyph);
-
-    textarea
-}
-
-fn textarea_height(textarea: &TextArea, width: u16) -> u16 {
-    const MAX_HEIGHT: u16 = 10;
-    const MIN_HEIGHT: u16 = 3;
-    const BORDER_HEIGHT: u16 = 2;
-
-    let inner_width = usize::from(width).max(1);
-
-    let visual_lines = textarea
-        .lines()
-        .iter()
-        .map(|line| {
-            let width = UnicodeWidthStr::width(line.as_str());
-            width.saturating_add(2).max(1).div_ceil(inner_width)
-        })
-        .sum::<usize>();
-
-    u16::try_from(visual_lines)
-        .unwrap_or(u16::MAX)
-        .saturating_add(BORDER_HEIGHT)
-        .clamp(MIN_HEIGHT, MAX_HEIGHT)
-}
-
-fn fetch_events(
-    rx: &mut UnboundedReceiver<AgentEvent>,
-    events: &mut Vec<AgentEvent>,
-) -> anyhow::Result<()> {
-    loop {
-        match rx.try_recv() {
-            Ok(event) => events.push(event),
-            Err(TryRecvError::Empty) => break Ok(()),
-            x @ Err(_) => {
-                x?;
-            }
-        }
-    }
-}
-
-fn parse_units(events: &mut Vec<AgentEvent>, units: &mut Vec<RenderUnit>) -> anyhow::Result<()> {
     for unit in preprocess_events(events)? {
         match (units.last_mut(), &unit) {
-            (Some(RenderUnit::Text(t)), RenderUnit::Text(nt)) => t.push_str(nt.as_str()),
-            _ => {
-                units.push(unit);
+            (Some(RenderUnit::Text(text)), RenderUnit::Text(next)) => text.push_str(next.as_str()),
+            (Some(RenderUnit::Separator), RenderUnit::Separator) => {}
+            (_, RenderUnit::Tool(presentation)) => {
+                let current = units.iter_mut().find_map(|unit| match unit {
+                    RenderUnit::Tool(current) if current.call_id == presentation.call_id => {
+                        Some(current)
+                    }
+                    _ => None,
+                });
+
+                match current {
+                    Some(current) => *current = presentation.clone(),
+                    None => units.push(unit),
+                }
             }
+            _ => units.push(unit),
         }
     }
 
@@ -272,57 +64,400 @@ fn parse_units(events: &mut Vec<AgentEvent>, units: &mut Vec<RenderUnit>) -> any
     Ok(())
 }
 
-pub fn run_ui(
-    mut rx: UnboundedReceiver<AgentEvent>,
-    committer: Sender<String>,
-) -> JoinHandle<anyhow::Result<()>> {
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let mut events = Vec::new();
+fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit>> {
+    let mut units = Vec::new();
+    let mut text = String::new();
 
-        let mut units = Vec::new();
+    for event in events {
+        match event {
+            AgentViewEvent::TextDelta(delta) => text.push_str(delta),
+            event => {
+                if !text.is_empty() {
+                    units.push(RenderUnit::Text(std::mem::take(&mut text)));
+                }
 
-        ratatui::run(|terminal| -> anyhow::Result<()> {
-            let mut textarea = textarea();
+                units.push(event.try_into()?);
+            }
+        }
+    }
 
-            loop {
-                terminal.draw(|frame| render_ui(frame, &mut textarea, &units).unwrap())?;
+    if !text.is_empty() {
+        units.push(RenderUnit::Text(text));
+    }
 
-                fetch_events(&mut rx, &mut events)?;
+    Ok(units)
+}
 
-                parse_units(&mut events, &mut units)?;
+#[derive(Debug, Clone)]
+enum RenderUnit {
+    Text(String),
+    Tool(Presentation),
+    Prompt(String),
+    Separator,
+}
 
-                if event::poll(Duration::from_millis(10))? {
-                    if let Event::Key(key) = crossterm::event::read()? {
-                        match key.code {
-                            KeyCode::Esc => {
-                                break Ok(());
-                            }
-                            KeyCode::Enter => {
-                                if !textarea.is_empty() {
-                                    let prompt = textarea
-                                        .lines()
-                                        .iter()
-                                        .filter(|e| !e.is_empty())
-                                        .map(|e| e.to_string())
-                                        .collect::<Vec<String>>()
-                                        .join("");
+#[derive(Debug, Props, Default)]
+pub struct UIProp {
+    pub committer: Option<Sender<String>>,
+    pub event_rx: Arc<Mutex<Option<UnboundedReceiver<AgentViewEvent>>>>,
+}
 
-                                    committer.blocking_send(prompt.clone())?;
+#[component]
+pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
+    let mut units = hooks.use_state(|| Vec::<RenderUnit>::new());
 
-                                    textarea.clear();
+    let event_rx = props.event_rx.clone();
+    hooks.use_future(async move {
+        tracing::info!(event = "ui.event_receiver.started");
+        let mut rx = event_rx.lock().await.take().unwrap();
 
-                                    units.push(RenderUnit::Prompt(prompt))
-                                }
-                            }
-                            _ => {
-                                textarea.input(key);
-                            }
-                        }
-                    }
+        while let Some(event) = rx.recv().await {
+            let mut inner = units.write();
+            if parse_units(&mut vec![event], &mut inner).is_err() {
+                tracing::error!(
+                    event = "ui.view_event.failed",
+                    operation = "parse_units",
+                    error_class = "view_event_parse_error"
+                );
+            }
+        }
+
+        tracing::info!(event = "ui.event_receiver.closed");
+    });
+
+    let committer = props.committer.clone();
+    let input_handler = hooks.use_async_handler(move |s: String| {
+        let committer = committer.clone().unwrap();
+
+        Box::pin(async move {
+            units.write().push(RenderUnit::Prompt(s.clone()));
+            tracing::info!(event = "ui.prompt_submitted");
+            if committer.send(s).await.is_err() {
+                tracing::warn!(
+                    event = "ui.prompt_send.failed",
+                    operation = "prompt_channel_send",
+                    error_class = "prompt_channel_closed"
+                );
+            }
+        })
+    });
+
+    let (width, height) = hooks.use_terminal_size();
+
+    element! {
+        View(width: width, height: height, flex_direction: FlexDirection::Column) {
+            View(width: 100pct, flex_grow: 1.0_f32, overflow: Overflow::Hidden) {
+                ScrollView(
+                    auto_scroll: false,
+                    scrollbar: Some(false),
+                    keyboard_scroll: Some(false),
+                ) {
+                    DisplayArea(units: units.read().iter().cloned().collect::<Vec<_>>())
                 }
             }
-        })?;
 
-        Ok(())
-    })
+            Textarea(on_submit: input_handler)
+        }
+    }
+}
+
+#[derive(Debug, Props, Default)]
+struct RainbowTextProps {
+    content: String,
+}
+
+#[component]
+fn RainbowText(props: &RainbowTextProps) -> impl Into<AnyElement<'static>> {
+    let mut hasher = DefaultHasher::new();
+    props.content.hash(&mut hasher);
+    let start_hue = (hasher.finish() % 360) as f32;
+    let contents: Vec<MixedTextContent> = props
+        .content
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            MixedTextContent::new(character)
+                .color(get_rainbow_color(index, start_hue))
+                .italic()
+        })
+        .collect();
+
+    element! {
+        MixedText(contents: contents)
+    }
+}
+
+fn get_rainbow_color(index: usize, start_hue: f32) -> Color {
+    const SATURATION: f32 = 0.5;
+    const BRIGHTNESS: f32 = 0.9;
+    const HUE_STEP: f32 = 6.0;
+
+    let hue = (start_hue + index as f32 * HUE_STEP) % 360.0;
+    let (r, g, b) = hsv_to_rgb(hue, SATURATION, BRIGHTNESS);
+
+    Color::Rgb { r, g, b }
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (u8, u8, u8) {
+    let chroma = value * saturation;
+    let hue_section = hue / 60.0;
+    let secondary = chroma * (1.0 - (hue_section % 2.0 - 1.0).abs());
+
+    let (r, g, b) = match hue_section {
+        section if section < 1.0 => (chroma, secondary, 0.0),
+        section if section < 2.0 => (secondary, chroma, 0.0),
+        section if section < 3.0 => (0.0, chroma, secondary),
+        section if section < 4.0 => (0.0, secondary, chroma),
+        section if section < 5.0 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+
+    let match_value = value - chroma;
+    let to_byte = |component: f32| ((component + match_value) * 255.0).round() as u8;
+
+    (to_byte(r), to_byte(g), to_byte(b))
+}
+
+#[derive(Debug, Default, Props)]
+struct DisplayAreaProp {
+    units: Vec<RenderUnit>,
+}
+
+#[derive(Props, Default)]
+struct TextareaProp {
+    on_submit: Handler<String>,
+}
+
+fn left_padding_to(s: impl AsRef<str>, min_len: usize) -> String {
+    let s = s.as_ref();
+
+    if s.len() >= min_len {
+        return s.to_string();
+    }
+
+    format!("{}{}", " ".repeat(min_len - s.len()), s)
+}
+
+fn digits(n: usize) -> usize {
+    n.checked_ilog10().unwrap_or(0) as usize + 1
+}
+
+fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
+    let indicator = match &presentation.status {
+        ToolCallStatus::Running => "⟳ ",
+        ToolCallStatus::Succeeded => "● ",
+        ToolCallStatus::Failed { .. } => "✗ ",
+    };
+
+    let target = match &presentation.target {
+        Some(target) => target.as_str(),
+        None => "unknown",
+    };
+
+    let title = format!(
+        "{} {}({}) <- ({})",
+        indicator, presentation.name, target, presentation.label
+    );
+
+    let title = element! {
+        Text(content: title)
+    }
+    .into_any();
+
+    let mut blocks = Vec::new();
+
+    for block in &presentation.blocks {
+        match block {
+            DisplayBlock::Summary(summary) => {
+                blocks.push(element! { Text(content: format!("   └ {summary}")) }.into_any())
+            }
+            DisplayBlock::TextOutput {
+                content,
+                truncated_lines,
+            } => blocks.push(element! { Text(content: format!("   └ {content}")) }.into_any()),
+            DisplayBlock::CodeBlock {
+                language,
+                content,
+                truncated_lines,
+            } => {
+                let lines = content.lines().collect::<Vec<_>>();
+
+                let max_lines = lines.len().min(*truncated_lines);
+
+                let lines = lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, s)| element! { Text(content: format!("     {} {}", left_padding_to((n + 1).to_string(), digits(max_lines)), s)) }.into_any());
+
+                blocks.extend(lines);
+            }
+            DisplayBlock::KeyValue { entries } => blocks.extend(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        element! { Text(content: format!("     - {}: {}", entry.key, entry.value)) }
+                            .into_any()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => todo!(),
+        }
+    }
+
+    element! {
+        View(width: 100pct, height: blocks.len() as u16, flex_direction: FlexDirection::Column) {
+            #(title)
+            #(blocks.into_iter())
+        }
+    }
+    .into_any()
+}
+
+#[component]
+fn DisplayArea<'a>(mut hooks: Hooks, props: &DisplayAreaProp) -> impl Into<AnyElement<'a>> {
+    let (width, _) = hooks.use_terminal_size();
+
+    element! {
+        View(width: 100pct, flex_direction: FlexDirection::Column, row_gap: 1) {
+            #(props.units.iter().map(|unit| {
+                match unit {
+                    RenderUnit::Text(text) => element! { Text(content: format!("{}", text.as_str()), color: Some(Color::Cyan)) }.into_any(),
+                    RenderUnit::Prompt(text) => element! { RainbowText(content: format!("❯ {}", text)) }.into_any(),
+                    RenderUnit::Separator => element! { Text(content: "─".repeat(width as usize).to_string()) }.into_any(),
+                    RenderUnit::Tool(presentation) => render_tool(presentation),
+                }
+            }))
+        }
+    }
+}
+
+fn textarea_height(input: impl AsRef<str>, width: u16) -> u16 {
+    const PROMPT_WIDTH: usize = 2;
+    const CURSOR_WIDTH: usize = 1;
+    const BORDER_HEIGHT: usize = 2;
+
+    const MIN_HEIGHT: usize = 3;
+    const MAX_HEIGHT: usize = 10;
+
+    let text_width = usize::from(width)
+        .saturating_sub(PROMPT_WIDTH)
+        .saturating_sub(CURSOR_WIDTH)
+        .max(1);
+
+    let lines = input
+        .as_ref()
+        .split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                1
+            } else {
+                textwrap::wrap(line, text_width).len().max(1)
+            }
+        })
+        .sum::<usize>();
+
+    lines
+        .saturating_add(BORDER_HEIGHT)
+        .clamp(MIN_HEIGHT, MAX_HEIGHT) as u16
+}
+
+#[component]
+fn Textarea<'a>(mut hooks: Hooks, props: &TextareaProp) -> impl Into<AnyElement<'a>> {
+    let mut input = hooks.use_state(|| "".to_string());
+
+    let (width, _) = hooks.use_terminal_size();
+
+    let height = textarea_height(input.read().as_str(), width);
+
+    let on_submit = props.on_submit.clone();
+    hooks.use_local_terminal_events(move |event| {
+        if let TerminalEvent::Key(key) = event {
+            if key.code == KeyCode::Enter && key.kind == KeyEventKind::Press {
+                let value = input.read().clone();
+
+                if !value.trim().is_empty() {
+                    on_submit(input.read().clone());
+                }
+
+                input.set("".to_string());
+            }
+        }
+    });
+
+    element! {
+        View(width: 100pct, height: height, border_style: BorderStyle::Round, border_edges: Some(Edges::Top | Edges::Bottom)) {
+            View(width: 2) {
+                Text(content: "❯ ".to_string())
+            }
+
+            View(flex_grow: 1.0f32) {
+                TextInput(
+                    has_focus: true,
+                    value: input.to_string(),
+                    on_change: move |new_value| {
+                        input.set(new_value)
+                    },
+                    multiline: true,
+                    italic: true,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_event_tests {
+    use super::*;
+    use crate::tool::{ToolCallId, ToolCallStatus};
+
+    fn presentation(status: ToolCallStatus) -> Presentation {
+        Presentation {
+            call_id: ToolCallId("call-1".to_owned()),
+            name: "Test Tool".to_owned(),
+            label: "tool".to_owned(),
+            target: None,
+            status,
+            blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merges_text_and_upserts_tool_presentations() {
+        let mut units = Vec::new();
+        let mut events = vec![
+            AgentViewEvent::TextDelta("hello ".to_owned()),
+            AgentViewEvent::TextDelta("world".to_owned()),
+            AgentViewEvent::Tool(presentation(ToolCallStatus::Running)),
+        ];
+
+        parse_units(&mut events, &mut units).unwrap();
+
+        assert!(matches!(&units[0], RenderUnit::Text(text) if text == "hello world"));
+        assert!(matches!(
+            &units[1],
+            RenderUnit::Tool(tool) if matches!(tool.status, ToolCallStatus::Running)
+        ));
+
+        let mut events = vec![AgentViewEvent::Tool(presentation(
+            ToolCallStatus::Succeeded,
+        ))];
+        parse_units(&mut events, &mut units).unwrap();
+
+        assert_eq!(units.len(), 2);
+        assert!(matches!(
+            &units[1],
+            RenderUnit::Tool(tool) if matches!(tool.status, ToolCallStatus::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn collapses_repeated_completion_separators() {
+        let mut units = Vec::new();
+        let mut events = vec![AgentViewEvent::Completed, AgentViewEvent::Completed];
+
+        parse_units(&mut events, &mut units).unwrap();
+
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0], RenderUnit::Separator));
+    }
 }
