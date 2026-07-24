@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut agent = Agent::new(provider);
     agent
-        .with_internal_tools()
+        .with_internal_tools()?
         .with_global_prompts()
         .await?
         .initialize()?;
@@ -39,12 +39,16 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(async move {
         while let Some(prompt) = rx.recv().await {
-            if agent.continue_turn(prompt).await.is_err() {
-                tracing::error!(
-                    event = "agent.worker.failed",
-                    operation = "continue_turn",
-                    error_class = "agent_turn_error"
-                );
+            match agent.continue_turn(prompt).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        event = "agent.worker.failed",
+                        operation = "continue_turn",
+                        error_class = "agent_turn_error",
+                        error = e.to_string(),
+                    );
+                }
             }
         }
 

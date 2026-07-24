@@ -5,6 +5,7 @@ use std::{
 };
 
 use iocraft::prelude::*;
+use pulldown_cmark::{Event, Options, Parser, TagEnd};
 use tokio::sync::{
     Mutex,
     mpsc::{Sender, UnboundedReceiver},
@@ -13,7 +14,10 @@ use tokio::sync::{
 use crate::{
     event::AgentViewEvent,
     tool::{DisplayBlock, Presentation, ToolCallStatus},
+    ui::markdown::MarkdownBlock,
 };
+
+mod markdown;
 
 impl TryFrom<AgentViewEvent> for RenderUnit {
     type Error = anyhow::Error;
@@ -23,6 +27,7 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
             AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
             AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
             AgentViewEvent::Completed => Ok(RenderUnit::Separator),
+            AgentViewEvent::Err(e) => Ok(RenderUnit::Err(e)),
         }
     }
 }
@@ -91,9 +96,11 @@ fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit
 #[derive(Debug, Clone)]
 enum RenderUnit {
     Text(String),
+    ParsedMarkdown(Vec<MarkdownBlock>),
     Tool(Presentation),
     Prompt(String),
     Separator,
+    Err(String),
 }
 
 #[derive(Debug, Props, Default)]
@@ -164,6 +171,7 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
 #[derive(Debug, Props, Default)]
 struct RainbowTextProps {
     content: String,
+    italic: bool,
 }
 
 #[component]
@@ -176,9 +184,14 @@ fn RainbowText(props: &RainbowTextProps) -> impl Into<AnyElement<'static>> {
         .chars()
         .enumerate()
         .map(|(index, character)| {
-            MixedTextContent::new(character)
-                .color(get_rainbow_color(index, start_hue))
-                .italic()
+            let mut content =
+                MixedTextContent::new(character).color(get_rainbow_color(index, start_hue));
+
+            if props.italic {
+                content = content.italic();
+            }
+
+            content
         })
         .collect();
 
@@ -242,6 +255,38 @@ fn digits(n: usize) -> usize {
     n.checked_ilog10().unwrap_or(0) as usize + 1
 }
 
+fn format_code_lines(
+    content: &str,
+    truncated_lines: usize,
+    show_line_numbers: bool,
+    start_line_number: usize,
+) -> Vec<String> {
+    let lines = if content.is_empty() {
+        vec![""]
+    } else {
+        content.lines().take(truncated_lines).collect::<Vec<_>>()
+    };
+    let last_line_number = start_line_number.saturating_add(lines.len().saturating_sub(1));
+    let line_number_width = digits(last_line_number);
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            if show_line_numbers {
+                let line_number = start_line_number.saturating_add(offset);
+                format!(
+                    "     {} {}",
+                    left_padding_to(line_number.to_string(), line_number_width),
+                    line
+                )
+            } else {
+                format!("     {line}")
+            }
+        })
+        .collect()
+}
+
 fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
     let indicator = match &presentation.status {
         ToolCallStatus::Running => "⟳ ",
@@ -260,7 +305,7 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
     );
 
     let title = element! {
-        Text(content: title)
+        RainbowText(content: title)
     }
     .into_any();
 
@@ -273,23 +318,25 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
             }
             DisplayBlock::TextOutput {
                 content,
-                truncated_lines,
+                truncated_lines: _,
             } => blocks.push(element! { Text(content: format!("   └ {content}")) }.into_any()),
             DisplayBlock::CodeBlock {
-                language,
+                language: _,
                 content,
                 truncated_lines,
+                show_line_numbers,
+                start_line_number,
             } => {
-                let lines = content.lines().collect::<Vec<_>>();
-
-                let max_lines = lines.len().min(*truncated_lines);
-
-                let lines = lines
+                blocks.extend(
+                    format_code_lines(
+                        content,
+                        *truncated_lines,
+                        *show_line_numbers,
+                        *start_line_number,
+                    )
                     .into_iter()
-                    .enumerate()
-                    .map(|(n, s)| element! { Text(content: format!("     {} {}", left_padding_to((n + 1).to_string(), digits(max_lines)), s)) }.into_any());
-
-                blocks.extend(lines);
+                    .map(|content| element! { Text(content: content) }.into_any()),
+                );
             }
             DisplayBlock::KeyValue { entries } => blocks.extend(
                 entries
@@ -322,9 +369,11 @@ fn DisplayArea<'a>(mut hooks: Hooks, props: &DisplayAreaProp) -> impl Into<AnyEl
             #(props.units.iter().map(|unit| {
                 match unit {
                     RenderUnit::Text(text) => element! { Text(content: format!("{}", text.as_str()), color: Some(Color::Cyan)) }.into_any(),
-                    RenderUnit::Prompt(text) => element! { RainbowText(content: format!("❯ {}", text)) }.into_any(),
+                    RenderUnit::Prompt(text) => element! { RainbowText(content: format!("❯ {}", text), italic: true) }.into_any(),
+                    RenderUnit::ParsedMarkdown(_) => todo!(),
                     RenderUnit::Separator => element! { Text(content: "─".repeat(width as usize).to_string()) }.into_any(),
                     RenderUnit::Tool(presentation) => render_tool(presentation),
+                    RenderUnit::Err(err) => element! { Text(content: format!("✖ {err}"), color: Some(Color::Red)) }.into_any(),
                 }
             }))
         }
@@ -448,6 +497,34 @@ mod view_event_tests {
             &units[1],
             RenderUnit::Tool(tool) if matches!(tool.status, ToolCallStatus::Succeeded)
         ));
+    }
+
+    #[test]
+    fn formats_absolute_code_line_numbers() {
+        assert_eq!(
+            format_code_lines("alpha\nbeta\ngamma", 10, true, 998),
+            vec![
+                "      998 alpha".to_owned(),
+                "      999 beta".to_owned(),
+                "     1000 gamma".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn formats_a_numbered_blank_code_line() {
+        assert_eq!(
+            format_code_lines("", 10, true, 42),
+            vec!["     42 ".to_owned()]
+        );
+    }
+
+    #[test]
+    fn formats_code_without_line_numbers_and_honors_limit() {
+        assert_eq!(
+            format_code_lines("alpha\nbeta\ngamma", 2, false, 42),
+            vec!["     alpha".to_owned(), "     beta".to_owned()]
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::{
     context::{Context, Message},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
-    tool::{ReadFileTool, ToolRegistry, WriteFileTool},
+    tool::{FetchTool, FileBufferStore, ReadFileTool, ToolRegistry, WriteFileTool},
 };
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -60,11 +60,20 @@ where
         self.view_bus.subscribe()
     }
 
-    pub fn with_internal_tools(&mut self) -> &mut Self {
+    pub fn with_internal_tools(&mut self) -> anyhow::Result<&mut Self> {
+        let file_buffers = FileBufferStore::default();
+
         self.tool
-            .register(ReadFileTool)
-            .register_with_presenter(WriteFileTool, crate::tool::WriteFilePresenter);
-        self
+            .register_with_presenter(
+                ReadFileTool::new(file_buffers.clone()),
+                crate::tool::ReadFilePresenter,
+            )
+            .register_with_presenter(
+                WriteFileTool::new(file_buffers),
+                crate::tool::WriteFilePresenter,
+            )
+            .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter);
+        Ok(self)
     }
 
     pub async fn with_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
@@ -254,7 +263,14 @@ where
                         error_class = "provider_stream_error",
                         duration_ms = request_started.elapsed().as_millis() as u64
                     );
-                    e?;
+
+                    match e {
+                        Ok(_) => {}
+                        Err(e) => {
+                            self.view_bus.broadcast(AgentViewEvent::Err(e.to_string()));
+                            break Err(e);
+                        }
+                    }
                 }
                 None => {
                     tracing::info!(

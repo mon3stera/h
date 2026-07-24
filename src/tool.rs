@@ -1,9 +1,21 @@
-use std::{collections::HashMap, marker::PhantomData, time::Instant};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
 
+use readabilityrs::{Readability, ReadabilityOptions};
+use reqwest::header::{HeaderMap, HeaderValue};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::fs;
+use tokio::{
+    fs::{self, File, OpenOptions},
+    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+    sync::RwLock,
+};
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec<T> {
@@ -100,18 +112,303 @@ where
     }
 }
 
+const MAX_READ_LINES: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl FileFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(unix)]
+            mtime_nsec: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            ctime: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IndexedFile {
+    fingerprint: FileFingerprint,
+    line_starts: Vec<u64>,
+    scanned_to: u64,
+    total_lines: Option<usize>,
+}
+
+impl IndexedFile {
+    fn new(fingerprint: FileFingerprint) -> Self {
+        Self {
+            fingerprint,
+            line_starts: Vec::new(),
+            scanned_to: 0,
+            total_lines: None,
+        }
+    }
+
+    fn reset(&mut self, fingerprint: FileFingerprint) {
+        *self = Self::new(fingerprint);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileBufferStore {
+    files: Arc<RwLock<HashMap<PathBuf, Arc<tokio::sync::Mutex<IndexedFile>>>>>,
+}
+
+impl FileBufferStore {
+    async fn index_for(
+        &self,
+        path: &Path,
+        fingerprint: FileFingerprint,
+    ) -> Arc<tokio::sync::Mutex<IndexedFile>> {
+        if let Some(index) = self.files.read().await.get(path).cloned() {
+            return index;
+        }
+
+        self.files
+            .write()
+            .await
+            .entry(path.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(IndexedFile::new(fingerprint))))
+            .clone()
+    }
+
+    async fn invalidate(&self, path: &Path) {
+        let mut paths = vec![absolute_path(path)];
+        if let Ok(canonical_path) = fs::canonicalize(path).await {
+            paths.push(canonical_path);
+        }
+
+        let mut files = self.files.write().await;
+        for path in paths {
+            files.remove(&path);
+        }
+    }
+}
+
+fn is_cacheable(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_file() && metadata.len() > 0
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .unwrap_or_else(|_| path.to_owned())
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadFileToolArgs {
-    /// File path
+    /// File path.
     path: String,
+    /// First line to read. Line numbers are 1-based and inclusive. Defaults to 1.
+    start_line: Option<usize>,
+    /// Last line to read. Line numbers are 1-based and inclusive. If omitted, reads up to 200 lines.
+    end_line: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ReadFileToolOutput {
     content: String,
+    start_line: usize,
+    end_line: Option<usize>,
+    total_lines: Option<usize>,
+    has_more: bool,
 }
 
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    buffers: FileBufferStore,
+}
+
+impl ReadFileTool {
+    pub fn new(buffers: FileBufferStore) -> Self {
+        Self { buffers }
+    }
+
+    async fn read_range(
+        &self,
+        path: &Path,
+        start_line: usize,
+        requested_end: usize,
+    ) -> anyhow::Result<ReadFileToolOutput> {
+        let canonical_path = fs::canonicalize(path).await?;
+        let metadata = fs::metadata(&canonical_path).await?;
+        let fingerprint = FileFingerprint::from_metadata(&metadata);
+
+        if !is_cacheable(&metadata) {
+            let mut index = IndexedFile::new(fingerprint);
+            return read_indexed_range(
+                File::open(&canonical_path).await?,
+                &mut index,
+                start_line,
+                requested_end,
+            )
+            .await;
+        }
+
+        let index = self
+            .buffers
+            .index_for(&canonical_path, fingerprint.clone())
+            .await;
+        let mut index = index.lock().await;
+        if index.fingerprint != fingerprint {
+            index.reset(fingerprint);
+        }
+
+        read_indexed_range(
+            File::open(&canonical_path).await?,
+            &mut index,
+            start_line,
+            requested_end,
+        )
+        .await
+    }
+}
+
+async fn read_indexed_range(
+    file: File,
+    index: &mut IndexedFile,
+    start_line: usize,
+    requested_end: usize,
+) -> anyhow::Result<ReadFileToolOutput> {
+    let lookahead_line = requested_end.saturating_add(1);
+    let mut reader = BufReader::new(file);
+    extend_line_index(&mut reader, index, lookahead_line).await?;
+
+    let total_lines = index.total_lines;
+    let available_lines = total_lines.unwrap_or(index.line_starts.len());
+    if start_line > available_lines {
+        return Ok(ReadFileToolOutput {
+            content: String::new(),
+            start_line,
+            end_line: None,
+            total_lines,
+            has_more: false,
+        });
+    }
+
+    let actual_end = requested_end.min(available_lines);
+    let content = read_lines_from_offsets(&mut reader, index, start_line, actual_end).await?;
+    let has_more = match total_lines {
+        Some(total_lines) => actual_end < total_lines,
+        None => index.line_starts.len() > actual_end,
+    };
+
+    Ok(ReadFileToolOutput {
+        content,
+        start_line,
+        end_line: Some(actual_end),
+        total_lines,
+        has_more,
+    })
+}
+
+async fn extend_line_index(
+    reader: &mut BufReader<File>,
+    index: &mut IndexedFile,
+    target_line: usize,
+) -> anyhow::Result<()> {
+    if index.total_lines.is_some() || index.line_starts.len() >= target_line {
+        return Ok(());
+    }
+
+    reader
+        .seek(std::io::SeekFrom::Start(index.scanned_to))
+        .await?;
+
+    loop {
+        let line_start = index.scanned_to;
+        let mut bytes = Vec::new();
+        let bytes_read = reader.read_until(b'\n', &mut bytes).await?;
+
+        if bytes_read == 0 {
+            index.total_lines = Some(index.line_starts.len());
+            return Ok(());
+        }
+
+        validate_line_bytes(&bytes)?;
+        index.line_starts.push(line_start);
+        index.scanned_to = index
+            .scanned_to
+            .checked_add(u64::try_from(bytes_read)?)
+            .ok_or_else(|| anyhow::anyhow!("file offset overflow"))?;
+
+        if index.line_starts.len() >= target_line {
+            return Ok(());
+        }
+    }
+}
+
+async fn read_lines_from_offsets(
+    reader: &mut BufReader<File>,
+    index: &IndexedFile,
+    start_line: usize,
+    end_line: usize,
+) -> anyhow::Result<String> {
+    reader
+        .seek(std::io::SeekFrom::Start(index.line_starts[start_line - 1]))
+        .await?;
+
+    let mut lines = Vec::with_capacity(end_line - start_line + 1);
+    for _ in start_line..=end_line {
+        let mut bytes = Vec::new();
+        let bytes_read = reader.read_until(b'\n', &mut bytes).await?;
+        anyhow::ensure!(bytes_read > 0, "file changed while it was being read");
+        strip_line_ending(&mut bytes);
+        lines.push(String::from_utf8(bytes)?);
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn validate_line_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut content = bytes;
+    if content.last() == Some(&b'\n') {
+        content = &content[..content.len() - 1];
+        if content.last() == Some(&b'\r') {
+            content = &content[..content.len() - 1];
+        }
+    }
+    std::str::from_utf8(content)?;
+    Ok(())
+}
+
+fn strip_line_ending(bytes: &mut Vec<u8>) {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl TypedTool for ReadFileTool {
@@ -124,19 +421,57 @@ impl TypedTool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "get file content"
+        "read a 1-based inclusive range from a file; returns at most 200 lines and total_lines is null until EOF is reached"
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
-        let content = fs::read_to_string(arguments.path).await?;
-        Ok(ReadFileToolOutput { content })
+        let start_line = arguments.start_line.unwrap_or(1);
+        anyhow::ensure!(start_line > 0, "start_line must be at least 1");
+
+        if let Some(end_line) = arguments.end_line {
+            anyhow::ensure!(
+                end_line >= start_line,
+                "end_line must be greater than or equal to start_line"
+            );
+            let requested_lines = end_line
+                .checked_sub(start_line)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("requested line range is too large"))?;
+            anyhow::ensure!(
+                requested_lines <= MAX_READ_LINES,
+                "cannot read more than {MAX_READ_LINES} lines at once"
+            );
+        }
+
+        let requested_end = arguments
+            .end_line
+            .unwrap_or_else(|| start_line.saturating_add(MAX_READ_LINES - 1));
+
+        self.read_range(Path::new(&arguments.path), start_line, requested_end)
+            .await
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteFileMode {
+    Overwrite,
+    Append,
+}
+
+fn default_write_file_mode() -> WriteFileMode {
+    WriteFileMode::Overwrite
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct WriteFileToolArgs {
+    /// File path.
     path: String,
+    /// Content to write.
     content: String,
+    /// Write mode. `overwrite` replaces the file; `append` adds content to the end. Defaults to `overwrite`.
+    #[serde(default = "default_write_file_mode")]
+    mode: WriteFileMode,
 }
 
 #[derive(Serialize)]
@@ -144,7 +479,15 @@ pub struct WriteFileToolOutput {
     status: String,
 }
 
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    buffers: FileBufferStore,
+}
+
+impl WriteFileTool {
+    pub fn new(buffers: FileBufferStore) -> Self {
+        Self { buffers }
+    }
+}
 
 #[async_trait::async_trait]
 impl TypedTool for WriteFileTool {
@@ -157,20 +500,109 @@ impl TypedTool for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "overwrite a file"
+        "write content to a file by overwriting it or appending to its end"
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
-        let status = match fs::write(arguments.path, arguments.content)
-            .await
-            .map(|_| "Ok".to_string())
-            .map_err(|e| e.to_string())
-        {
-            Ok(s) | Err(s) => s,
+        let path = PathBuf::from(&arguments.path);
+
+        match arguments.mode {
+            WriteFileMode::Overwrite => fs::write(&path, arguments.content).await?,
+            WriteFileMode::Append => {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await?;
+                file.write_all(arguments.content.as_bytes()).await?;
+                file.flush().await?;
+            }
+        }
+
+        self.buffers.invalidate(&path).await;
+
+        Ok(WriteFileToolOutput {
+            status: "Ok".to_owned(),
+        })
+    }
+}
+
+pub struct FetchTool {
+    client: reqwest::Client,
+}
+
+impl FetchTool {
+    pub fn new() -> anyhow::Result<Self> {
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            "User-Agent",
+            HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+        );
+
+        let client = reqwest::ClientBuilder::new()
+            .default_headers(headers)
+            .build()?;
+
+        Ok(Self { client })
+    }
+}
+
+#[async_trait::async_trait]
+impl TypedTool for FetchTool {
+    type Arguments = FetchToolArgs;
+
+    type Output = FetchToolOutput;
+
+    fn name(&self) -> &'static str {
+        "fetch"
+    }
+
+    fn description(&self) -> &'static str {
+        "fetch, clean a web page and convert it to markdown"
+    }
+
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+        let resp = match self.client.get(&arguments.url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let status = e.status().unwrap();
+                anyhow::bail!("{} {}", status.as_u16(), status.as_str())
+            }
         };
 
-        Ok(WriteFileToolOutput { status })
+        let text = resp.text().await?;
+
+        if arguments.raw {
+            return Ok(FetchToolOutput { result: text });
+        }
+
+        let readability = Readability::new(
+            &text,
+            Some(&arguments.url),
+            Some(ReadabilityOptions::builder().output_markdown(true).build()),
+        )?;
+
+        let result = match readability.parse() {
+            Some(article) => format!("{}", article.markdown_content.unwrap()),
+            None => format!("WARNING: failed to clean the page\nRaw: {text}"),
+        };
+
+        Ok(FetchToolOutput { result })
     }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FetchToolArgs {
+    /// URL of a page.
+    url: String,
+    /// Whether the page will be clean. If set to false, keep the page unchanged.
+    raw: bool,
+}
+
+#[derive(Serialize)]
+pub struct FetchToolOutput {
+    result: String,
 }
 
 struct RegisteredTool {
@@ -414,6 +846,8 @@ pub enum DisplayBlock {
         language: Option<String>,
         content: String,
         truncated_lines: usize,
+        show_line_numbers: bool,
+        start_line_number: usize,
     },
     Diff {
         content: String,
@@ -631,6 +1065,156 @@ impl Presenter for DefaultPresenter {
     }
 }
 
+pub struct FetchPresenter;
+
+impl Presenter for FetchPresenter {
+    fn completed(&self, call: &ToolCall, result: &ToolCallResult) -> Presentation {
+        let url = call
+            .arguments
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let (status, summary) = match &result.outcome {
+            ToolCallOutcome::Success(_) => (
+                ToolCallStatus::Succeeded,
+                DisplayBlock::Summary("200 OK".to_owned()),
+            ),
+            ToolCallOutcome::Failure { message } => (
+                ToolCallStatus::Failed {
+                    message: message.clone(),
+                },
+                DisplayBlock::Summary(message.clone()),
+            ),
+        };
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "Fetch".to_owned(),
+            label: "built-in".to_owned(),
+            target: url,
+            status,
+            blocks: vec![summary],
+        }
+    }
+
+    fn running(&self, call: &ToolCall) -> Presentation {
+        let url = call
+            .arguments
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "Fetch".to_owned(),
+            label: "built-in".to_owned(),
+            target: url,
+            status: ToolCallStatus::Running,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+pub struct ReadFilePresenter;
+
+impl Presenter for ReadFilePresenter {
+    fn completed(&self, call: &ToolCall, result: &ToolCallResult) -> Presentation {
+        let path = call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let (status, blocks) = match &result.outcome {
+            ToolCallOutcome::Success(output) => {
+                let content = output
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let start_line = output
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok())
+                    .unwrap_or(1);
+                let end_line = output
+                    .get("end_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                let total_lines = output
+                    .get("total_lines")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                let has_more = output
+                    .get("has_more")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                let summary = match (end_line, total_lines) {
+                    (Some(end_line), Some(total_lines)) => {
+                        format!("Read lines {start_line}–{end_line} of {total_lines}")
+                    }
+                    (Some(end_line), None) if has_more => format!(
+                        "Read lines {start_line}–{end_line} (total unknown; more available)"
+                    ),
+                    (Some(end_line), None) => {
+                        format!("Read lines {start_line}–{end_line} (total unknown)")
+                    }
+                    (None, Some(total_lines)) => {
+                        format!("No lines at or after {start_line} (file has {total_lines} lines)")
+                    }
+                    (None, None) => format!("No lines returned at or after {start_line}"),
+                };
+
+                let mut blocks = vec![DisplayBlock::Summary(summary)];
+                if end_line.is_some() {
+                    blocks.push(DisplayBlock::CodeBlock {
+                        language: Some("raw".to_owned()),
+                        content: content.to_owned(),
+                        truncated_lines: 10,
+                        show_line_numbers: true,
+                        start_line_number: start_line,
+                    });
+                }
+
+                (ToolCallStatus::Succeeded, blocks)
+            }
+            ToolCallOutcome::Failure { message } => (
+                ToolCallStatus::Failed {
+                    message: message.clone(),
+                },
+                vec![DisplayBlock::Summary("Failed to read file".to_owned())],
+            ),
+        };
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "ReadFile".to_owned(),
+            label: "built-in".to_owned(),
+            target: path,
+            status,
+            blocks,
+        }
+    }
+
+    fn running(&self, call: &ToolCall) -> Presentation {
+        let path = call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "ReadFile".to_owned(),
+            label: "built-in".to_owned(),
+            target: path,
+            status: ToolCallStatus::Running,
+            blocks: Vec::new(),
+        }
+    }
+}
+
 pub struct WriteFilePresenter;
 
 impl Presenter for WriteFilePresenter {
@@ -648,16 +1232,28 @@ impl Presenter for WriteFilePresenter {
             .unwrap_or_default();
 
         let lines_cnt = content.lines().count();
+        let mode = call
+            .arguments
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("overwrite");
+        let action = if mode == "append" {
+            "Appended"
+        } else {
+            "Wrote"
+        };
 
         let (status, blocks) = match &result.outcome {
             ToolCallOutcome::Success(_) => (
                 ToolCallStatus::Succeeded,
                 vec![
-                    DisplayBlock::Summary(format!("Wrote {lines_cnt} lines")),
+                    DisplayBlock::Summary(format!("{action} {lines_cnt} lines")),
                     DisplayBlock::CodeBlock {
                         language: Some("raw".to_string()),
                         content: content.to_owned(),
                         truncated_lines: 10,
+                        show_line_numbers: true,
+                        start_line_number: 1,
                     },
                 ],
             ),
@@ -708,6 +1304,402 @@ mod presenter_tests {
             name: name.to_owned(),
             arguments,
         }
+    }
+
+    fn temporary_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("h-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn read_file_defaults_to_a_bounded_first_page() {
+        let path = temporary_file("bounded-read");
+        let content = (1..=250)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).await.unwrap();
+
+        let tool = ReadFileTool::new(FileBufferStore::default());
+        let output = TypedTool::call(
+            &tool,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.start_line, 1);
+        assert_eq!(output.end_line, Some(200));
+        assert_eq!(output.total_lines, None);
+        assert!(output.has_more);
+        assert_eq!(output.content.lines().count(), 200);
+        assert!(output.content.starts_with("line 1\n"));
+        assert!(output.content.ends_with("line 200"));
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_uses_one_based_inclusive_ranges() {
+        let path = temporary_file("inclusive-read");
+        fs::write(&path, "one\ntwo\n\nfour\nfive\n").await.unwrap();
+
+        let tool = ReadFileTool::new(FileBufferStore::default());
+        let output = TypedTool::call(
+            &tool,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: Some(2),
+                end_line: Some(4),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.content, "two\n\nfour");
+        assert_eq!(output.start_line, 2);
+        assert_eq!(output.end_line, Some(4));
+        assert_eq!(output.total_lines, None);
+        assert!(output.has_more);
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_validates_ranges_before_reading() {
+        let tool = ReadFileTool::new(FileBufferStore::default());
+        let missing = temporary_file("missing").to_string_lossy().into_owned();
+
+        for (start_line, end_line, expected) in [
+            (Some(0), None, "start_line must be at least 1"),
+            (
+                Some(5),
+                Some(4),
+                "end_line must be greater than or equal to start_line",
+            ),
+            (
+                Some(1),
+                Some(MAX_READ_LINES + 1),
+                "cannot read more than 200 lines at once",
+            ),
+        ] {
+            let error = TypedTool::call(
+                &tool,
+                ReadFileToolArgs {
+                    path: missing.clone(),
+                    start_line,
+                    end_line,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_handles_empty_and_past_eof_ranges() {
+        let path = temporary_file("empty-read");
+        fs::write(&path, "").await.unwrap();
+
+        let tool = ReadFileTool::new(FileBufferStore::default());
+        let output = TypedTool::call(
+            &tool,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: Some(10),
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.content.is_empty());
+        assert_eq!(output.start_line, 10);
+        assert_eq!(output.end_line, None);
+        assert_eq!(output.total_lines, Some(0));
+        assert!(!output.has_more);
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_indexes_extend_lazily_and_refresh_external_changes() {
+        let path = temporary_file("index-refresh");
+        let content = (1..=250)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).await.unwrap();
+        let buffers = FileBufferStore::default();
+        let reader = ReadFileTool::new(buffers.clone());
+
+        let first = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.total_lines, None);
+
+        let index = buffers.files.read().await.values().next().cloned().unwrap();
+        let indexed = index.lock().await;
+        assert_eq!(indexed.line_starts.len(), 201);
+        assert!(indexed.scanned_to < fs::metadata(&path).await.unwrap().len());
+        drop(indexed);
+
+        fs::write(&path, "new content").await.unwrap();
+        let refreshed = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.content, "new content");
+        assert_eq!(refreshed.total_lines, Some(1));
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_reaches_eof_and_remembers_exact_total() {
+        let path = temporary_file("known-total");
+        fs::write(&path, "one\ntwo\nthree").await.unwrap();
+        let buffers = FileBufferStore::default();
+        let reader = ReadFileTool::new(buffers.clone());
+
+        let output = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: Some(2),
+                end_line: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.content, "two\nthree");
+        assert_eq!(output.total_lines, Some(3));
+        assert!(!output.has_more);
+
+        let index = buffers.files.read().await.values().next().cloned().unwrap();
+        assert_eq!(index.lock().await.total_lines, Some(3));
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_normalizes_crlf_and_preserves_blank_lines() {
+        let path = temporary_file("line-semantics");
+        fs::write(&path, b"one\r\n\r\nthree\r\n").await.unwrap();
+        let reader = ReadFileTool::new(FileBufferStore::default());
+
+        let output = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.content, "one\n\nthree");
+        assert_eq!(output.total_lines, Some(3));
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_invalid_utf8_in_scanned_lines() {
+        let path = temporary_file("invalid-utf8");
+        fs::write(&path, [0xff, b'\n']).await.unwrap();
+        let reader = ReadFileTool::new(FileBufferStore::default());
+
+        let error = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid utf-8"));
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proc_files_bypass_the_reusable_index() {
+        let buffers = FileBufferStore::default();
+        let reader = ReadFileTool::new(buffers.clone());
+
+        let first = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: "/proc/uptime".to_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: "/proc/uptime".to_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(first.content, second.content);
+        assert!(buffers.files.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_file_invalidates_the_shared_read_buffer() {
+        let path = temporary_file("write-invalidation");
+        fs::write(&path, "old").await.unwrap();
+        let buffers = FileBufferStore::default();
+        let reader = ReadFileTool::new(buffers.clone());
+        let writer = WriteFileTool::new(buffers.clone());
+
+        let before = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.content, "old");
+        assert_eq!(buffers.files.read().await.len(), 1);
+
+        TypedTool::call(
+            &writer,
+            WriteFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "new".to_owned(),
+                mode: WriteFileMode::Overwrite,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(buffers.files.read().await.is_empty());
+
+        let after = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.content, "new");
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_appends_and_invalidates_the_shared_read_buffer() {
+        let path = temporary_file("append-invalidation");
+        fs::write(&path, "first\n").await.unwrap();
+        let buffers = FileBufferStore::default();
+        let reader = ReadFileTool::new(buffers.clone());
+        let writer = WriteFileTool::new(buffers.clone());
+
+        TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(buffers.files.read().await.len(), 1);
+
+        TypedTool::call(
+            &writer,
+            WriteFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "second\n".to_owned(),
+                mode: WriteFileMode::Append,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(buffers.files.read().await.is_empty());
+
+        let output = TypedTool::call(
+            &reader,
+            ReadFileToolArgs {
+                path: path.to_string_lossy().into_owned(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.content, "first\nsecond");
+
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[test]
+    fn write_file_mode_defaults_to_overwrite() {
+        let arguments: WriteFileToolArgs = serde_json::from_value(json!({
+            "path": "example.txt",
+            "content": "replacement",
+        }))
+        .unwrap();
+
+        assert!(matches!(arguments.mode, WriteFileMode::Overwrite));
+    }
+
+    #[test]
+    fn write_file_presenter_describes_append_mode() {
+        let call = call(
+            "write_file",
+            json!({
+                "path": "example.txt",
+                "content": "one\ntwo",
+                "mode": "append",
+            }),
+        );
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({ "status": "Ok" })),
+        };
+        let presentation = WriteFilePresenter.completed(&call, &result);
+
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "Appended 2 lines"
+        ));
     }
 
     #[test]
@@ -811,6 +1803,153 @@ mod presenter_tests {
         };
         assert!(message.ends_with("… [truncated]"));
         assert!(matches!(presentation.blocks[0], DisplayBlock::Summary(_)));
+    }
+
+    #[test]
+    fn fetch_presenter_presents_successful_status() {
+        let call = call(
+            "fetch",
+            json!({ "url": "https://example.com", "raw": false }),
+        );
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({ "result": "Example" })),
+        };
+        let presentation = FetchPresenter.completed(&call, &result);
+
+        assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+        assert_eq!(presentation.name, "Fetch");
+        assert_eq!(presentation.label, "built-in");
+        assert_eq!(presentation.target.as_deref(), Some("https://example.com"));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "200 OK"
+        ));
+    }
+
+    #[test]
+    fn fetch_presenter_uses_failure_message_as_summary() {
+        let call = call(
+            "fetch",
+            json!({ "url": "https://example.com/missing", "raw": false }),
+        );
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Failure {
+                message: "404 Not Found".to_owned(),
+            },
+        };
+        let presentation = FetchPresenter.completed(&call, &result);
+
+        assert!(matches!(
+            presentation.status,
+            ToolCallStatus::Failed { ref message } if message == "404 Not Found"
+        ));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "404 Not Found"
+        ));
+    }
+
+    #[test]
+    fn read_file_presenter_presents_successful_output() {
+        let call = call("read_file", json!({ "path": "src/main.rs" }));
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({
+                "content": "fn two() {}\nfn three() {}",
+                "start_line": 2,
+                "end_line": 3,
+                "total_lines": 10,
+                "has_more": true,
+            })),
+        };
+        let presentation = ReadFilePresenter.completed(&call, &result);
+
+        assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+        assert_eq!(presentation.name, "ReadFile");
+        assert_eq!(presentation.label, "built-in");
+        assert_eq!(presentation.target.as_deref(), Some("src/main.rs"));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "Read lines 2–3 of 10"
+        ));
+        assert!(matches!(
+            &presentation.blocks[1],
+            DisplayBlock::CodeBlock {
+                language: Some(language),
+                content,
+                truncated_lines: 10,
+                show_line_numbers: true,
+                start_line_number: 2,
+            } if language == "raw" && content == "fn two() {}\nfn three() {}"
+        ));
+    }
+
+    #[test]
+    fn read_file_presenter_presents_unknown_total() {
+        let call = call("read_file", json!({ "path": "large.rs" }));
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({
+                "content": "line 1\nline 2",
+                "start_line": 1,
+                "end_line": 2,
+                "total_lines": null,
+                "has_more": true,
+            })),
+        };
+        let presentation = ReadFilePresenter.completed(&call, &result);
+
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary)
+                if summary == "Read lines 1–2 (total unknown; more available)"
+        ));
+    }
+
+    #[test]
+    fn read_file_presenter_omits_code_block_past_eof() {
+        let call = call("read_file", json!({ "path": "small.rs" }));
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({
+                "content": "",
+                "start_line": 10,
+                "end_line": null,
+                "total_lines": 3,
+                "has_more": false,
+            })),
+        };
+        let presentation = ReadFilePresenter.completed(&call, &result);
+
+        assert_eq!(presentation.blocks.len(), 1);
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary)
+                if summary == "No lines at or after 10 (file has 3 lines)"
+        ));
+    }
+
+    #[test]
+    fn read_file_presenter_presents_failure() {
+        let call = call("read_file", json!({ "path": "missing.rs" }));
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Failure {
+                message: "not found".to_owned(),
+            },
+        };
+        let presentation = ReadFilePresenter.completed(&call, &result);
+
+        assert!(matches!(
+            presentation.status,
+            ToolCallStatus::Failed { ref message } if message == "not found"
+        ));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "Failed to read file"
+        ));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub enum AgentViewEvent {
     TextDelta(String),
     Tool(Presentation),
     Completed,
+    Err(String),
 }
 
 #[derive(Debug, Clone)]

@@ -102,14 +102,51 @@ impl OpenAIProvider {
 
     fn sanitize_schema(schema: &Value) -> Value {
         let mut schema = schema.clone();
-        Self::sanitize_schema_node(&mut schema);
+        let definitions = schema
+            .as_object()
+            .and_then(|object| object.get("$defs").or_else(|| object.get("definitions")))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        Self::sanitize_schema_node(&mut schema, &definitions);
+
+        if let Value::Object(object) = &mut schema {
+            object.remove("$defs");
+            object.remove("definitions");
+        }
+
         schema
     }
 
-    fn sanitize_schema_node(schema: &mut Value) {
+    fn sanitize_schema_node(schema: &mut Value, definitions: &Map<String, Value>) {
         let Value::Object(object) = schema else {
             return;
         };
+
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            if let Some(name) = reference
+                .strip_prefix("#/$defs/")
+                .or_else(|| reference.strip_prefix("#/definitions/"))
+            {
+                if let Some(definition) = definitions.get(name) {
+                    let annotations = std::mem::take(object);
+                    let mut resolved = definition.clone();
+                    Self::sanitize_schema_node(&mut resolved, definitions);
+
+                    let Value::Object(resolved) = resolved else {
+                        return;
+                    };
+
+                    *object = resolved;
+                    for (keyword, value) in annotations {
+                        if keyword != "$ref" {
+                            object.insert(keyword, value);
+                        }
+                    }
+                }
+            }
+        }
 
         for keyword in [
             "$schema",
@@ -152,50 +189,29 @@ impl OpenAIProvider {
 
         let is_object = Self::has_type(object, "object") || object.contains_key("properties");
         if is_object {
-            Self::sanitize_object_schema(object);
+            Self::sanitize_object_schema(object, definitions);
         }
 
         if let Some(items) = object.get_mut("items") {
-            Self::sanitize_schema_node(items);
+            Self::sanitize_schema_node(items, definitions);
         }
 
         for keyword in ["anyOf", "oneOf", "allOf"] {
             if let Some(Value::Array(branches)) = object.get_mut(keyword) {
                 for branch in branches {
-                    Self::sanitize_schema_node(branch);
-                }
-            }
-        }
-
-        for keyword in ["$defs", "definitions"] {
-            if let Some(Value::Object(definitions)) = object.get_mut(keyword) {
-                for definition in definitions.values_mut() {
-                    Self::sanitize_schema_node(definition);
+                    Self::sanitize_schema_node(branch, definitions);
                 }
             }
         }
     }
 
-    fn sanitize_object_schema(schema: &mut Map<String, Value>) {
-        let required = schema
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect::<std::collections::BTreeSet<_>>();
-
+    fn sanitize_object_schema(schema: &mut Map<String, Value>, definitions: &Map<String, Value>) {
         let property_names = match schema.get_mut("properties") {
             Some(Value::Object(properties)) => {
                 let property_names = properties.keys().cloned().collect::<Vec<_>>();
 
-                for (name, property_schema) in properties {
-                    Self::sanitize_schema_node(property_schema);
-
-                    if !required.contains(name) {
-                        Self::make_nullable(property_schema);
-                    }
+                for property_schema in properties.values_mut() {
+                    Self::sanitize_schema_node(property_schema, definitions);
                 }
 
                 property_names
@@ -208,64 +224,6 @@ impl OpenAIProvider {
             "required".to_owned(),
             Value::Array(property_names.into_iter().map(Value::String).collect()),
         );
-    }
-
-    fn make_nullable(schema: &mut Value) {
-        if Self::is_nullable(schema) {
-            return;
-        }
-
-        if let Value::Object(object) = schema {
-            match object.get_mut("type") {
-                Some(Value::String(kind)) => {
-                    let kind = std::mem::take(kind);
-                    object.insert(
-                        "type".to_owned(),
-                        Value::Array(vec![Value::String(kind), Value::String("null".to_owned())]),
-                    );
-                    return;
-                }
-                Some(Value::Array(types)) => {
-                    types.push(Value::String("null".to_owned()));
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        let original = std::mem::take(schema);
-        *schema = serde_json::json!({
-            "anyOf": [
-                original,
-                { "type": "null" }
-            ]
-        });
-    }
-
-    fn is_nullable(schema: &Value) -> bool {
-        let Some(object) = schema.as_object() else {
-            return false;
-        };
-
-        match object.get("type") {
-            Some(Value::String(kind)) if kind == "null" => return true,
-            Some(Value::Array(types)) if types.iter().any(|kind| kind.as_str() == Some("null")) => {
-                return true;
-            }
-            _ => {}
-        }
-
-        object
-            .get("anyOf")
-            .and_then(Value::as_array)
-            .is_some_and(|branches| branches.iter().any(Self::is_null_schema))
-    }
-
-    fn is_null_schema(schema: &Value) -> bool {
-        schema
-            .as_object()
-            .and_then(|object| object.get("type"))
-            .is_some_and(|kind| kind.as_str() == Some("null"))
     }
 
     fn has_type(schema: &Map<String, Value>, expected: &str) -> bool {
@@ -528,6 +486,7 @@ impl Provider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::OpenAIProvider;
+    use crate::tool::WriteFileToolArgs;
     use serde_json::json;
 
     #[test]
@@ -547,7 +506,8 @@ mod tests {
                     "minimum": 0
                 },
                 "options": {
-                    "$ref": "#/$defs/SearchOptions"
+                    "$ref": "#/$defs/SearchOptions",
+                    "description": "Search options."
                 }
             },
             "required": ["query"],
@@ -578,17 +538,8 @@ mod tests {
                         "type": ["integer", "null"]
                     },
                     "options": {
-                        "anyOf": [
-                            { "$ref": "#/$defs/SearchOptions" },
-                            { "type": "null" }
-                        ]
-                    }
-                },
-                "required": ["limit", "options", "query"],
-                "additionalProperties": false,
-                "$defs": {
-                    "SearchOptions": {
                         "type": "object",
+                        "description": "Search options.",
                         "properties": {
                             "include_archived": {
                                 "type": "boolean"
@@ -597,7 +548,39 @@ mod tests {
                         "required": ["include_archived"],
                         "additionalProperties": false
                     }
-                }
+                },
+                "required": ["limit", "options", "query"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn sanitizes_write_file_schema_for_openai_strict_tools() {
+        let schema = serde_json::to_value(schemars::schema_for!(WriteFileToolArgs)).unwrap();
+        let sanitized = OpenAIProvider::sanitize_schema(&schema);
+
+        assert_eq!(
+            sanitized,
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["overwrite", "append"],
+                        "description": "Write mode. `overwrite` replaces the file; `append` adds content to the end. Defaults to `overwrite`."
+                    }
+                },
+                "required": ["content", "mode", "path"],
+                "additionalProperties": false
             })
         );
     }
