@@ -5,7 +5,6 @@ use std::{
 };
 
 use iocraft::prelude::*;
-use pulldown_cmark::{Event, Options, Parser, TagEnd};
 use tokio::sync::{
     Mutex,
     mpsc::{Sender, UnboundedReceiver},
@@ -14,10 +13,14 @@ use tokio::sync::{
 use crate::{
     event::AgentViewEvent,
     tool::{DisplayBlock, Presentation, ToolCallStatus},
-    ui::markdown::MarkdownBlock,
+    ui::{
+        markdown::{MarkdownBlock, parse_markdown},
+        markdown_view::{render_markdown, render_rule},
+    },
 };
 
 mod markdown;
+mod markdown_view;
 
 impl TryFrom<AgentViewEvent> for RenderUnit {
     type Error = anyhow::Error;
@@ -45,10 +48,18 @@ fn parse_units(
     units: &mut Vec<RenderUnit>,
 ) -> anyhow::Result<()> {
     for unit in preprocess_events(events)? {
-        match (units.last_mut(), &unit) {
-            (Some(RenderUnit::Text(text)), RenderUnit::Text(next)) => text.push_str(next.as_str()),
-            (Some(RenderUnit::Separator), RenderUnit::Separator) => {}
-            (_, RenderUnit::Tool(presentation)) => {
+        match unit {
+            RenderUnit::Text(next) => match units.last_mut() {
+                Some(RenderUnit::Text(text)) => text.push_str(&next),
+                _ => units.push(RenderUnit::Text(next)),
+            },
+            RenderUnit::Separator => {
+                finalize_response_markdown(units);
+                if !matches!(units.last(), Some(RenderUnit::Separator)) {
+                    units.push(RenderUnit::Separator);
+                }
+            }
+            RenderUnit::Tool(presentation) => {
                 let current = units.iter_mut().find_map(|unit| match unit {
                     RenderUnit::Tool(current) if current.call_id == presentation.call_id => {
                         Some(current)
@@ -57,16 +68,30 @@ fn parse_units(
                 });
 
                 match current {
-                    Some(current) => *current = presentation.clone(),
-                    None => units.push(unit),
+                    Some(current) => *current = presentation,
+                    None => units.push(RenderUnit::Tool(presentation)),
                 }
             }
-            _ => units.push(unit),
+            unit => units.push(unit),
         }
     }
 
     events.clear();
     Ok(())
+}
+
+fn finalize_response_markdown(units: &mut [RenderUnit]) {
+    let response_start = units
+        .iter()
+        .rposition(|unit| matches!(unit, RenderUnit::Separator))
+        .map_or(0, |index| index + 1);
+
+    for unit in &mut units[response_start..] {
+        if let RenderUnit::Text(source) = unit {
+            let source = std::mem::take(source);
+            *unit = RenderUnit::ParsedMarkdown(parse_markdown(&source));
+        }
+    }
 }
 
 fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit>> {
@@ -352,7 +377,7 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
     }
 
     element! {
-        View(width: 100pct, height: blocks.len() as u16, flex_direction: FlexDirection::Column) {
+        View(width: 100pct, flex_direction: FlexDirection::Column) {
             #(title)
             #(blocks.into_iter())
         }
@@ -361,17 +386,15 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
 }
 
 #[component]
-fn DisplayArea<'a>(mut hooks: Hooks, props: &DisplayAreaProp) -> impl Into<AnyElement<'a>> {
-    let (width, _) = hooks.use_terminal_size();
-
+fn DisplayArea<'a>(props: &DisplayAreaProp) -> impl Into<AnyElement<'a>> {
     element! {
         View(width: 100pct, flex_direction: FlexDirection::Column, row_gap: 1) {
             #(props.units.iter().map(|unit| {
                 match unit {
-                    RenderUnit::Text(text) => element! { Text(content: format!("{}", text.as_str()), color: Some(Color::Cyan)) }.into_any(),
+                    RenderUnit::Text(text) => render_markdown(&parse_markdown(text)),
                     RenderUnit::Prompt(text) => element! { RainbowText(content: format!("❯ {}", text), italic: true) }.into_any(),
-                    RenderUnit::ParsedMarkdown(_) => todo!(),
-                    RenderUnit::Separator => element! { Text(content: "─".repeat(width as usize).to_string()) }.into_any(),
+                    RenderUnit::ParsedMarkdown(blocks) => render_markdown(blocks),
+                    RenderUnit::Separator => render_rule(),
                     RenderUnit::Tool(presentation) => render_tool(presentation),
                     RenderUnit::Err(err) => element! { Text(content: format!("✖ {err}"), color: Some(Color::Red)) }.into_any(),
                 }
@@ -497,6 +520,76 @@ mod view_event_tests {
             &units[1],
             RenderUnit::Tool(tool) if matches!(tool.status, ToolCallStatus::Succeeded)
         ));
+    }
+
+    #[test]
+    fn finalizes_text_when_response_completes() {
+        let mut units = Vec::new();
+        let mut events = vec![
+            AgentViewEvent::TextDelta("**hello**".to_owned()),
+            AgentViewEvent::Completed,
+        ];
+
+        parse_units(&mut events, &mut units).unwrap();
+
+        assert!(matches!(
+            &units[..],
+            [
+                RenderUnit::ParsedMarkdown(blocks),
+                RenderUnit::Separator,
+            ] if matches!(
+                &blocks[..],
+                [MarkdownBlock::Paragraph(content)]
+                    if matches!(&content[..], [markdown::Inline::Strong(_)])
+            )
+        ));
+    }
+
+    #[test]
+    fn finalizes_all_text_segments_in_the_current_response() {
+        let tool = presentation(ToolCallStatus::Running);
+        let mut units = Vec::new();
+        let mut events = vec![
+            AgentViewEvent::TextDelta("before".to_owned()),
+            AgentViewEvent::Tool(tool),
+            AgentViewEvent::TextDelta("after".to_owned()),
+            AgentViewEvent::Completed,
+        ];
+
+        parse_units(&mut events, &mut units).unwrap();
+
+        assert!(matches!(
+            &units[..],
+            [
+                RenderUnit::ParsedMarkdown(_),
+                RenderUnit::Tool(_),
+                RenderUnit::ParsedMarkdown(_),
+                RenderUnit::Separator,
+            ]
+        ));
+    }
+
+    #[test]
+    fn completion_does_not_reparse_previous_responses_or_create_empty_markdown() {
+        let historical = vec![MarkdownBlock::Paragraph(vec![markdown::Inline::Text(
+            "history".to_owned(),
+        )])];
+        let mut units = vec![
+            RenderUnit::ParsedMarkdown(historical.clone()),
+            RenderUnit::Separator,
+            RenderUnit::Tool(presentation(ToolCallStatus::Running)),
+        ];
+        let mut events = vec![AgentViewEvent::Completed, AgentViewEvent::Completed];
+
+        parse_units(&mut events, &mut units).unwrap();
+
+        assert_eq!(units.len(), 4);
+        assert!(matches!(
+            &units[0],
+            RenderUnit::ParsedMarkdown(blocks) if blocks == &historical
+        ));
+        assert!(matches!(&units[2], RenderUnit::Tool(_)));
+        assert!(matches!(&units[3], RenderUnit::Separator));
     }
 
     #[test]

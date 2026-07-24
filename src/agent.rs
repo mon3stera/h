@@ -5,7 +5,7 @@ use crate::{
     context::{Context, Message},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
-    tool::{FetchTool, FileBufferStore, ReadFileTool, ToolRegistry, WriteFileTool},
+    tool::{FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolRegistry, WriteFileTool},
 };
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -72,7 +72,8 @@ where
                 WriteFileTool::new(file_buffers),
                 crate::tool::WriteFilePresenter,
             )
-            .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter);
+            .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter)
+            .register_with_presenter(GrepTool, crate::tool::GrepPresenter);
         Ok(self)
     }
 

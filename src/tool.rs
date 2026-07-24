@@ -6,11 +6,15 @@ use std::{
     time::{Instant, SystemTime},
 };
 
+use grep_regex::RegexMatcher;
+use grep_searcher::{Searcher, SearcherBuilder, Sink, sinks::UTF8};
+use ignore::WalkBuilder;
 use readabilityrs::{Readability, ReadabilityOptions};
 use reqwest::header::{HeaderMap, HeaderValue};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use similar::TextDiff;
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
@@ -605,6 +609,138 @@ pub struct FetchToolOutput {
     result: String,
 }
 
+pub struct GrepTool;
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GrepToolArgs {
+    /// file or directory
+    path: String,
+    /// regex
+    pattern: String,
+    /// including N lines before
+    before: usize,
+    /// including N lines after
+    after: usize,
+}
+
+#[derive(Serialize)]
+pub struct GrepToolOutput {
+    results: String,
+}
+
+struct GrepSink {
+    output: String,
+    path: String,
+}
+
+impl Sink for GrepSink {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        mat: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line_num = mat.line_number().unwrap_or(0);
+        let line = std::str::from_utf8(mat.bytes()).unwrap_or("");
+
+        self.output
+            .push_str(&format!("{}:{}:{}", self.path, line_num, line));
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line_num = ctx.line_number().unwrap_or(0);
+        let line = std::str::from_utf8(ctx.bytes()).unwrap_or("");
+
+        self.output
+            .push_str(&format!("{}-{}-{}", self.path, line_num, line));
+        Ok(true)
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
+        self.output.push_str("--\n");
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl TypedTool for GrepTool {
+    type Arguments = GrepToolArgs;
+
+    type Output = GrepToolOutput;
+
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+
+    fn description(&self) -> &'static str {
+        "grep a pattern in specific path (file or directory)"
+    }
+
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+        let matcher = RegexMatcher::new(&arguments.pattern)?;
+
+        let mut searcher = SearcherBuilder::new()
+            .before_context(arguments.before)
+            .after_context(arguments.after)
+            .passthru(false)
+            .build();
+
+        let mut results = String::new();
+
+        for result in WalkBuilder::new(&arguments.path).build() {
+            let entry = result?;
+
+            if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                let path = entry.path();
+
+                let mut sink = GrepSink {
+                    output: String::new(),
+                    path: path.display().to_string(),
+                };
+
+                searcher.search_path(&matcher, path, &mut sink)?;
+
+                results = format!("{results}\n{}", sink.output);
+            }
+        }
+
+        Ok(GrepToolOutput { results })
+    }
+}
+
+pub struct EditTool;
+
+#[derive(Deserialize, JsonSchema)]
+pub struct EditToolArgs {}
+
+#[derive(Serialize)]
+pub struct EditToolOutput {}
+
+#[async_trait::async_trait]
+impl TypedTool for EditTool {
+    type Arguments = EditToolArgs;
+
+    type Output = EditToolOutput;
+
+    fn name(&self) -> &'static str {
+        "edit"
+    }
+
+    fn description(&self) -> &'static str {
+        "Edit a file"
+    }
+
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+        Ok(EditToolOutput {})
+    }
+}
+
 struct RegisteredTool {
     tool: Box<dyn DynTool>,
     presenter: Box<dyn Presenter>,
@@ -1112,6 +1248,92 @@ impl Presenter for FetchPresenter {
             target: url,
             status: ToolCallStatus::Running,
             blocks: Vec::new(),
+        }
+    }
+}
+
+pub struct GrepPresenter;
+
+impl GrepPresenter {
+    fn target(call: &ToolCall) -> Option<String> {
+        call.arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+}
+
+impl Presenter for GrepPresenter {
+    fn running(&self, call: &ToolCall) -> Presentation {
+        let pattern = call
+            .arguments
+            .get("pattern")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let blocks = if pattern.is_empty() {
+            Vec::new()
+        } else {
+            vec![DisplayBlock::Summary(format!("Searching for {pattern:?}"))]
+        };
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "Grep".to_owned(),
+            label: "built-in".to_owned(),
+            target: Self::target(call),
+            status: ToolCallStatus::Running,
+            blocks,
+        }
+    }
+
+    fn completed(&self, call: &ToolCall, result: &ToolCallResult) -> Presentation {
+        let (status, blocks) = match &result.outcome {
+            ToolCallOutcome::Success(output) => {
+                let results = output
+                    .get("results")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim_matches('\n');
+
+                if results.is_empty() {
+                    (
+                        ToolCallStatus::Succeeded,
+                        vec![DisplayBlock::Summary("No matches".to_owned())],
+                    )
+                } else {
+                    let returned_lines = results
+                        .lines()
+                        .filter(|line| !line.is_empty() && *line != "--")
+                        .count();
+                    let (content, truncated_lines) = truncate_preview(results);
+
+                    (
+                        ToolCallStatus::Succeeded,
+                        vec![
+                            DisplayBlock::Summary(format!("Returned {returned_lines} lines")),
+                            DisplayBlock::TextOutput {
+                                content,
+                                truncated_lines,
+                            },
+                        ],
+                    )
+                }
+            }
+            ToolCallOutcome::Failure { message } => (
+                ToolCallStatus::Failed {
+                    message: message.clone(),
+                },
+                vec![DisplayBlock::Summary("Grep failed".to_owned())],
+            ),
+        };
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "Grep".to_owned(),
+            label: "built-in".to_owned(),
+            target: Self::target(call),
+            status,
+            blocks,
         }
     }
 }
@@ -1848,6 +2070,110 @@ mod presenter_tests {
         assert!(matches!(
             &presentation.blocks[0],
             DisplayBlock::Summary(summary) if summary == "404 Not Found"
+        ));
+    }
+
+    #[test]
+    fn grep_presenter_presents_running_query() {
+        let call = call(
+            "grep",
+            json!({
+                "path": "src",
+                "pattern": "parse_markdown",
+                "before": 1,
+                "after": 2,
+            }),
+        );
+
+        let presentation = GrepPresenter.running(&call);
+
+        assert!(matches!(presentation.status, ToolCallStatus::Running));
+        assert_eq!(presentation.name, "Grep");
+        assert_eq!(presentation.label, "built-in");
+        assert_eq!(presentation.target.as_deref(), Some("src"));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "Searching for \"parse_markdown\""
+        ));
+    }
+
+    #[test]
+    fn grep_presenter_presents_matches() {
+        let call = call(
+            "grep",
+            json!({
+                "path": "src",
+                "pattern": "fn main",
+                "before": 0,
+                "after": 0,
+            }),
+        );
+        let results = "src/main.rs:21:fn main() {}\nsrc/bin.rs:9:fn main() {}\n";
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({ "results": results })),
+        };
+
+        let presentation = GrepPresenter.completed(&call, &result);
+
+        assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+        assert_eq!(presentation.target.as_deref(), Some("src"));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "Returned 2 lines"
+        ));
+        assert!(matches!(
+            &presentation.blocks[1],
+            DisplayBlock::TextOutput {
+                content,
+                truncated_lines: 0,
+            } if content == results.trim_end()
+        ));
+    }
+
+    #[test]
+    fn grep_presenter_presents_no_matches() {
+        let call = call(
+            "grep",
+            json!({ "path": "src", "pattern": "missing", "before": 0, "after": 0 }),
+        );
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Success(json!({ "results": "\n" })),
+        };
+
+        let presentation = GrepPresenter.completed(&call, &result);
+
+        assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+        assert_eq!(presentation.blocks.len(), 1);
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "No matches"
+        ));
+    }
+
+    #[test]
+    fn grep_presenter_presents_failure() {
+        let call = call(
+            "grep",
+            json!({ "path": "src", "pattern": "[", "before": 0, "after": 0 }),
+        );
+        let result = ToolCallResult {
+            id: call.id.clone(),
+            outcome: ToolCallOutcome::Failure {
+                message: "unclosed character class".to_owned(),
+            },
+        };
+
+        let presentation = GrepPresenter.completed(&call, &result);
+
+        assert!(matches!(
+            presentation.status,
+            ToolCallStatus::Failed { ref message } if message == "unclosed character class"
+        ));
+        assert!(matches!(
+            &presentation.blocks[0],
+            DisplayBlock::Summary(summary) if summary == "Grep failed"
         ));
     }
 
