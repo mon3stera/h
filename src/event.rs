@@ -17,6 +17,10 @@ pub enum AgentEvent {
 
 #[derive(Debug, Clone)]
 pub enum AgentViewEvent {
+    Startup {
+        model: String,
+        thinking_effort: Option<String>,
+    },
     TextDelta(String),
     Tool(Presentation),
     Completed,

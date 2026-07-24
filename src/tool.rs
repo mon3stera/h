@@ -1,11 +1,8 @@
 use std::{
-    collections::HashMap,
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Instant, SystemTime},
+    collections::HashMap, io, marker::PhantomData, path::{Path, PathBuf}, sync::Arc, time::{Instant, SystemTime},
 };
 
+use fuzzy_match_flex::partial_ratio;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, sinks::UTF8};
 use ignore::WalkBuilder;
@@ -15,6 +12,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use similar::TextDiff;
+use strsim::{jaro_winkler, normalized_levenshtein};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
@@ -569,11 +567,14 @@ impl TypedTool for FetchTool {
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
         let resp = match self.client.get(&arguments.url).send().await {
             Ok(resp) => resp,
-            Err(e) => {
-                let status = e.status().unwrap();
-                anyhow::bail!("{} {}", status.as_u16(), status.as_str())
-            }
+            Err(e) =>  anyhow::bail!("{e}")    
         };
+
+        let status = resp.status();
+
+        if !status.is_success() {
+            anyhow::bail!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown Status Code"));
+        }
 
         let text = resp.text().await?;
 
@@ -717,10 +718,53 @@ impl TypedTool for GrepTool {
 pub struct EditTool;
 
 #[derive(Deserialize, JsonSchema)]
-pub struct EditToolArgs {}
+pub struct EditToolArgs {
+    /// path of a file
+    path: String,
+    /// source that will be replaced from
+    source: String,
+    /// target that will be replaced into
+    target: String,
+}
 
 #[derive(Serialize)]
-pub struct EditToolOutput {}
+struct ExactMatchCandidates {
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Serialize)]
+enum EditStatus {
+    Ok,
+    MultipleExactMatches {
+        candidates: Vec<ExactMatchCandidates>,
+    },
+    NoCandidate {
+        message: String,
+    },
+    SimilarMatches {
+        matches: Vec<MatchResult>,
+    },
+    FileNotFound,
+    InvalidRange {
+        message: String,
+    }
+}
+
+#[derive(Serialize)]
+struct MatchResult {
+    similarity: f64,
+    start: usize,
+    end: usize,
+    actual_source: String,
+    diff: String,
+}
+
+#[derive(Serialize)]
+pub struct EditToolOutput {
+    status: EditStatus,
+    applied: bool,
+}
 
 #[async_trait::async_trait]
 impl TypedTool for EditTool {
@@ -737,7 +781,79 @@ impl TypedTool for EditTool {
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
-        Ok(EditToolOutput {})
+        let mut content = match fs::read_to_string(&arguments.path).await {
+            Ok(content) => content,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(EditToolOutput {
+                    status: EditStatus::FileNotFound,
+                    applied: false,
+                })
+            }
+            Err(e) => anyhow::bail!("{e}"),
+        };
+
+        if content.contains(&arguments.source) {
+            content = content.replace(&arguments.source, &arguments.target);
+
+            fs::write(arguments.path, content).await?;
+
+            return Ok(EditToolOutput {
+                status: EditStatus::Ok,
+                applied: true,
+            })
+        }
+
+        let content_lines = content.lines().collect::<Vec<_>>();
+        let source_lines = arguments.source.lines().collect::<Vec<_>>();
+
+        let content_line_num = content_lines.len();
+        let source_line_num = source_lines.len();
+
+        let mut matches = Vec::new();
+ 
+        if content_line_num < source_line_num {
+            return Ok(EditToolOutput {
+                status: EditStatus::InvalidRange {
+                    message: "File content length is less than source's".to_string(),
+                },
+                applied: false,
+            });
+        }
+
+        for window_size in [source_line_num + 1, source_line_num, source_line_num.saturating_sub(1)] {
+            if window_size > 0 {
+                for i in 0..=content_line_num.saturating_sub(window_size) {
+                    let segment = (&content_lines[i..i+window_size])
+                        .join("\n");
+
+                    let similarity = normalized_levenshtein(&segment, &arguments.source) as f64;
+
+                    if similarity > 0.85 {
+                        matches.push(MatchResult {
+                            similarity: similarity,
+                            start: i + 1,
+                            end: i + window_size + 1,
+                            actual_source: segment.clone(),
+                            diff: TextDiff::from_lines(&arguments.source, segment).unified_diff().to_string(),
+                        })
+                    } 
+                }
+            }
+        }
+
+        if !matches.is_empty() {
+            return Ok(EditToolOutput {
+                status: EditStatus::SimilarMatches { matches },
+                applied: false,
+            });
+        }
+
+        Ok(EditToolOutput {
+            status: EditStatus::NoCandidate {
+                message: "There is no candidate that is exact to or similar to the source".to_string(),
+            },
+            applied: false, 
+        })
     }
 }
 

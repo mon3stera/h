@@ -1031,6 +1031,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy_match_flex"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd915a28a5b500053fe165df297d486562b29e7721bd5fa06f2eb7a2aee0d4a6"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "generational-box"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1164,6 +1173,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "futures",
+ "fuzzy_match_flex",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
@@ -1181,6 +1191,7 @@ dependencies = [
  "serde_json",
  "shellexpand",
  "similar",
+ "strsim",
  "textwrap",
  "tokio",
  "tracing",

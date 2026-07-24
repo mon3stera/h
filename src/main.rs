@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let provider = OpenAIProvider::from_config(OpenAIProviderConfig::from_env()?);
 
     let mut agent = Agent::new(provider);
+    let bus_rx = agent.subscribe_view();
     agent
         .with_internal_tools()?
         .with_global_prompts()
@@ -34,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
 
-    let bus_rx = agent.subscribe_view();
     tracing::info!(event = "app.ready");
 
     tokio::spawn(async move {

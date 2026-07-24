@@ -14,11 +14,13 @@ use crate::{
     event::AgentViewEvent,
     tool::{DisplayBlock, Presentation, ToolCallStatus},
     ui::{
+        banner::render_banner,
         markdown::{MarkdownBlock, parse_markdown},
         markdown_view::{render_markdown, render_rule},
     },
 };
 
+mod banner;
 mod markdown;
 mod markdown_view;
 
@@ -27,6 +29,7 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
 
     fn try_from(value: AgentViewEvent) -> Result<Self, Self::Error> {
         match value {
+            AgentViewEvent::Startup { .. } => anyhow::bail!("must update startup state"),
             AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
             AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
             AgentViewEvent::Completed => Ok(RenderUnit::Separator),
@@ -128,6 +131,34 @@ enum RenderUnit {
     Err(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupInfo {
+    model: String,
+    thinking_effort: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ViewState {
+    startup: Option<StartupInfo>,
+    units: Vec<RenderUnit>,
+}
+
+fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Result<()> {
+    match event {
+        AgentViewEvent::Startup {
+            model,
+            thinking_effort,
+        } => {
+            state.startup = Some(StartupInfo {
+                model,
+                thinking_effort,
+            });
+            Ok(())
+        }
+        event => parse_units(&mut vec![event], &mut state.units),
+    }
+}
+
 #[derive(Debug, Props, Default)]
 pub struct UIProp {
     pub committer: Option<Sender<String>>,
@@ -136,7 +167,7 @@ pub struct UIProp {
 
 #[component]
 pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
-    let mut units = hooks.use_state(|| Vec::<RenderUnit>::new());
+    let mut state = hooks.use_state(ViewState::default);
 
     let event_rx = props.event_rx.clone();
     hooks.use_future(async move {
@@ -144,11 +175,10 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
         let mut rx = event_rx.lock().await.take().unwrap();
 
         while let Some(event) = rx.recv().await {
-            let mut inner = units.write();
-            if parse_units(&mut vec![event], &mut inner).is_err() {
+            if reduce_view_event(&mut state.write(), event).is_err() {
                 tracing::error!(
                     event = "ui.view_event.failed",
-                    operation = "parse_units",
+                    operation = "reduce_view_event",
                     error_class = "view_event_parse_error"
                 );
             }
@@ -162,7 +192,7 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
         let committer = committer.clone().unwrap();
 
         Box::pin(async move {
-            units.write().push(RenderUnit::Prompt(s.clone()));
+            state.write().units.push(RenderUnit::Prompt(s.clone()));
             tracing::info!(event = "ui.prompt_submitted");
             if committer.send(s).await.is_err() {
                 tracing::warn!(
@@ -175,6 +205,7 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
     });
 
     let (width, height) = hooks.use_terminal_size();
+    let state = state.read();
 
     element! {
         View(width: width, height: height, flex_direction: FlexDirection::Column) {
@@ -184,7 +215,11 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
                     scrollbar: Some(false),
                     keyboard_scroll: Some(false),
                 ) {
-                    DisplayArea(units: units.read().iter().cloned().collect::<Vec<_>>())
+                    DisplayArea(
+                        width,
+                        startup: state.startup.clone(),
+                        units: state.units.clone(),
+                    )
                 }
             }
 
@@ -258,6 +293,8 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (u8, u8, u8) {
 
 #[derive(Debug, Default, Props)]
 struct DisplayAreaProp {
+    width: u16,
+    startup: Option<StartupInfo>,
     units: Vec<RenderUnit>,
 }
 
@@ -387,8 +424,17 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
 
 #[component]
 fn DisplayArea<'a>(props: &DisplayAreaProp) -> impl Into<AnyElement<'a>> {
+    let banner = props.startup.as_ref().map(|startup| {
+        render_banner(
+            &startup.model,
+            startup.thinking_effort.as_deref(),
+            props.width,
+        )
+    });
+
     element! {
         View(width: 100pct, flex_direction: FlexDirection::Column, row_gap: 1) {
+            #(banner)
             #(props.units.iter().map(|unit| {
                 match unit {
                     RenderUnit::Text(text) => render_markdown(&parse_markdown(text)),
@@ -491,6 +537,62 @@ mod view_event_tests {
             status,
             blocks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn startup_event_updates_banner_state_without_adding_a_render_unit() {
+        let mut state = ViewState::default();
+
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::Startup {
+                model: "gpt-5.6-sol".to_owned(),
+                thinking_effort: Some("high".to_owned()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.startup,
+            Some(StartupInfo {
+                model: "gpt-5.6-sol".to_owned(),
+                thinking_effort: Some("high".to_owned()),
+            })
+        );
+        assert!(state.units.is_empty());
+    }
+
+    #[test]
+    fn startup_state_survives_content_and_is_replaced_by_updates() {
+        let mut state = ViewState::default();
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::Startup {
+                model: "first-model".to_owned(),
+                thinking_effort: None,
+            },
+        )
+        .unwrap();
+        state.units.push(RenderUnit::Prompt("hello".to_owned()));
+
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::Startup {
+                model: "second-model".to_owned(),
+                thinking_effort: Some("xhigh".to_owned()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.units.len(), 1);
+        assert!(matches!(&state.units[0], RenderUnit::Prompt(prompt) if prompt == "hello"));
+        assert_eq!(
+            state.startup,
+            Some(StartupInfo {
+                model: "second-model".to_owned(),
+                thinking_effort: Some("xhigh".to_owned()),
+            })
+        );
     }
 
     #[test]

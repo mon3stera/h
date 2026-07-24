@@ -12,6 +12,10 @@ type ProviderEventStream<C> = Pin<Box<dyn Stream<Item = anyhow::Result<C>> + Sen
 pub trait Provider: Send + Sync + 'static {
     type StreamEvent;
 
+    fn model(&self) -> &str;
+
+    fn thinking_effort(&self) -> Option<&str>;
+
     fn define_tools(&mut self, specs: Vec<ToolDefinition>) -> anyhow::Result<()>;
 
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal>;

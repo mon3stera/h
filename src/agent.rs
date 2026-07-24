@@ -5,7 +5,9 @@ use crate::{
     context::{Context, Message},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
-    tool::{FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolRegistry, WriteFileTool},
+    tool::{
+        EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolRegistry, WriteFileTool,
+    },
 };
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -73,7 +75,9 @@ where
                 crate::tool::WriteFilePresenter,
             )
             .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter)
-            .register_with_presenter(GrepTool, crate::tool::GrepPresenter);
+            .register_with_presenter(GrepTool, crate::tool::GrepPresenter)
+            .register(EditTool);
+
         Ok(self)
     }
 
@@ -86,6 +90,10 @@ where
         let definitions = self.tool.definitions()?;
 
         self.provider.define_tools(definitions)?;
+        self.view_bus.broadcast(AgentViewEvent::Startup {
+            model: self.provider.model().to_owned(),
+            thinking_effort: self.provider.thinking_effort().map(str::to_owned),
+        });
 
         Ok(())
     }
@@ -283,5 +291,62 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+
+    use futures::{Stream, stream};
+
+    use super::*;
+    use crate::tool::ToolDefinition;
+
+    struct TestProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for TestProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            Some("high")
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(ProviderSignal::Unsupported)
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
+        {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[test]
+    fn initialize_broadcasts_startup_to_existing_view_subscriber() {
+        let mut agent = Agent::new(TestProvider);
+        let mut receiver = agent.subscribe_view();
+
+        agent.initialize().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AgentViewEvent::Startup {
+                model,
+                thinking_effort: Some(thinking_effort),
+            } if model == "test-model" && thinking_effort == "high"
+        ));
     }
 }
