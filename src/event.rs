@@ -23,6 +23,8 @@ pub enum AgentViewEvent {
     },
     TextDelta(String),
     Tool(Presentation),
+    TurnStart,
+    TurnFinished,
     Completed,
     Err(String),
 }

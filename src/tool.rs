@@ -1,14 +1,35 @@
 use std::{
-    collections::HashMap, io, marker::PhantomData, path::{Path, PathBuf}, sync::Arc, time::{Instant, SystemTime},
+    collections::HashMap,
+    io::{self, Read, Write},
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Instant, SystemTime},
 };
 
-use fuzzy_match_flex::partial_ratio;
+use dashmap::{
+    DashMap,
+    mapref::one::{Ref, RefMut},
+};
+use expectrl::{
+    AsyncExpect, Session,
+    process::{
+        Termios,
+        unix::{AsyncPtyStream, UnixProcess},
+    },
+    repl::{ReplSession, spawn_bash},
+    spawn,
+    stream::log::{self, LogStream},
+};
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, sinks::UTF8};
 use ignore::WalkBuilder;
+use parking_lot::Mutex;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use readabilityrs::{Readability, ReadabilityOptions};
 use reqwest::header::{HeaderMap, HeaderValue};
 use schemars::{JsonSchema, schema_for};
+use scopeguard::guard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use similar::TextDiff;
@@ -16,8 +37,10 @@ use strsim::{jaro_winkler, normalized_levenshtein};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+    process::Command,
     sync::RwLock,
 };
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec<T> {
@@ -567,13 +590,17 @@ impl TypedTool for FetchTool {
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
         let resp = match self.client.get(&arguments.url).send().await {
             Ok(resp) => resp,
-            Err(e) =>  anyhow::bail!("{e}")    
+            Err(e) => anyhow::bail!("{e}"),
         };
 
         let status = resp.status();
 
         if !status.is_success() {
-            anyhow::bail!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown Status Code"));
+            anyhow::bail!(
+                "{} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown Status Code")
+            );
         }
 
         let text = resp.text().await?;
@@ -748,7 +775,7 @@ enum EditStatus {
     FileNotFound,
     InvalidRange {
         message: String,
-    }
+    },
 }
 
 #[derive(Serialize)]
@@ -787,7 +814,7 @@ impl TypedTool for EditTool {
                 return Ok(EditToolOutput {
                     status: EditStatus::FileNotFound,
                     applied: false,
-                })
+                });
             }
             Err(e) => anyhow::bail!("{e}"),
         };
@@ -800,7 +827,7 @@ impl TypedTool for EditTool {
             return Ok(EditToolOutput {
                 status: EditStatus::Ok,
                 applied: true,
-            })
+            });
         }
 
         let content_lines = content.lines().collect::<Vec<_>>();
@@ -810,7 +837,7 @@ impl TypedTool for EditTool {
         let source_line_num = source_lines.len();
 
         let mut matches = Vec::new();
- 
+
         if content_line_num < source_line_num {
             return Ok(EditToolOutput {
                 status: EditStatus::InvalidRange {
@@ -820,11 +847,14 @@ impl TypedTool for EditTool {
             });
         }
 
-        for window_size in [source_line_num + 1, source_line_num, source_line_num.saturating_sub(1)] {
+        for window_size in [
+            source_line_num + 1,
+            source_line_num,
+            source_line_num.saturating_sub(1),
+        ] {
             if window_size > 0 {
                 for i in 0..=content_line_num.saturating_sub(window_size) {
-                    let segment = (&content_lines[i..i+window_size])
-                        .join("\n");
+                    let segment = (&content_lines[i..i + window_size]).join("\n");
 
                     let similarity = normalized_levenshtein(&segment, &arguments.source) as f64;
 
@@ -834,9 +864,11 @@ impl TypedTool for EditTool {
                             start: i + 1,
                             end: i + window_size + 1,
                             actual_source: segment.clone(),
-                            diff: TextDiff::from_lines(&arguments.source, segment).unified_diff().to_string(),
+                            diff: TextDiff::from_lines(&arguments.source, segment)
+                                .unified_diff()
+                                .to_string(),
                         })
-                    } 
+                    }
                 }
             }
         }
@@ -850,11 +882,474 @@ impl TypedTool for EditTool {
 
         Ok(EditToolOutput {
             status: EditStatus::NoCandidate {
-                message: "There is no candidate that is exact to or similar to the source".to_string(),
+                message: "There is no candidate that is exact to or similar to the source"
+                    .to_string(),
             },
-            applied: false, 
+            applied: false,
         })
     }
+}
+
+async fn write_temp(content: impl AsRef<str>) -> anyhow::Result<String> {
+    let path = PathBuf::from(format!("/tmp/h_{}", Uuid::new_v4().to_string()));
+    fs::write(&path, content.as_ref()).await?;
+    Ok(path.display().to_string())
+}
+
+async fn write_temp_and_mention(content: impl AsRef<str>) -> anyhow::Result<String> {
+    let content = content.as_ref();
+
+    if content.len() < 512 {
+        return Ok(content.to_string());
+    }
+
+    let path = write_temp(content).await?;
+
+    return Ok(format!(
+        "{}... [Truncated] (Find full contents in {path})",
+        &content[..512].to_string()
+    ));
+}
+
+#[derive(Debug, Clone)]
+struct MemoryLog {
+    history_file: PathBuf,
+    inner: Arc<Mutex<String>>,
+}
+
+impl MemoryLog {
+    fn new() -> Self {
+        Self {
+            history_file: PathBuf::from(&format!("/tmp/h_{}", Uuid::new_v4().to_string())),
+            inner: Arc::new(Mutex::new(String::new())),
+        }
+    }
+}
+
+impl Write for MemoryLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut inner = self.inner.lock();
+
+        let cleaned = strip_ansi_escapes::strip(buf);
+        inner.push_str(&String::from_utf8_lossy(&cleaned));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BashSession {
+    id: String,
+    session: ReplSession<Session<UnixProcess, LogStream<AsyncPtyStream, MemoryLog>>>,
+    memory: MemoryLog,
+    is_busy: bool,
+}
+
+enum SpawnResult {
+    Ok,
+    Busy,
+}
+
+enum KillResult {
+    Ok,
+    NoBusyCommand,
+}
+
+enum WaitResult {
+    Ok { output: String },
+    NoBusyCommand,
+}
+
+enum ViewResult {
+    Ok { output: String },
+    NoBusyCommand,
+}
+
+impl BashSession {
+    fn is_busy(&self) -> bool {
+        self.is_busy
+    }
+
+    async fn exit(&mut self) -> anyhow::Result<()> {
+        self.session.exit().await?;
+        Ok(())
+    }
+
+    async fn kill(&mut self) -> anyhow::Result<KillResult> {
+        if !self.is_busy {
+            return Ok(KillResult::NoBusyCommand);
+        }
+
+        self.session.send(&[3]).await?;
+        Ok(KillResult::Ok)
+    }
+
+    async fn archive_log(&mut self) -> anyhow::Result<String> {
+        let content = self.memory.inner.lock().clone();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&self.memory.history_file)
+            .await?;
+        let content = strip_ansi_escapes::strip(content);
+        file.write(&content).await?;
+        self.memory.inner.lock().clear();
+        Ok(String::from_utf8_lossy(&content).to_string())
+    }
+
+    async fn view(&mut self) -> anyhow::Result<ViewResult> {
+        if !self.is_busy {
+            return Ok(ViewResult::NoBusyCommand);
+        }
+
+        let output = self.archive_log().await?;
+
+        if output.len() < 512 {
+            Ok(ViewResult::Ok { output })
+        } else {
+            Ok(ViewResult::Ok {
+                output: format!(
+                    "{} [Truncated] (Read {} to find all inputs and outputs of the session)",
+                    &output[..512],
+                    self.memory.history_file.display().to_string()
+                ),
+            })
+        }
+    }
+
+    async fn send(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+        self.session.send(buf).await?;
+        Ok(())
+    }
+
+    fn log_file(&self) -> String {
+        self.memory.history_file.display().to_string()
+    }
+
+    async fn wait(&mut self) -> anyhow::Result<WaitResult> {
+        if !self.is_busy {
+            return Ok(WaitResult::NoBusyCommand);
+        }
+
+        self.session.expect_prompt().await?;
+
+        self.is_busy = false;
+
+        let output = self.archive_log().await?;
+
+        if output.len() < 512 {
+            Ok(WaitResult::Ok { output })
+        } else {
+            Ok(WaitResult::Ok {
+                output: format!(
+                    "{} [Truncated] (Read {} to find all inputs and outputs)",
+                    &output[..512],
+                    self.memory.history_file.display().to_string()
+                ),
+            })
+        }
+    }
+
+    async fn spawn(&mut self, cmd: impl AsRef<str>) -> anyhow::Result<SpawnResult> {
+        let cmd = cmd.as_ref();
+
+        if self.is_busy {
+            return Ok(SpawnResult::Busy);
+        }
+
+        self.is_busy = true;
+        self.session.send_line(cmd).await?;
+        Ok(SpawnResult::Ok)
+    }
+}
+
+pub struct BashTool {
+    sessions: DashMap<String, BashSession>,
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self {
+            sessions: DashMap::new(),
+        }
+    }
+
+    async fn spawn(&self) -> anyhow::Result<String> {
+        let session_id = Uuid::new_v4().to_string();
+
+        let memory_log = MemoryLog::new();
+
+        const DEFAULT_PROMPT: &str = "EXPECT_PROMPT";
+
+        let mut cmd = std::process::Command::new("bash");
+        let _ = cmd.env("PS1", DEFAULT_PROMPT);
+
+        let _ = cmd.env(
+            "PROMPT_COMMAND",
+            "PS1=EXPECT_PROMPT; unset PROMPT_COMMAND; bind 'set enable-bracketed-paste off'",
+        );
+
+        let session = expectrl::session::Session::spawn(cmd)?;
+        let session = expectrl::session::log(session, memory_log.clone())?;
+
+        let mut bash: ReplSession<
+            Session<
+                UnixProcess,
+                log::LogStream<expectrl::process::unix::AsyncPtyStream, MemoryLog>,
+            >,
+        > = ReplSession::new(session, DEFAULT_PROMPT);
+        bash.set_quit_command("quit");
+
+        bash.expect_prompt().await?;
+
+        self.sessions.insert(
+            session_id.to_string(),
+            BashSession {
+                id: session_id.clone(),
+                session: bash,
+                memory: memory_log,
+                is_busy: false,
+            },
+        );
+
+        Ok(session_id)
+    }
+
+    async fn get_mut(
+        &self,
+        session_id: impl AsRef<str>,
+    ) -> Option<RefMut<'_, String, BashSession>> {
+        let session_id = session_id.as_ref();
+
+        if !self.sessions.contains_key(session_id) {
+            return None;
+        }
+
+        Some(self.sessions.get_mut(session_id).unwrap())
+    }
+
+    async fn get(&self, session_id: impl AsRef<str>) -> Option<Ref<'_, String, BashSession>> {
+        let session_id = session_id.as_ref();
+
+        if !self.sessions.contains_key(session_id) {
+            return None;
+        }
+
+        Some(self.sessions.get(session_id).unwrap())
+    }
+
+    async fn get_or_spawn(
+        &self,
+        session_id: Option<String>,
+    ) -> anyhow::Result<RefMut<'_, String, BashSession>> {
+        let has_active = if let Some(session_id) = &session_id {
+            self.sessions.contains_key(session_id)
+        } else {
+            false
+        };
+
+        if has_active {
+            return Ok(self.sessions.get_mut(&session_id.unwrap()).unwrap());
+        }
+
+        let session_id = self.spawn().await?;
+        Ok(self.sessions.get_mut(&session_id).unwrap())
+    }
+
+    async fn run_background(
+        &self,
+        session_id: Option<String>,
+        command: String,
+    ) -> anyhow::Result<BashToolOutput> {
+        if let Some(session_id) = &session_id
+            && !self.sessions.contains_key(session_id)
+        {
+            return Ok(BashToolOutput::SessionNotExist);
+        }
+
+        let mut session = self.get_or_spawn(session_id).await?;
+
+        match session.spawn(command).await? {
+            SpawnResult::Ok => {}
+            SpawnResult::Busy => return Ok(BashToolOutput::SessionBusy),
+        }
+
+        return Ok(BashToolOutput::Spawned {
+            session_id: session.id.clone(),
+        });
+    }
+
+    async fn view(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
+        let mut session = match self.get_mut(&session_id).await {
+            Some(session) => session,
+            None => return Ok(BashToolOutput::SessionNotExist),
+        };
+
+        match session.view().await? {
+            ViewResult::NoBusyCommand => Ok(BashToolOutput::NoBusyCommand),
+            ViewResult::Ok { output } => Ok(BashToolOutput::Output { output }),
+        }
+    }
+
+    async fn wait(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
+        let mut session = match self.get_mut(&session_id).await {
+            Some(session) => session,
+            None => return Ok(BashToolOutput::SessionNotExist),
+        };
+
+        match session.wait().await? {
+            WaitResult::NoBusyCommand => Ok(BashToolOutput::NoBusyCommand),
+            WaitResult::Ok { output } => Ok(BashToolOutput::Output { output }),
+        }
+    }
+
+    async fn terminate(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
+        let mut session = match self.get_mut(&session_id).await {
+            Some(session) => session,
+            None => return Ok(BashToolOutput::SessionNotExist),
+        };
+
+        match session.kill().await? {
+            KillResult::Ok => Ok(BashToolOutput::Terminated),
+            KillResult::NoBusyCommand => Ok(BashToolOutput::NoBusyCommand),
+        }
+    }
+
+    async fn log_path(&self, session_id: String) -> BashToolOutput {
+        let session = match self.get(&session_id).await {
+            Some(session) => session,
+            None => return BashToolOutput::SessionNotExist,
+        };
+
+        BashToolOutput::FilePath {
+            path: session.log_file(),
+        }
+    }
+
+    async fn send(
+        &self,
+        session_id: String,
+        buf: impl AsRef<[u8]>,
+    ) -> anyhow::Result<BashToolOutput> {
+        let buf = buf.as_ref();
+
+        let mut session = match self.get_mut(&session_id).await {
+            Some(session) => session,
+            None => return Ok(BashToolOutput::SessionNotExist),
+        };
+
+        session.send(buf).await?;
+        Ok(BashToolOutput::Sent)
+    }
+
+    async fn run_blocking(&self, command: String) -> anyhow::Result<BashToolOutput> {
+        let parts = command
+            .split_whitespace()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>();
+
+        if parts.is_empty() {
+            anyhow::bail!("Empty command");
+        }
+
+        let output = Command::new("bash").arg("-c").arg(command).output().await?;
+
+        let stdout =
+            write_temp_and_mention(String::from_utf8_lossy(&output.stdout).to_string()).await?;
+        let stderr =
+            write_temp_and_mention(String::from_utf8_lossy(&output.stderr).to_string()).await?;
+
+        Ok(BashToolOutput::RanBlocking { stdout, stderr })
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum BashToolArgs {
+    /// Run a command and block until it completes.
+    RunBlocking {
+        /// The shell command to execute.
+        command: String,
+    },
+    /// Spawn a command in the background without waiting for completion.
+    RunBackground {
+        /// The shell command to execute.
+        command: String,
+        /// An existing background terminal session. A new session is created when omitted.
+        session_id: Option<String>,
+    },
+    /// Get the log file path containing a session's historical inputs and outputs.
+    LogFilePath {
+        /// The background terminal session to inspect.
+        session_id: String,
+    },
+    /// Send input or a command to a running background terminal session.
+    Send {
+        /// The background terminal session to receive the input.
+        session_id: String,
+        /// The text or command to send.
+        input: String,
+    },
+    /// Get the buffered output generated since the last view for a running session.
+    View {
+        /// The background terminal session to inspect.
+        session_id: String,
+    },
+    /// Wait until the running command in a background terminal session exits.
+    Wait {
+        /// The background terminal session to wait for.
+        session_id: String,
+    },
+    /// Kill the running command in a background terminal session.
+    Terminate {
+        /// The background terminal session whose command should be killed.
+        session_id: String,
+    },
+}
+
+#[async_trait::async_trait]
+impl TypedTool for BashTool {
+    type Arguments = BashToolArgs;
+    type Output = BashToolOutput;
+
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+
+    fn description(&self) -> &'static str {
+        "Execute bash commands and manage background terminal sessions."
+    }
+
+    async fn call(&self, args: Self::Arguments) -> anyhow::Result<Self::Output> {
+        match args {
+            BashToolArgs::RunBlocking { command } => self.run_blocking(command).await,
+            BashToolArgs::RunBackground {
+                command,
+                session_id,
+            } => self.run_background(session_id, command).await,
+            BashToolArgs::LogFilePath { session_id } => Ok(self.log_path(session_id).await),
+            BashToolArgs::Send { session_id, input } => self.send(session_id, input).await,
+            BashToolArgs::View { session_id } => self.view(session_id).await,
+            BashToolArgs::Wait { session_id } => self.wait(session_id).await,
+            BashToolArgs::Terminate { session_id } => self.terminate(session_id).await,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub enum BashToolOutput {
+    FilePath { path: String },
+    Sent,
+    RanBlocking { stdout: String, stderr: String },
+    Spawned { session_id: String },
+    Output { output: String },
+    NoBusyCommand,
+    Terminated,
+    SessionBusy,
+    SessionNotExist,
 }
 
 struct RegisteredTool {
@@ -2005,6 +2500,56 @@ mod presenter_tests {
         assert_eq!(output.content, "first\nsecond");
 
         fs::remove_file(path).await.unwrap();
+    }
+
+    #[test]
+    fn bash_arguments_deserialize_by_action() {
+        let run_blocking: BashToolArgs = serde_json::from_value(json!({
+            "action": "run_blocking",
+            "command": "cargo test"
+        }))
+        .unwrap();
+        assert!(matches!(
+            run_blocking,
+            BashToolArgs::RunBlocking { command } if command == "cargo test"
+        ));
+
+        let run_background: BashToolArgs = serde_json::from_value(json!({
+            "action": "run_background",
+            "command": "cargo watch"
+        }))
+        .unwrap();
+        assert!(matches!(
+            run_background,
+            BashToolArgs::RunBackground {
+                command,
+                session_id: None,
+            } if command == "cargo watch"
+        ));
+
+        let send: BashToolArgs = serde_json::from_value(json!({
+            "action": "send",
+            "command": null,
+            "session_id": "session-1",
+            "input": "yes\n"
+        }))
+        .unwrap();
+        assert!(matches!(
+            send,
+            BashToolArgs::Send { session_id, input }
+                if session_id == "session-1" && input == "yes\n"
+        ));
+    }
+
+    #[test]
+    fn bash_arguments_reject_missing_action_specific_fields() {
+        for arguments in [
+            json!({"action": "run_blocking"}),
+            json!({"action": "send", "session_id": "session-1"}),
+            json!({"action": "wait"}),
+        ] {
+            assert!(serde_json::from_value::<BashToolArgs>(arguments).is_err());
+        }
     }
 
     #[test]

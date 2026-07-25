@@ -6,7 +6,8 @@ use crate::{
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
     tool::{
-        EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolRegistry, WriteFileTool,
+        BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolRegistry,
+        WriteFileTool,
     },
 };
 use futures::StreamExt;
@@ -76,7 +77,8 @@ where
             )
             .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter)
             .register_with_presenter(GrepTool, crate::tool::GrepPresenter)
-            .register(EditTool);
+            .register(EditTool)
+            .register(BashTool::new());
 
         Ok(self)
     }
@@ -189,7 +191,9 @@ where
         let started = Instant::now();
         let span = tracing::info_span!("agent.turn", turn_id = %turn_id);
 
-        async {
+        self.view_bus.broadcast(AgentViewEvent::TurnStart);
+
+        let result = async {
             tracing::info!(event = "agent.turn.started");
 
             let result = self.run_turn(prompt).await;
@@ -215,7 +219,10 @@ where
             result.map(|_| ())
         }
         .instrument(span)
-        .await
+        .await;
+
+        self.view_bus.broadcast(AgentViewEvent::TurnFinished);
+        result
     }
 
     async fn run_turn(&mut self, prompt: String) -> anyhow::Result<TurnMetrics> {
@@ -253,7 +260,13 @@ where
             message_count = self.context.histories().len()
         );
 
-        let mut stream = self.provider.stream(self.context.histories()).await?;
+        let mut stream = match self.provider.stream(self.context.histories()).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.view_bus.broadcast(AgentViewEvent::Err(e.to_string()));
+                return Err(e);
+            }
+        };
 
         loop {
             match stream.next().await {

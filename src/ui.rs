@@ -2,12 +2,16 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     sync::Arc,
+    time::Duration,
 };
 
-use iocraft::prelude::*;
-use tokio::sync::{
-    Mutex,
-    mpsc::{Sender, UnboundedReceiver},
+use iocraft::{hooks, prelude::*};
+use tokio::{
+    sync::{
+        Mutex,
+        mpsc::{Sender, UnboundedReceiver},
+    },
+    time::{MissedTickBehavior, interval},
 };
 
 use crate::{
@@ -31,6 +35,9 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
         match value {
             AgentViewEvent::Startup { .. } => anyhow::bail!("must update startup state"),
             AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
+            AgentViewEvent::TurnStart | AgentViewEvent::TurnFinished => {
+                anyhow::bail!("should not be rendered")
+            }
             AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
             AgentViewEvent::Completed => Ok(RenderUnit::Separator),
             AgentViewEvent::Err(e) => Ok(RenderUnit::Err(e)),
@@ -141,6 +148,7 @@ struct StartupInfo {
 struct ViewState {
     startup: Option<StartupInfo>,
     units: Vec<RenderUnit>,
+    turn_in_progress: bool,
 }
 
 fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Result<()> {
@@ -153,6 +161,14 @@ fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Re
                 model,
                 thinking_effort,
             });
+            Ok(())
+        }
+        AgentViewEvent::TurnStart => {
+            state.turn_in_progress = true;
+            Ok(())
+        }
+        AgentViewEvent::TurnFinished => {
+            state.turn_in_progress = false;
             Ok(())
         }
         event => parse_units(&mut vec![event], &mut state.units),
@@ -207,6 +223,10 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
     let (width, height) = hooks.use_terminal_size();
     let state = state.read();
 
+    let indicator = state
+        .turn_in_progress
+        .then(|| element! { WorkingIndicator });
+
     element! {
         View(width: width, height: height, flex_direction: FlexDirection::Column) {
             View(width: 100pct, flex_grow: 1.0_f32, overflow: Overflow::Hidden) {
@@ -222,8 +242,8 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
                     )
                 }
             }
-
-            Textarea(on_submit: input_handler)
+            #(indicator)
+            Textarea(on_submit: input_handler, turn_in_progress: state.turn_in_progress)
         }
     }
 }
@@ -301,6 +321,7 @@ struct DisplayAreaProp {
 #[derive(Props, Default)]
 struct TextareaProp {
     on_submit: Handler<String>,
+    turn_in_progress: bool,
 }
 
 fn left_padding_to(s: impl AsRef<str>, min_len: usize) -> String {
@@ -488,16 +509,16 @@ fn Textarea<'a>(mut hooks: Hooks, props: &TextareaProp) -> impl Into<AnyElement<
     let height = textarea_height(input.read().as_str(), width);
 
     let on_submit = props.on_submit.clone();
+    let in_progress = props.turn_in_progress;
     hooks.use_local_terminal_events(move |event| {
         if let TerminalEvent::Key(key) = event {
             if key.code == KeyCode::Enter && key.kind == KeyEventKind::Press {
                 let value = input.read().clone();
 
-                if !value.trim().is_empty() {
+                if !in_progress && !value.trim().is_empty() {
                     on_submit(input.read().clone());
+                    input.set("".to_string());
                 }
-
-                input.set("".to_string());
             }
         }
     });
@@ -519,6 +540,40 @@ fn Textarea<'a>(mut hooks: Hooks, props: &TextareaProp) -> impl Into<AnyElement<
                     italic: true,
                 )
             }
+        }
+    }
+}
+
+const WORKING_FRAMES: [(&str, &str); 4] = [
+    ("◜", "h-..."),
+    ("◝", "h-i..."),
+    ("◞", "h-in..."),
+    ("◟", "h-ing..."),
+];
+
+#[component]
+fn WorkingIndicator(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let mut frame = hooks.use_state(|| 0_usize);
+
+    hooks.use_future(async move {
+        let mut timer = interval(Duration::from_millis(200));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        timer.tick().await;
+
+        loop {
+            timer.tick().await;
+
+            let next = (*frame.read() + 1) % WORKING_FRAMES.len();
+            frame.set(next);
+        }
+    });
+
+    let (arc, message) = WORKING_FRAMES[*frame.read()];
+
+    element! {
+        View(width: 100pct, height: 1, flex_direction: FlexDirection::Row) {
+            RainbowText(content: format!("  {arc} {message}"))
         }
     }
 }
