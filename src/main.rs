@@ -20,6 +20,7 @@ mod event;
 mod logger;
 mod provider;
 mod tool;
+mod tui;
 mod ui;
 
 #[tokio::main]
