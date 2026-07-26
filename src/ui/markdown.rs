@@ -362,7 +362,7 @@ impl State {
     }
 }
 
-pub(super) fn parse_markdown(markdown: &str) -> Vec<MarkdownBlock> {
+pub fn parse_markdown(markdown: &str) -> Vec<MarkdownBlock> {
     let mut options = Options::empty();
 
     options.insert(Options::ENABLE_STRIKETHROUGH);

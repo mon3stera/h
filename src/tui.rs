@@ -7,4 +7,5 @@
 //! have landed so far look unused.
 #![allow(dead_code)]
 
+pub mod markdown;
 pub mod text;

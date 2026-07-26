@@ -26,7 +26,7 @@ use crate::{
 
 mod banner;
 pub mod choice_list;
-mod markdown;
+pub mod markdown;
 mod markdown_view;
 pub mod resume;
 
