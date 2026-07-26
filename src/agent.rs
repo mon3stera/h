@@ -25,6 +25,15 @@ const STREAM_MAX_ATTEMPTS: u32 = 4;
 
 const STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(150);
 
+/// Provider requests a single turn may take before it is called runaway.
+///
+/// A turn legitimately spans one request per tool call, and real ones have been
+/// seen to reach the low twenties. This is not a budget but a backstop: a
+/// provider that keeps asking for tool rounds without ever settling would
+/// otherwise loop forever, and every round leaves another event on an unbounded
+/// bus.
+const MAX_TURN_ROUNDS: usize = 100;
+
 /// The wait after a failed attempt, doubling each time: 150ms, 300ms, 600ms.
 fn stream_retry_delay(attempt: u32) -> Duration {
     STREAM_RETRY_BASE_DELAY * 2_u32.pow(attempt.saturating_sub(1))
@@ -258,13 +267,19 @@ where
                 ),
             }
 
-            result.map(|_| ())
+            result
         }
         .instrument(span)
         .await;
 
-        self.view_bus.broadcast(AgentViewEvent::TurnFinished);
-        result
+        // Only a turn that ran to a final answer is worth summarising; one that
+        // failed already reported why.
+        let completed = matches!(&result, Ok(metrics) if metrics.completion_reason == "final");
+
+        self.view_bus
+            .broadcast(AgentViewEvent::TurnFinished { completed });
+
+        result.map(|_| ())
     }
 
     async fn run_turn(&mut self, prompt: String) -> anyhow::Result<TurnMetrics> {
@@ -274,6 +289,23 @@ where
         loop {
             if matches!(self.turn, NextTurn::Stop) {
                 return Ok(metrics);
+            }
+
+            if metrics.provider_requests >= MAX_TURN_ROUNDS {
+                let message = format!(
+                    "stopped after {MAX_TURN_ROUNDS} provider requests without a final answer"
+                );
+
+                tracing::error!(
+                    event = "agent.turn.runaway",
+                    error_class = "turn_round_limit",
+                    provider_request_count = metrics.provider_requests,
+                    tool_call_count = metrics.tool_call_count,
+                );
+                self.view_bus
+                    .broadcast(AgentViewEvent::Err(message.clone()));
+
+                anyhow::bail!(message);
             }
 
             self.next_turn(&mut metrics).await?
@@ -547,6 +579,167 @@ mod tests {
         {
             Ok(Box::pin(stream::empty()))
         }
+    }
+
+    /// Reports a scripted completion reason per provider request, so a turn that
+    /// spans several rounds can be driven without a provider.
+    ///
+    /// Once the script runs out it reports nothing, which ends the turn. A
+    /// provider that answered `NeedCall` forever would keep [`Agent::run_turn`]
+    /// opening fresh requests and never return.
+    struct ScriptedProvider {
+        reasons: std::collections::VecDeque<CompletedReason>,
+    }
+
+    impl ScriptedProvider {
+        fn new(reasons: impl IntoIterator<Item = CompletedReason>) -> Self {
+            Self {
+                reasons: reasons.into_iter().collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "scripted-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(self
+                .reasons
+                .pop_front()
+                .map_or(ProviderSignal::Unsupported, ProviderSignal::Completed))
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
+        {
+            Ok(Box::pin(stream::once(async { Ok(()) })))
+        }
+    }
+
+    fn turn_finished(events: &mut UnboundedReceiver<AgentViewEvent>) -> Option<bool> {
+        std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
+            AgentViewEvent::TurnFinished { completed } => Some(completed),
+            _ => None,
+        })
+    }
+
+    /// Asks for another tool round forever. Safe to run only because the round
+    /// cap stops it; without one this hangs and grows without bound.
+    struct RunawayProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for RunawayProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "runaway-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(ProviderSignal::Completed(CompletedReason::NeedCall))
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
+        {
+            Ok(Box::pin(stream::once(async { Ok(()) })))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_never_settles_is_cut_off() {
+        let mut agent = Agent::new(RunawayProvider);
+        let mut events = agent.subscribe_view();
+
+        let error = agent.continue_turn("ask something").await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("without a final answer"),
+            "the reason has to reach the caller: {error}"
+        );
+
+        let seen = drain(&mut events);
+
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                AgentViewEvent::Err(message) if message.contains("without a final answer")
+            )),
+            "and the screen, so the user is not left guessing"
+        );
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, AgentViewEvent::TurnFinished { completed: false })),
+            "a cut-off turn is not a finished one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_reaches_a_final_answer_reports_it_completed() {
+        let mut agent = Agent::new(ScriptedProvider::new([CompletedReason::Final]));
+        let mut events = agent.subscribe_view();
+
+        agent.continue_turn("ask something").await.unwrap();
+
+        assert_eq!(
+            turn_finished(&mut events),
+            Some(true),
+            "the view needs this to decide whether to summarise the wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_round_does_not_end_the_turn() {
+        let mut agent = Agent::new(ScriptedProvider::new([
+            CompletedReason::NeedCall,
+            CompletedReason::Final,
+        ]));
+        let mut events = agent.subscribe_view();
+
+        agent.continue_turn("ask something").await.unwrap();
+
+        assert_eq!(
+            turn_finished(&mut events),
+            Some(true),
+            "the final answer came on the second request, and it still counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_never_reached_a_final_answer_reports_that() {
+        let mut agent = Agent::new(ScriptedProvider::new([CompletedReason::NeedCall]));
+        let mut events = agent.subscribe_view();
+
+        // The second request reports nothing, which is how this ends rather than
+        // asking for another tool round forever.
+        agent.continue_turn("ask something").await.unwrap();
+
+        assert_eq!(turn_finished(&mut events), Some(false));
     }
 
     #[test]

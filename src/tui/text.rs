@@ -61,7 +61,24 @@ pub fn verbatim(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
                     flush(&mut current, &mut used);
                 }
 
-                let (fits, tail) = split_at_width(rest, width - used);
+                let mut fits = fitting_prefix(rest, width - used);
+
+                // A double-width character can miss a single remaining column.
+                // Give it a whole line before giving up on fitting it.
+                if fits.is_empty() && used > 0 {
+                    flush(&mut current, &mut used);
+                    fits = fitting_prefix(rest, width);
+                }
+
+                // Wider than a whole line: take it anyway. Overflowing by a column
+                // is a blemish; not advancing here would spin forever.
+                let taken = if fits.is_empty() {
+                    first_character(rest)
+                } else {
+                    fits.len()
+                };
+
+                let (fits, tail) = rest.split_at(taken);
 
                 used += fits.width();
                 current.push(Span::styled(fits.to_owned(), span.style));
@@ -79,21 +96,29 @@ pub fn verbatim(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Splits at the last character boundary that still fits `room` columns.
-fn split_at_width(text: &str, room: usize) -> (&str, &str) {
+/// The longest prefix of `text` that fits `room` columns.
+///
+/// Empty when even the first character is too wide, which callers have to handle:
+/// treating an empty prefix as progress is how a layout loop hangs.
+fn fitting_prefix(text: &str, room: usize) -> &str {
     let mut used = 0;
 
     for (offset, character) in text.char_indices() {
         let character_width = character.to_string().width();
 
         if used + character_width > room {
-            return text.split_at(offset);
+            return &text[..offset];
         }
 
         used += character_width;
     }
 
-    (text, "")
+    text
+}
+
+/// Byte length of the first character, so a caller can always advance by one.
+fn first_character(text: &str) -> usize {
+    text.char_indices().nth(1).map_or(text.len(), |(at, _)| at)
 }
 
 /// Splits a run of text into words and the whitespace between them, keeping
@@ -276,6 +301,38 @@ mod tests {
         assert_eq!(
             texts(&verbatim(&[plain("one\n\ntwo")], 40)),
             ["one", "", "two"]
+        );
+    }
+
+    /// A double-width character that misses the last column used to leave the
+    /// layout loop pushing empty fragments forever.
+    #[test]
+    fn verbatim_moves_a_wide_character_to_the_next_line() {
+        assert_eq!(
+            texts(&verbatim(&[plain("ab中")], 3)),
+            ["ab", "中"],
+            "two columns are left, and the character needs two of its own"
+        );
+    }
+
+    #[test]
+    fn verbatim_survives_a_character_wider_than_the_line() {
+        assert_eq!(
+            texts(&verbatim(&[plain("中文")], 1)),
+            ["中", "文"],
+            "it has to advance even where nothing can fit"
+        );
+    }
+
+    #[test]
+    fn verbatim_wraps_a_comment_in_a_wide_script() {
+        let lines = texts(&verbatim(&[plain("let x = 1; // 记录当前值")], 15));
+
+        assert!(lines.len() > 1, "{lines:?}");
+        assert_eq!(
+            lines.concat().replace(' ', ""),
+            "letx=1;//记录当前值".replace(' ', ""),
+            "nothing may be dropped or duplicated on the way"
         );
     }
 

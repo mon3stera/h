@@ -1,4 +1,8 @@
-use std::{io::stdout, panic, time::Duration};
+use std::{
+    io::stdout,
+    panic,
+    time::{Duration, Instant},
+};
 
 use futures::StreamExt;
 use ratatui::{
@@ -38,6 +42,10 @@ const SPINNER: [(&str, &str); 4] = [
 ];
 
 const SPINNER_PERIOD: Duration = Duration::from_millis(200);
+
+/// The widest spinner word. Padding to it keeps the elapsed time from shuffling
+/// left and right as the animation cycles.
+const SPINNER_WIDTH: usize = 8;
 
 /// How far the transcript moves for one page key.
 const PAGE: isize = 10;
@@ -171,10 +179,25 @@ struct App {
     /// The transcript's height on the last draw, so scroll keys know the page
     /// size before the next one.
     viewport: u16,
+    /// When the running turn began. A turn spans every provider request its tool
+    /// calls set off, so this is not reset between them.
+    started: Option<Instant>,
 }
 
 impl App {
     fn handle_agent_event(&mut self, event: AgentViewEvent) {
+        match &event {
+            AgentViewEvent::TurnStart => self.started = Some(Instant::now()),
+            AgentViewEvent::TurnFinished { completed } => {
+                if let Some(started) = self.started.take() {
+                    if *completed {
+                        self.state.units.push(RenderUnit::Done(started.elapsed()));
+                    }
+                }
+            }
+            _ => {}
+        }
+
         if reduce_view_event(&mut self.state, event).is_err() {
             tracing::error!(
                 event = "ui.view_event.failed",
@@ -349,10 +372,17 @@ impl App {
 
     fn spinner_line(&self) -> Line<'static> {
         let (glyph, word) = SPINNER[self.spinner];
+        let elapsed = self
+            .started
+            .map(|started| format!(" ({}s)", started.elapsed().as_secs()))
+            .unwrap_or_default();
 
         Line::from(vec![
             Span::styled(format!("{glyph} "), Style::default().fg(Color::Cyan)),
-            Span::styled(word, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{word:<SPINNER_WIDTH$}{elapsed}"),
+                Style::default().fg(Color::DarkGray),
+            ),
         ])
     }
 }
@@ -744,6 +774,106 @@ mod tests {
         let busy = drawn(&mut app, &mut terminal);
 
         assert!(busy.iter().any(|row| row.contains("h-...")), "{busy:?}");
+    }
+
+    #[test]
+    fn the_padding_matches_the_widest_spinner_word() {
+        assert_eq!(
+            SPINNER.iter().map(|(_, word)| word.len()).max().unwrap(),
+            SPINNER_WIDTH,
+            "a wider word would push the elapsed time out of its column"
+        );
+    }
+
+    #[test]
+    fn the_elapsed_time_sits_in_the_same_column_whatever_the_frame() {
+        let (mut app, mut terminal) = app_with_size(40, 8);
+        app.state.turn_in_progress = true;
+        app.handle_agent_event(AgentViewEvent::TurnStart);
+
+        let column = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            drawn(app, terminal)
+                .into_iter()
+                .find(|row| row.contains("(0s)"))
+                .and_then(|row| row.find("(0s)"))
+        };
+
+        let first = column(&mut app, &mut terminal);
+        app.advance_spinner();
+        app.advance_spinner();
+        let later = column(&mut app, &mut terminal);
+
+        assert!(first.is_some(), "the counter should be drawn");
+        assert_eq!(first, later, "it must not shuffle as the animation cycles");
+    }
+
+    #[test]
+    fn the_counter_appears_only_once_a_turn_is_running() {
+        let (mut app, mut terminal) = app_with_size(40, 8);
+        app.state.turn_in_progress = true;
+
+        assert!(
+            !drawn(&mut app, &mut terminal)
+                .iter()
+                .any(|row| row.contains("(")),
+            "no turn has started, so there is nothing to count"
+        );
+
+        app.handle_agent_event(AgentViewEvent::TurnStart);
+
+        assert!(
+            drawn(&mut app, &mut terminal)
+                .iter()
+                .any(|row| row.contains("(0s)"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_leaves_a_summary_in_the_transcript() {
+        let (mut app, mut terminal) = app_with_size(40, 10);
+
+        app.handle_agent_event(AgentViewEvent::TurnStart);
+        app.handle_agent_event(AgentViewEvent::TurnFinished { completed: true });
+
+        assert!(
+            drawn(&mut app, &mut terminal)
+                .iter()
+                .any(|row| row.starts_with("❃ Done for")),
+            "the record of the wait should outlive the spinner"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_is_not_summarised() {
+        let (mut app, mut terminal) = app_with_size(40, 10);
+
+        app.handle_agent_event(AgentViewEvent::TurnStart);
+        app.handle_agent_event(AgentViewEvent::TurnFinished { completed: false });
+
+        assert!(
+            !drawn(&mut app, &mut terminal)
+                .iter()
+                .any(|row| row.contains("Done for")),
+            "a turn that failed already said why"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_does_not_restart_the_clock() {
+        let (mut app, _) = app_with_size(40, 10);
+
+        app.handle_agent_event(AgentViewEvent::TurnStart);
+        let started = app.started;
+
+        // A tool round ends with `Completed`, and the next request follows inside
+        // the same turn.
+        app.handle_agent_event(AgentViewEvent::Completed);
+        app.handle_agent_event(AgentViewEvent::TextDelta("more".to_owned()));
+
+        assert_eq!(
+            app.started, started,
+            "the clock spans the whole turn, not one provider request"
+        );
     }
 
     #[test]

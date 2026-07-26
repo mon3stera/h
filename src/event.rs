@@ -30,7 +30,11 @@ pub enum AgentViewEvent {
     TextDelta(String),
     Tool(Presentation),
     TurnStart,
-    TurnFinished,
+    /// `completed` is true when the turn ended because the model finished
+    /// speaking, rather than because it failed part way through.
+    TurnFinished {
+        completed: bool,
+    },
     Completed,
     Err(String),
 }

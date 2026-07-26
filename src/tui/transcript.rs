@@ -9,6 +9,14 @@ use crate::{
     ui::{RenderGroup, RenderUnit, ViewState, explore_presentation, group_units},
 };
 
+/// Opens the model's own prose, so it is as easy to pick out as a prompt.
+const RESPONSE_MARKER: &str = "❋ ";
+/// What its later rows keep, so the whole answer reads as one block.
+const RESPONSE_INDENT: &str = "  ";
+
+/// Closes a finished turn.
+const DONE_MARKER: &str = "❃ ";
+
 /// The conversation as drawable lines, kept between frames.
 ///
 /// Laying the transcript out is the expensive part of drawing, and almost every
@@ -18,11 +26,6 @@ use crate::{
 /// Slicing is also what keeps a long session cheap. Only the rows inside the
 /// viewport are handed to the terminal, so a thousand entries cost no more to
 /// draw than a dozen.
-/// Opens the model's own prose, so it is as easy to pick out as a prompt.
-const RESPONSE_MARKER: &str = "❋ ";
-/// What its later rows keep, so the whole answer reads as one block.
-const RESPONSE_INDENT: &str = "  ";
-
 #[derive(Default)]
 pub struct Transcript {
     lines: Vec<Line<'static>>,
@@ -108,6 +111,10 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
                 RenderUnit::Text(text) => response(&parse_markdown(text), width),
                 RenderUnit::ParsedMarkdown(blocks) => response(blocks, width),
                 RenderUnit::Prompt(text) => vec![crate::tui::rainbow(&format!("❯ {text}"))],
+                RenderUnit::Done(elapsed) => vec![Line::from(Span::styled(
+                    format!("{DONE_MARKER}Done for {}s", elapsed.as_secs()),
+                    Style::default().fg(Color::DarkGray),
+                ))],
                 RenderUnit::Err(error) => vec![Line::from(ratatui::text::Span::styled(
                     format!("✖ {error}"),
                     ratatui::style::Style::default().fg(ratatui::style::Color::Red),
@@ -294,6 +301,37 @@ mod tests {
             ["❋ first", "", "  second"],
             "indenting an empty row would leave trailing spaces behind"
         );
+    }
+
+    #[test]
+    fn a_finished_turn_is_summarised_in_grey() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Done(std::time::Duration::from_secs(48))]),
+            40,
+        );
+
+        let lines = transcript.visible(10);
+
+        assert_eq!(texts(lines), ["❃ Done for 48s"]);
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(Color::DarkGray),
+            "it reports rather than announces"
+        );
+    }
+
+    #[test]
+    fn a_summary_rounds_down_to_whole_seconds() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Done(std::time::Duration::from_millis(
+                1_900,
+            ))]),
+            40,
+        );
+
+        assert_eq!(texts(transcript.visible(10)), ["❃ Done for 1s"]);
     }
 
     #[test]

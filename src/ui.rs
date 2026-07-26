@@ -35,7 +35,7 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
         match value {
             AgentViewEvent::Startup { .. } => anyhow::bail!("must update startup state"),
             AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
-            AgentViewEvent::TurnStart | AgentViewEvent::TurnFinished => {
+            AgentViewEvent::TurnStart | AgentViewEvent::TurnFinished { .. } => {
                 anyhow::bail!("should not be rendered")
             }
             AgentViewEvent::Prompt(prompt) => Ok(RenderUnit::Prompt(prompt)),
@@ -132,6 +132,9 @@ fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit
 #[derive(Debug, Clone)]
 pub enum RenderUnit {
     Text(String),
+    /// How long a finished turn took, kept in the transcript so the record of a
+    /// long wait survives scrolling away from it.
+    Done(Duration),
     ParsedMarkdown(Vec<MarkdownBlock>),
     Tool(Presentation),
     Prompt(String),
@@ -173,7 +176,7 @@ pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow
             state.turn_in_progress = true;
             Ok(())
         }
-        AgentViewEvent::TurnFinished => {
+        AgentViewEvent::TurnFinished { .. } => {
             state.turn_in_progress = false;
             Ok(())
         }
