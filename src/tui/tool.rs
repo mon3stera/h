@@ -15,13 +15,16 @@ const ADDED_WASH: Color = Color::Rgb(0x1c, 0x3d, 0x28);
 
 const MUTED: Color = Color::DarkGray;
 
+/// Where a wrapped title's later rows begin.
+const TITLE_INDENT: &str = "  ";
+
 /// The indent under a tool's title, matching the glyphs the blocks use.
 const BLOCK_INDENT: &str = "   ";
 const NESTED_INDENT: &str = "     ";
 
 /// Lays out one tool call: a title, then whatever the presenter attached.
 pub fn render(presentation: &Presentation, width: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![title(presentation)];
+    let mut lines = title(presentation, width);
 
     for block in &presentation.blocks {
         lines.extend(render_block(block, width));
@@ -30,7 +33,9 @@ pub fn render(presentation: &Presentation, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn title(presentation: &Presentation) -> Line<'static> {
+/// The title, wrapped rather than left to run off the edge — a long command or
+/// search pattern easily outruns a terminal.
+fn title(presentation: &Presentation, width: usize) -> Vec<Line<'static>> {
     let indicator = match &presentation.status {
         ToolCallStatus::Running => "⟳ ",
         ToolCallStatus::Succeeded => "● ",
@@ -38,11 +43,29 @@ fn title(presentation: &Presentation) -> Line<'static> {
     };
 
     let target = presentation.target.as_deref().unwrap_or("unknown");
-
-    crate::tui::rainbow(&format!(
+    let text = format!(
         "{} {}({}) <- ({})",
         indicator, presentation.name, target, presentation.label
-    ))
+    );
+
+    let inner = width.saturating_sub(TITLE_INDENT.len()).max(1);
+
+    wrap(&crate::tui::rainbow_spans(&text, Style::default()), inner)
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            // A continuation is indented so it cannot be read as another entry
+            // starting at the margin.
+            if offset == 0 {
+                return line;
+            }
+
+            let mut spans = vec![Span::raw(TITLE_INDENT)];
+            spans.extend(line.spans);
+
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn render_block(block: &DisplayBlock, width: usize) -> Vec<Line<'static>> {
@@ -247,6 +270,22 @@ mod tests {
             .collect()
     }
 
+    /// The lines a presentation's blocks draw, skipping however many the title
+    /// took. Slicing a fixed offset would break the moment a title wraps.
+    fn block_lines(presentation: &Presentation, width: usize) -> Vec<Line<'static>> {
+        let mut bare = presentation.clone();
+        bare.blocks = Vec::new();
+
+        let title_rows = render(&bare, width).len();
+        let mut lines = render(presentation, width);
+
+        lines.split_off(title_rows)
+    }
+
+    fn block_rows(presentation: &Presentation, width: usize) -> Vec<String> {
+        texts(&block_lines(presentation, width))
+    }
+
     fn diff_line(number: usize, kind: DiffLineKind, text: &str) -> DiffLine {
         DiffLine {
             number,
@@ -260,6 +299,38 @@ mod tests {
         let lines = render(&presentation(Vec::new()), 60);
 
         assert_eq!(texts(&lines), ["●  Edit(src/main.rs) <- (built-in)"]);
+    }
+
+    #[test]
+    fn a_long_title_wraps_instead_of_running_off_the_edge() {
+        let mut shown = presentation(Vec::new());
+        shown.name = "Bash".to_owned();
+        shown.target = Some("cargo test --workspace --all-features -- --nocapture".to_owned());
+
+        let rows = texts(&render(&shown, 30));
+
+        assert!(rows.len() > 1, "it should have wrapped: {rows:?}");
+        assert!(
+            rows.iter().all(|row| row.chars().count() <= 30),
+            "no row may outrun the terminal: {rows:?}"
+        );
+        assert!(
+            rows[1].starts_with("  "),
+            "a continuation is indented so it is not read as a new entry: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_title_that_fits_stays_on_one_row() {
+        assert_eq!(render(&presentation(Vec::new()), 60).len(), 1);
+    }
+
+    #[test]
+    fn a_wrapped_title_still_carries_its_blocks() {
+        let mut shown = presentation(vec![DisplayBlock::Summary("done".to_owned())]);
+        shown.target = Some("a target long enough to force the title onto two rows".to_owned());
+
+        assert_eq!(block_rows(&shown, 30), ["   └ done"]);
     }
 
     #[test]
@@ -283,7 +354,7 @@ mod tests {
 
     #[test]
     fn a_summary_hangs_under_the_glyph() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::Summary(
                 "alpha beta gamma delta".to_owned(),
             )]),
@@ -291,7 +362,7 @@ mod tests {
         );
 
         assert_eq!(
-            texts(&lines)[1..],
+            rows,
             ["   └ alpha beta", "     gamma delta"],
             "the wrapped remainder lines up past the glyph"
         );
@@ -299,7 +370,7 @@ mod tests {
 
     #[test]
     fn key_values_are_listed_one_per_row() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::KeyValue {
                 entries: vec![KeyValueEntry {
                     key: "exit_code".to_owned(),
@@ -309,12 +380,12 @@ mod tests {
             40,
         );
 
-        assert_eq!(texts(&lines)[1], "     - exit_code: 0");
+        assert_eq!(rows, ["     - exit_code: 0"]);
     }
 
     #[test]
     fn a_diff_puts_the_number_before_the_sign() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::Diff {
                 lines: vec![
                     diff_line(9, DiffLineKind::Context, "kept"),
@@ -325,15 +396,12 @@ mod tests {
             40,
         );
 
-        assert_eq!(
-            texts(&lines)[1..],
-            ["      9  kept", "     10 -old", "     10 +new"]
-        );
+        assert_eq!(rows, ["      9  kept", "     10 -old", "     10 +new"]);
     }
 
     #[test]
     fn only_changed_diff_rows_are_washed() {
-        let lines = render(
+        let lines = block_lines(
             &presentation(vec![DisplayBlock::Diff {
                 lines: vec![
                     diff_line(1, DiffLineKind::Context, "kept"),
@@ -344,10 +412,7 @@ mod tests {
             40,
         );
 
-        let backgrounds = lines[1..]
-            .iter()
-            .map(|line| line.style.bg)
-            .collect::<Vec<_>>();
+        let backgrounds = lines.iter().map(|line| line.style.bg).collect::<Vec<_>>();
 
         assert_eq!(
             backgrounds,
@@ -358,7 +423,7 @@ mod tests {
 
     #[test]
     fn code_blocks_number_their_lines_when_asked() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::CodeBlock {
                 language: None,
                 content: "one\ntwo".to_owned(),
@@ -369,12 +434,12 @@ mod tests {
             40,
         );
 
-        assert_eq!(texts(&lines)[1..], ["      9 one", "     10 two"]);
+        assert_eq!(rows, ["      9 one", "     10 two"]);
     }
 
     #[test]
     fn an_empty_code_block_still_gets_a_numbered_row() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::CodeBlock {
                 language: None,
                 content: String::new(),
@@ -385,12 +450,12 @@ mod tests {
             40,
         );
 
-        assert_eq!(texts(&lines)[1], "     42 ");
+        assert_eq!(rows, ["     42 "]);
     }
 
     #[test]
     fn a_code_block_stops_at_its_truncation_limit() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::CodeBlock {
                 language: None,
                 content: "a\nb\nc\nd".to_owned(),
@@ -401,12 +466,12 @@ mod tests {
             40,
         );
 
-        assert_eq!(texts(&lines)[1..], ["     a", "     b"]);
+        assert_eq!(rows, ["     a", "     b"]);
     }
 
     #[test]
     fn a_table_pads_its_columns_to_the_widest_cell() {
-        let lines = render(
+        let rows = block_rows(
             &presentation(vec![DisplayBlock::Table {
                 headers: vec!["name".to_owned(), "n".to_owned()],
                 rows: vec![vec!["a-long-name".to_owned(), "1".to_owned()]],
@@ -414,9 +479,6 @@ mod tests {
             60,
         );
 
-        assert_eq!(
-            texts(&lines)[1..],
-            ["     name         n", "     a-long-name  1"]
-        );
+        assert_eq!(rows, ["     name         n", "     a-long-name  1"]);
     }
 }
