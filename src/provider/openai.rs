@@ -1,8 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_openai::{
-    Client, config::OpenAIConfig, error::OpenAIError, types::responses::{
-        CodeInterpreterTool, CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, FileSearchTool, FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, FunctionToolCallOutputResource, InputItem::{self, EasyMessage}, Item, MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning, ReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool, WebSearchTool,
+    Client,
+    config::OpenAIConfig,
+    error::OpenAIError,
+    types::responses::{
+        CodeInterpreterTool, CreateResponse, CreateResponseArgs, EasyInputContent,
+        EasyInputMessage, FileSearchTool, FunctionCallOutput, FunctionCallOutputItemParam,
+        FunctionTool, FunctionToolCall, FunctionToolCallOutputResource,
+        InputItem::{self, EasyMessage},
+        Item, MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning,
+        ReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool, WebSearchTool,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -137,9 +145,9 @@ impl OpenAIProvider {
 
         let client = Client::with_config(client_config);
 
-        let tools = vec![
-            async_openai::types::responses::Tool::WebSearch(WebSearchTool::default()),
-        ];
+        let tools = vec![async_openai::types::responses::Tool::WebSearch(
+            WebSearchTool::default(),
+        )];
 
         Self {
             config,
@@ -868,10 +876,12 @@ impl Provider for OpenAIProvider {
 
     fn define_tools(&mut self, specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
         let tool_count = specs.len();
-        self.tools.extend(specs
-            .into_iter()
-            .map(Self::compile_tool)
-            .collect::<anyhow::Result<Vec<_>>>()?);
+        self.tools.extend(
+            specs
+                .into_iter()
+                .map(Self::compile_tool)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
         tracing::info!(
             event = "provider.tools.defined",
             provider = "openai",
@@ -963,15 +973,14 @@ impl Provider for OpenAIProvider {
             .responses()
             .create_stream_byot::<_, Value>(request)
             .await?
-            .map(|v| {
-                match v {
-                    Ok(mut value) => {
-                        patch(&mut value);
-                        let raw = serde_json::to_string(&value).unwrap();
-                        serde_json::from_value::<ResponseStreamEvent>(value).map_err(|err| OpenAIError::JSONDeserialize(err, raw))
-                    }
-                    Err(e) => Err(e),
+            .map(|v| match v {
+                Ok(mut value) => {
+                    patch(&mut value);
+                    let raw = serde_json::to_string(&value).unwrap();
+                    serde_json::from_value::<ResponseStreamEvent>(value)
+                        .map_err(|err| OpenAIError::JSONDeserialize(err, raw))
                 }
+                Err(e) => Err(e),
             })
             .filter_map(|result| async move {
                 match result {

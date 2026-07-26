@@ -31,6 +31,8 @@ async fn main() -> anyhow::Result<()> {
         .with_internal_tools()?
         .with_global_prompts()
         .await?
+        .with_workspace_info()
+        .await?
         .initialize()?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);

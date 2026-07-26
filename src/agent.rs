@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::{
     bus::EventBus,
-    context::{Context, Message},
+    context::{Context, Message, built_in_workspace_info},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
     tool::{
@@ -78,13 +78,19 @@ where
             .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter)
             .register_with_presenter(GrepTool, crate::tool::GrepPresenter)
             .register(EditTool)
-            .register(BashTool::new());
+            .register_with_presenter(BashTool::new(), crate::tool::BashPresenter);
 
         Ok(self)
     }
 
     pub async fn with_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
         self.context.inject_global_prompts().await?;
+        Ok(self)
+    }
+
+    pub async fn with_workspace_info(&mut self) -> anyhow::Result<&mut Self> {
+        let info = built_in_workspace_info();
+        self.context.inject_workspace_info(info).await?;
         Ok(self)
     }
 
@@ -238,6 +244,12 @@ where
         }
     }
 
+    async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {
+        let context = Context::resume(id).await?;
+        self.context = context;
+        Ok(self)
+    }
+
     async fn next_turn(&mut self, metrics: &mut TurnMetrics) -> anyhow::Result<()> {
         match &self.turn {
             NextTurn::Prompt(prompt) => {
@@ -312,9 +324,10 @@ mod tests {
     use std::pin::Pin;
 
     use futures::{Stream, stream};
+    use serde_json::json;
 
     use super::*;
-    use crate::tool::ToolDefinition;
+    use crate::tool::{ToolCall, ToolCallStatus, ToolDefinition};
 
     struct TestProvider;
 
@@ -361,5 +374,26 @@ mod tests {
                 thinking_effort: Some(thinking_effort),
             } if model == "test-model" && thinking_effort == "high"
         ));
+    }
+
+    #[test]
+    fn internal_bash_tool_uses_bash_presenter() {
+        let mut agent = Agent::new(TestProvider);
+        agent.with_internal_tools().unwrap();
+        let call = ToolCall::new(
+            "call-1",
+            "bash",
+            json!({
+                "action": "run_blocking",
+                "command": "cargo test",
+            }),
+        );
+
+        let presentation = agent.tool.present_running(&call);
+
+        assert_eq!(presentation.name, "Bash");
+        assert_eq!(presentation.label, "built-in");
+        assert_eq!(presentation.target.as_deref(), Some("cargo test"));
+        assert!(matches!(presentation.status, ToolCallStatus::Running));
     }
 }

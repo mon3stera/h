@@ -231,7 +231,7 @@ pub fn UI(mut hooks: Hooks, props: &UIProp) -> impl Into<AnyElement<'static>> {
         View(width: width, height: height, flex_direction: FlexDirection::Column) {
             View(width: 100pct, flex_grow: 1.0_f32, overflow: Overflow::Hidden) {
                 ScrollView(
-                    auto_scroll: false,
+                    auto_scroll: true,
                     scrollbar: Some(false),
                     keyboard_scroll: Some(false),
                 ) {
