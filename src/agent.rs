@@ -290,6 +290,12 @@ where
         self.context.archive().await
     }
 
+    /// What the user asked in this session, oldest first, for the prompt box to
+    /// offer back on recall.
+    pub fn prompts(&self) -> Vec<String> {
+        self.context.prompts()
+    }
+
     pub async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {
         let context = Context::resume(id).await?;
         self.context = context;

@@ -36,7 +36,7 @@ enum Direction {
 /// arrives as an ESC-prefixed return, which nearly every terminal sends.
 pub struct Input {
     area: TextArea<'static>,
-    /// Prompts already sent, oldest last.
+    /// Prompts already sent, oldest first.
     history: Vec<String>,
     /// Which entry the box is showing. `None` means it is showing the draft.
     recalled: Option<usize>,
@@ -106,6 +106,14 @@ impl Input {
         self.draft.clear();
 
         Some(prompt)
+    }
+
+    /// Fills the history from a resumed session, so what was asked before can be
+    /// recalled as if it had just been typed.
+    pub fn seed(&mut self, prompts: impl IntoIterator<Item = String>) {
+        for prompt in prompts {
+            self.remember(prompt);
+        }
     }
 
     /// Files a sent prompt, skipping a repeat of the newest so holding one key
@@ -443,6 +451,42 @@ mod tests {
             &format!("prompt {}", HISTORY_LIMIT + 19),
             "the newest survives; the oldest are dropped"
         );
+    }
+
+    #[test]
+    fn a_seeded_history_is_recalled_newest_first() {
+        let mut input = Input::default();
+
+        input.seed(["oldest".to_owned(), "newest".to_owned()]);
+
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "newest");
+
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "oldest");
+    }
+
+    #[test]
+    fn a_prompt_sent_after_seeding_lands_on_top() {
+        let mut input = Input::default();
+
+        input.seed(["from the archive".to_owned()]);
+        send(&mut input, "asked just now");
+
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "asked just now");
+
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "from the archive");
+    }
+
+    #[test]
+    fn seeding_obeys_the_same_cap() {
+        let mut input = Input::default();
+
+        input.seed((0..HISTORY_LIMIT + 20).map(|index| format!("prompt {index}")));
+
+        assert_eq!(input.history.len(), HISTORY_LIMIT);
     }
 
     #[test]

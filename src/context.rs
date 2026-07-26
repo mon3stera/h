@@ -316,6 +316,17 @@ impl Context {
         &self.histories
     }
 
+    /// The prompts the user sent, oldest first.
+    pub fn prompts(&self) -> Vec<String> {
+        self.histories
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(prompt) => Some(prompt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether anything happened worth keeping. System messages are injected on
     /// every start, so a context holding only those is an untouched session.
     pub fn has_exchange(&self) -> bool {
@@ -654,6 +665,27 @@ mod tests {
         context.finalize_buf(Message::Assistant);
 
         assert_eq!(context.histories().len(), 1);
+    }
+
+    #[test]
+    fn prompts_are_reported_in_the_order_they_were_asked() {
+        let context = Context {
+            id: "session-1".to_owned(),
+            buf: String::new(),
+            histories: vec![
+                Message::System("workspace info".to_owned()),
+                Message::User("first".to_owned()),
+                Message::Assistant("answer".to_owned()),
+                Message::ToolCall {
+                    call_id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                Message::User("second".to_owned()),
+            ],
+        };
+
+        assert_eq!(context.prompts(), ["first", "second"]);
     }
 
     #[test]

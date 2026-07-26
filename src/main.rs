@@ -68,6 +68,10 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         agent.rebroadcast_all_view();
     }
 
+    // Taken before the agent moves into the worker: a resumed session's prompts
+    // seed the prompt box so they can be recalled.
+    let history = agent.prompts();
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
 
     tracing::info!(event = "app.ready");
@@ -106,7 +110,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         archived
     });
 
-    tui::app::run(tx, bus_rx, ui_request_rx).await?;
+    tui::app::run(tx, bus_rx, ui_request_rx, history).await?;
 
     tracing::info!(event = "app.ui.closed");
 

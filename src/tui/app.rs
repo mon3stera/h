@@ -48,9 +48,11 @@ pub async fn run(
     // Questions the agent is waiting on. Answering them is not wired up yet, the
     // same as before the move to ratatui.
     _requests: Receiver<UiRequest>,
+    // What a resumed session already asked, so recall reaches back into it.
+    history: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut terminal = enter()?;
-    let outcome = drive(&mut terminal, committer, &mut events).await;
+    let outcome = drive(&mut terminal, committer, &mut events, history).await;
 
     leave();
     outcome
@@ -86,8 +88,11 @@ async fn drive(
     terminal: &mut DefaultTerminal,
     committer: Sender<String>,
     events: &mut UnboundedReceiver<AgentViewEvent>,
+    history: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut app = App::default();
+
+    app.input.seed(history);
     let mut keys = EventStream::new();
     let mut spinner = tokio::time::interval(SPINNER_PERIOD);
 
