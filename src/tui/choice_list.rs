@@ -101,6 +101,15 @@ impl ChoiceList {
         self.selected
     }
 
+    /// Rows the list would draw, for a caller that has to reserve room.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     fn on_free_text(&self) -> bool {
         matches!(
             self.items.get(self.selected),

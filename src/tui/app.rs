@@ -13,13 +13,20 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, BorderType, Borders, Paragraph},
 };
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver};
+use tokio::sync::{
+    mpsc::{Receiver, Sender, UnboundedReceiver},
+    oneshot,
+};
 
 use crate::{
-    event::{AgentViewEvent, UiRequest},
-    tui::{input::Input, transcript::Transcript},
+    event::{AgentViewEvent, AskAnswer, UiRequest},
+    tui::{
+        choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
+        input::Input,
+        transcript::Transcript,
+    },
     ui::{RenderUnit, ViewState, reduce_view_event},
 };
 
@@ -38,6 +45,9 @@ const PAGE: isize = 10;
 /// Rows per notch of the wheel.
 const WHEEL_STEP: isize = 3;
 
+/// The two rules and the question line around a set of options.
+const ASK_FRAME: u16 = 3;
+
 /// Runs the conversation view until the user quits.
 ///
 /// Returns once Ctrl+C is pressed or the agent's event channel closes, at which
@@ -45,14 +55,20 @@ const WHEEL_STEP: isize = 3;
 pub async fn run(
     committer: Sender<String>,
     mut events: UnboundedReceiver<AgentViewEvent>,
-    // Questions the agent is waiting on. Answering them is not wired up yet, the
-    // same as before the move to ratatui.
-    _requests: Receiver<UiRequest>,
+    // Questions the agent is waiting on, each carrying the channel to answer on.
+    mut requests: Receiver<UiRequest>,
     // What a resumed session already asked, so recall reaches back into it.
     history: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut terminal = enter()?;
-    let outcome = drive(&mut terminal, committer, &mut events, history).await;
+    let outcome = drive(
+        &mut terminal,
+        committer,
+        &mut events,
+        &mut requests,
+        history,
+    )
+    .await;
 
     leave();
     outcome
@@ -88,6 +104,7 @@ async fn drive(
     terminal: &mut DefaultTerminal,
     committer: Sender<String>,
     events: &mut UnboundedReceiver<AgentViewEvent>,
+    requests: &mut Receiver<UiRequest>,
     history: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut app = App::default();
@@ -117,6 +134,13 @@ async fn drive(
                 Some(event) => app.handle_agent_event(event),
                 None => return Ok(()),
             },
+            // Guarded: pulling a second question while one is unanswered would
+            // strand the first, and the agent would wait on it forever.
+            request = requests.recv(), if !app.is_asking() => {
+                if let Some(request) = request {
+                    app.begin_ask(request);
+                }
+            }
             _ = spinner.tick() => app.advance_spinner(),
         }
     }
@@ -128,11 +152,21 @@ enum Flow {
     Quit,
 }
 
+/// A question from the agent, and the channel it is waiting on.
+struct Asking {
+    question: String,
+    list: ChoiceList,
+    reply: oneshot::Sender<AskAnswer>,
+}
+
 #[derive(Default)]
 struct App {
     state: ViewState,
     transcript: Transcript,
     input: Input,
+    /// Set while the agent is blocked on an answer. The prompt box steps aside
+    /// for it, because nothing else can move until the question is settled.
+    asking: Option<Asking>,
     spinner: usize,
     /// The transcript's height on the last draw, so scroll keys know the page
     /// size before the next one.
@@ -150,13 +184,72 @@ impl App {
         }
     }
 
+    fn is_asking(&self) -> bool {
+        self.asking.is_some()
+    }
+
+    /// Puts a question on screen, offering the agent's options plus a row for an
+    /// answer it did not think of.
+    fn begin_ask(&mut self, request: UiRequest) {
+        let UiRequest::Ask { question, reply } = request;
+
+        let mut items = question
+            .options
+            .iter()
+            .map(|option| match &option.description {
+                Some(description) => {
+                    ChoiceItem::described(option.label.clone(), description.clone())
+                }
+                None => ChoiceItem::choice(option.label.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        // The offered options are never the only answers available.
+        items.push(ChoiceItem::free_text("something else"));
+
+        self.asking = Some(Asking {
+            question: question.question,
+            list: ChoiceList::new(items),
+            reply,
+        });
+    }
+
+    fn answer(&mut self, outcome: ChoiceOutcome) {
+        let Some(asking) = self.asking.take() else {
+            return;
+        };
+
+        let answer = match outcome {
+            ChoiceOutcome::Choice { index, label } => AskAnswer::Option { index, label },
+            ChoiceOutcome::FreeText { text, .. } => AskAnswer::FreeText(text),
+        };
+
+        if asking.reply.send(answer).is_err() {
+            tracing::warn!(event = "ui.ask.reply_failed", error_class = "caller_gone",);
+        }
+    }
+
     async fn handle_key(&mut self, key: KeyEvent, committer: &Sender<String>) -> Flow {
         if key.kind == KeyEventKind::Release {
             return Flow::Continue;
         }
 
+        // Quitting outranks the question; the agent learns the answer was
+        // abandoned when the reply channel closes with the process.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Flow::Quit;
+        }
+
+        // An unanswered question owns the keyboard.
+        if let Some(asking) = &mut self.asking {
+            match asking.list.handle_key(key) {
+                ChoiceEvent::Idle => {}
+                ChoiceEvent::Submitted(outcome) => self.answer(outcome),
+                // Dropping the reply channel is how the tool hears "dismissed".
+                ChoiceEvent::Dismissed => self.asking = None,
+            }
+
+            return Flow::Continue;
         }
 
         let page = self.viewport as isize;
@@ -217,10 +310,10 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let indicator_height = u16::from(self.state.turn_in_progress);
-        let [transcript, indicator, input] = Layout::vertical([
+        let [transcript, indicator, bottom] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(indicator_height),
-            Constraint::Length(self.input.height()),
+            Constraint::Length(self.bottom_height()),
         ])
         .areas(frame.area());
 
@@ -231,7 +324,19 @@ impl App {
             frame.render_widget(Paragraph::new(self.spinner_line()), indicator);
         }
 
-        self.input.render(frame, input);
+        // The question takes the prompt box's place: answering it is the only
+        // thing that moves the session forward.
+        match &mut self.asking {
+            Some(asking) => render_ask(frame, bottom, asking),
+            None => self.input.render(frame, bottom),
+        }
+    }
+
+    fn bottom_height(&self) -> u16 {
+        match &self.asking {
+            Some(asking) => asking.height(),
+            None => self.input.height(),
+        }
     }
 
     fn render_transcript(&mut self, frame: &mut Frame, area: Rect) {
@@ -250,6 +355,35 @@ impl App {
             Span::styled(word, Style::default().fg(Color::DarkGray)),
         ])
     }
+}
+
+impl Asking {
+    /// A rule, the question, and one row per option.
+    fn height(&self) -> u16 {
+        ASK_FRAME + self.list.len() as u16
+    }
+}
+
+fn render_ask(frame: &mut Frame, area: Rect, asking: &mut Asking) {
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+
+    frame.render_widget(block, area);
+
+    let [question, options] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            asking.question.clone(),
+            Style::default().fg(Color::Cyan),
+        ))),
+        question,
+    );
+    asking.list.render(frame, options);
 }
 
 #[cfg(test)]
@@ -429,6 +563,173 @@ mod tests {
         assert!(
             app.transcript.is_pinned(),
             "only the wheel scrolls; a move must not"
+        );
+    }
+
+    use crate::event::{AskOption, AskQuestion};
+
+    fn ask(options: &[(&str, Option<&str>)]) -> (UiRequest, oneshot::Receiver<AskAnswer>) {
+        let (reply, answer) = oneshot::channel();
+
+        (
+            UiRequest::Ask {
+                question: AskQuestion {
+                    question: "which way?".to_owned(),
+                    options: options
+                        .iter()
+                        .map(|(label, description)| AskOption {
+                            label: (*label).to_owned(),
+                            description: description.map(str::to_owned),
+                        })
+                        .collect(),
+                },
+                reply,
+            },
+            answer,
+        )
+    }
+
+    #[test]
+    fn a_question_takes_the_place_of_the_prompt_box() {
+        let (mut app, mut terminal) = app_with_size(40, 12);
+        let (request, _answer) = ask(&[("left", Some("go left")), ("right", None)]);
+
+        app.begin_ask(request);
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(
+            rows.iter().any(|row| row.contains("which way?")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("❯ left  go left")),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("right")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("something else")),
+            "an answer the agent did not offer is always available: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn choosing_an_option_answers_the_agent() {
+        let (mut app, _) = app_with_size(40, 12);
+        let (committer, _rx) = mpsc::channel(1);
+        let (request, answer) = ask(&[("left", None), ("right", None)]);
+
+        app.begin_ask(request);
+        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(
+            answer.await.unwrap(),
+            AskAnswer::Option {
+                index: 1,
+                label: "right".to_owned(),
+            }
+        );
+        assert!(!app.is_asking(), "the question is settled");
+    }
+
+    #[tokio::test]
+    async fn a_written_answer_reaches_the_agent() {
+        let (mut app, _) = app_with_size(40, 12);
+        let (committer, _rx) = mpsc::channel(1);
+        let (request, answer) = ask(&[("left", None)]);
+
+        app.begin_ask(request);
+        // Up from the first row wraps onto the free-text row.
+        app.handle_key(press(KeyCode::Up, KeyModifiers::NONE), &committer)
+            .await;
+        for character in "neither".chars() {
+            app.handle_key(
+                press(KeyCode::Char(character), KeyModifiers::NONE),
+                &committer,
+            )
+            .await;
+        }
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(
+            answer.await.unwrap(),
+            AskAnswer::FreeText("neither".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissing_tells_the_agent_the_question_went_unanswered() {
+        let (mut app, _) = app_with_size(40, 12);
+        let (committer, _rx) = mpsc::channel(1);
+        let (request, answer) = ask(&[("left", None)]);
+
+        app.begin_ask(request);
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert!(!app.is_asking());
+        assert!(
+            answer.await.is_err(),
+            "a dropped reply channel is how the tool hears it"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_while_asked_does_not_reach_the_prompt_box() {
+        let (mut app, _) = app_with_size(40, 12);
+        let (committer, _rx) = mpsc::channel(1);
+        let (request, _answer) = ask(&[("left", None)]);
+
+        app.begin_ask(request);
+        for character in "hello".chars() {
+            app.handle_key(
+                press(KeyCode::Char(character), KeyModifiers::NONE),
+                &committer,
+            )
+            .await;
+        }
+
+        assert!(app.is_asking(), "the question is still waiting");
+        assert_eq!(
+            app.input.text(),
+            "",
+            "keystrokes meant for the question must not land in the prompt box"
+        );
+    }
+
+    /// The loop pulls the next request only while `!is_asking()`. This pins that
+    /// predicate; the `select!` arm that reads it is not itself under test.
+    #[tokio::test]
+    async fn a_second_question_waits_until_the_first_is_settled() {
+        let (mut app, _) = app_with_size(40, 12);
+        let (committer, _rx) = mpsc::channel(1);
+        let (first, answer) = ask(&[("a", None)]);
+
+        app.begin_ask(first);
+        assert!(app.is_asking(), "the next request stays queued");
+
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert!(answer.await.is_ok());
+        assert!(!app.is_asking(), "now the loop may take the next one");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_outranks_a_pending_question() {
+        let (mut app, _) = app_with_size(40, 12);
+        let (committer, _rx) = mpsc::channel(1);
+        let (request, _answer) = ask(&[("left", None)]);
+
+        app.begin_ask(request);
+
+        assert_eq!(
+            app.handle_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL), &committer)
+                .await,
+            Flow::Quit
         );
     }
 

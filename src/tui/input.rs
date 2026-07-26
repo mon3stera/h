@@ -171,6 +171,13 @@ impl Input {
         self.area.move_cursor(CursorMove::End);
     }
 
+    /// What the box holds. An observation point for tests; the loop reads it
+    /// only through [`Self::handle_key`].
+    #[cfg(test)]
+    pub fn text(&self) -> String {
+        self.area.lines().join("\n")
+    }
+
     /// Rows the box needs, grown to fit what has been typed and capped so it
     /// never crowds out the conversation.
     pub fn height(&self) -> u16 {
@@ -294,10 +301,6 @@ mod tests {
         );
     }
 
-    fn text(input: &Input) -> String {
-        input.area.lines().join("\n")
-    }
-
     fn submit(input: &mut Input) -> Option<String> {
         input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
     }
@@ -314,7 +317,7 @@ mod tests {
         send(&mut input, "first");
         input.handle_key(press(KeyCode::Up));
 
-        assert_eq!(text(&input), "first");
+        assert_eq!(input.text(), "first");
     }
 
     #[test]
@@ -326,14 +329,14 @@ mod tests {
         send(&mut input, "newest");
 
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "newest");
+        assert_eq!(input.text(), "newest");
 
         input.handle_key(press(KeyCode::Up));
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "oldest");
+        assert_eq!(input.text(), "oldest");
 
         input.handle_key(press(KeyCode::Down));
-        assert_eq!(text(&input), "middle");
+        assert_eq!(input.text(), "middle");
     }
 
     #[test]
@@ -345,7 +348,7 @@ mod tests {
             input.handle_key(press(KeyCode::Up));
         }
 
-        assert_eq!(text(&input), "only", "it should not wrap around");
+        assert_eq!(input.text(), "only", "it should not wrap around");
     }
 
     #[test]
@@ -356,11 +359,11 @@ mod tests {
         type_text(&mut input, "half typed");
 
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "sent");
+        assert_eq!(input.text(), "sent");
 
         input.handle_key(press(KeyCode::Down));
         assert_eq!(
-            text(&input),
+            input.text(),
             "half typed",
             "the draft was set aside, not thrown away"
         );
@@ -374,7 +377,7 @@ mod tests {
         type_text(&mut input, "typing");
         input.handle_key(press(KeyCode::Down));
 
-        assert_eq!(text(&input), "typing");
+        assert_eq!(input.text(), "typing");
     }
 
     #[test]
@@ -389,12 +392,12 @@ mod tests {
         // The cursor is on the last line, so Up belongs to the text.
         input.handle_key(press(KeyCode::Up));
 
-        assert_eq!(text(&input), "top\nbottom", "the text is untouched");
+        assert_eq!(input.text(), "top\nbottom", "the text is untouched");
         assert_eq!(input.cursor_row(), 0, "the cursor moved instead");
 
         // Now at the top, Up reaches the history.
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "history entry");
+        assert_eq!(input.text(), "history entry");
     }
 
     #[test]
@@ -421,7 +424,7 @@ mod tests {
         assert_eq!(input.recalled, None, "sending leaves the history behind");
         input.handle_key(press(KeyCode::Up));
         assert_eq!(
-            text(&input),
+            input.text(),
             "one!",
             "browsing starts from the newest again"
         );
@@ -460,10 +463,10 @@ mod tests {
         input.seed(["oldest".to_owned(), "newest".to_owned()]);
 
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "newest");
+        assert_eq!(input.text(), "newest");
 
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "oldest");
+        assert_eq!(input.text(), "oldest");
     }
 
     #[test]
@@ -474,10 +477,10 @@ mod tests {
         send(&mut input, "asked just now");
 
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "asked just now");
+        assert_eq!(input.text(), "asked just now");
 
         input.handle_key(press(KeyCode::Up));
-        assert_eq!(text(&input), "from the archive");
+        assert_eq!(input.text(), "from the archive");
     }
 
     #[test]
@@ -496,7 +499,7 @@ mod tests {
         type_text(&mut input, "typing");
         input.handle_key(press(KeyCode::Up));
 
-        assert_eq!(text(&input), "typing");
+        assert_eq!(input.text(), "typing");
     }
 
     #[test]

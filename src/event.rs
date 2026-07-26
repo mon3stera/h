@@ -50,7 +50,7 @@ pub struct AskOption {
 
 /// The user's reply. `Option` carries the index into [`AskQuestion::options`];
 /// `FreeText` is what they typed when none of the options fit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AskAnswer {
     Option { index: usize, label: String },
     FreeText(String),
