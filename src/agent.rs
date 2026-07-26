@@ -681,6 +681,54 @@ mod tests {
         events
     }
 
+    /// The shape that filled archived sessions with blank replies: a tool call
+    /// with nothing said before or after it. Every boundary flushes the stream
+    /// buffer, and each empty flush used to become an assistant turn.
+    #[tokio::test]
+    async fn a_silent_tool_call_leaves_no_empty_assistant_turn() {
+        let mut agent = Agent::new(TestProvider);
+        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        let mut metrics = TurnMetrics::default();
+
+        // An unregistered tool fails in the registry rather than running
+        // anything, which is all this needs to reach both boundaries.
+        agent
+            .handle_signal(
+                &ProviderSignal::ToolCallStarted(ToolCall::new(
+                    "call-1",
+                    "no_such_tool",
+                    json!({}),
+                )),
+                &mut metrics,
+            )
+            .await
+            .unwrap();
+        agent
+            .handle_signal(
+                &ProviderSignal::Completed(CompletedReason::Final),
+                &mut metrics,
+            )
+            .await
+            .unwrap();
+
+        let blank = agent
+            .context
+            .histories()
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant(text) if text.trim().is_empty()))
+            .count();
+
+        assert_eq!(blank, 0, "an empty assistant turn must never be recorded");
+        assert!(
+            agent
+                .context
+                .histories()
+                .iter()
+                .any(|message| matches!(message, Message::ToolCall { .. })),
+            "the call itself is still recorded"
+        );
+    }
+
     #[test]
     fn rebroadcast_replays_prompts_and_responses_in_order() {
         let mut agent = agent_with_histories(vec![

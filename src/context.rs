@@ -295,9 +295,20 @@ impl Context {
         self.buf.push_str(n.as_ref());
     }
 
+    /// Closes the streaming buffer into a message, unless nothing was streamed.
+    ///
+    /// This is called at every boundary of a turn — before a tool call, after its
+    /// result, and on completion — and most of those boundaries have no text
+    /// waiting. Recording those as empty assistant turns would send the provider
+    /// a history of blank replies, which reads as the model having finished with
+    /// nothing to say.
     pub fn finalize_buf(&mut self, f: impl FnOnce(String) -> Message) {
-        let mut buf = String::new();
-        std::mem::swap(&mut buf, &mut self.buf);
+        let buf = std::mem::take(&mut self.buf);
+
+        if buf.trim().is_empty() {
+            return;
+        }
+
         self.histories.push(f(buf));
     }
 
@@ -593,6 +604,56 @@ mod tests {
             "unexpected histories: {:?}",
             resumed.histories.len()
         );
+    }
+
+    #[test]
+    fn an_empty_stream_buffer_records_no_message() {
+        let mut context = Context::new();
+
+        context.prepare_buf();
+        context.finalize_buf(Message::Assistant);
+
+        assert!(
+            context.histories().is_empty(),
+            "a boundary with no text is not a turn"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_buffer_records_no_message() {
+        let mut context = Context::new();
+
+        context.append_buf("  \n\t ");
+        context.finalize_buf(Message::Assistant);
+
+        assert!(context.histories().is_empty());
+    }
+
+    #[test]
+    fn a_buffer_with_text_is_recorded_whole() {
+        let mut context = Context::new();
+
+        context.append_buf("  indented\n");
+        context.finalize_buf(Message::Assistant);
+
+        assert!(
+            matches!(
+                context.histories(),
+                [Message::Assistant(text)] if text == "  indented\n"
+            ),
+            "surrounding whitespace decides nothing but is not stripped"
+        );
+    }
+
+    #[test]
+    fn finalizing_twice_does_not_repeat_the_message() {
+        let mut context = Context::new();
+
+        context.append_buf("said once");
+        context.finalize_buf(Message::Assistant);
+        context.finalize_buf(Message::Assistant);
+
+        assert_eq!(context.histories().len(), 1);
     }
 
     #[test]
