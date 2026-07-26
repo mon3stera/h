@@ -5,11 +5,13 @@ use tokio::sync::Mutex;
 
 use crate::{
     agent::Agent,
+    bridge::UiBridge,
     provider::openai::{OpenAIProvider, OpenAIProviderConfig},
     ui::UI,
 };
 
 mod agent;
+mod bridge;
 mod bus;
 mod context;
 mod event;
@@ -25,10 +27,12 @@ async fn main() -> anyhow::Result<()> {
 
     let provider = OpenAIProvider::from_config(OpenAIProviderConfig::from_env()?);
 
+    let (bridge, ui_request_rx) = UiBridge::new();
+
     let mut agent = Agent::new(provider);
     let bus_rx = agent.subscribe_view();
     agent
-        .with_internal_tools()?
+        .with_internal_tools(bridge)?
         .with_global_prompts()
         .await?
         .with_workspace_info()
@@ -58,10 +62,14 @@ async fn main() -> anyhow::Result<()> {
         anyhow::Ok(())
     });
 
-    element!(UI(committer: Some(tx), event_rx: Arc::new(Mutex::new(Some(bus_rx)))))
-        .render_loop()
-        .fullscreen()
-        .await?;
+    element!(UI(
+        committer: Some(tx),
+        event_rx: Arc::new(Mutex::new(Some(bus_rx))),
+        ui_request_rx: Arc::new(Mutex::new(Some(ui_request_rx))),
+    ))
+    .render_loop()
+    .fullscreen()
+    .await?;
 
     tracing::info!(event = "app.ui.closed");
     Ok(())

@@ -1,13 +1,13 @@
 use std::{env::current_dir, io, path::PathBuf};
 
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use gix::{
     bstr::ByteSlice,
     progress::Discard,
     state::InProgress,
     status::{Item as StatusItem, UntrackedFiles, index_worktree::Item as WorktreeItem},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use shellexpand::tilde;
 use tokio::{
     fs::{self, File},
@@ -184,19 +184,21 @@ pub enum Message {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Context<M> {
+pub struct Context {
     id: String,
     buf: String,
-    histories: Vec<M>,
+    histories: Vec<Message>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct PersistSession<M> {
+struct PersistSession {
     id: String,
-    histories: Vec<M>,
+    last_modified: DateTime<Utc>,
+    title: String,
+    histories: Vec<Message>,
 }
 
-impl Context<Message> {
+impl Context {
     pub async fn inject_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
         let mut prompts = Vec::new();
         let mut total_bytes = 0_usize;
@@ -255,7 +257,7 @@ impl Context<Message> {
     }
 }
 
-impl<M> Context<M> {
+impl Context {
     pub fn new() -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -276,17 +278,17 @@ impl<M> Context<M> {
         self.buf.push_str(n.as_ref());
     }
 
-    pub fn finalize_buf(&mut self, f: Box<dyn FnOnce(String) -> M>) {
+    pub fn finalize_buf(&mut self, f: impl FnOnce(String) -> Message) {
         let mut buf = String::new();
         std::mem::swap(&mut buf, &mut self.buf);
         self.histories.push(f(buf));
     }
 
-    pub fn histories(&self) -> &[M] {
+    pub fn histories(&self) -> &[Message] {
         &self.histories
     }
 
-    pub fn histories_mut(&mut self) -> &mut Vec<M> {
+    pub fn histories_mut(&mut self) -> &mut Vec<Message> {
         &mut self.histories
     }
 }
@@ -298,24 +300,47 @@ fn archive_dir() -> PathBuf {
     PathBuf::from(path.to_string())
 }
 
-impl<M> Context<M>
-where
-    M: Serialize + DeserializeOwned + Clone,
-{
+fn archive_path(id: &str) -> PathBuf {
+    archive_dir().join(format!("{id}.archive"))
+}
+
+const TITLE_CHARS: usize = 60;
+
+fn summarize(prompt: &str) -> String {
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    match collapsed.char_indices().nth(TITLE_CHARS) {
+        Some((end, _)) => format!("{}…", &collapsed[..end]),
+        None => collapsed,
+    }
+}
+
+impl Context {
     pub async fn ensure_archive_dir(&self) -> anyhow::Result<()> {
         Ok(fs::create_dir_all(archive_dir()).await?)
     }
 
-    fn to_persist_session(&self) -> PersistSession<M> {
+    fn to_persist_session(&self) -> PersistSession {
         PersistSession {
             id: self.id.clone(),
+            last_modified: Utc::now(),
+            title: self.title(),
             histories: self.histories.clone(),
         }
     }
 
+    fn title(&self) -> String {
+        self.histories
+            .iter()
+            .find_map(|message| match message {
+                Message::User(prompt) => Some(summarize(prompt)),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn archive(&self) -> anyhow::Result<()> {
-        let mut path = archive_dir();
-        path.push(format!("/{}.archive", &self.id));
+        let path = archive_path(&self.id);
 
         let serialized = serde_json::to_string(&self.to_persist_session())?;
         fs::write(path, serialized).await?;
@@ -324,12 +349,10 @@ where
 
     pub async fn resume(id: impl AsRef<str>) -> anyhow::Result<Self> {
         let id = id.as_ref();
-
-        let mut path = archive_dir();
-        path.push(format!("/{}.archive", id));
+        let path = archive_path(id);
 
         let content = fs::read_to_string(path).await?;
-        let deserialized = serde_json::from_str::<PersistSession<M>>(&content)?;
+        let deserialized = serde_json::from_str::<PersistSession>(&content)?;
 
         Ok(Self {
             id: deserialized.id,
@@ -353,6 +376,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn archive_path_stays_inside_the_archive_directory() {
+        let path = archive_path("0198e5c1-1234-7000-8000-000000000000");
+
+        assert_eq!(path.parent(), Some(archive_dir().as_path()));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("0198e5c1-1234-7000-8000-000000000000.archive")
+        );
+    }
 
     struct TestRepo {
         path: PathBuf,

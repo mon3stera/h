@@ -4,6 +4,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
+mod ask;
 mod bash;
 mod edit;
 mod fetch;
@@ -14,6 +15,7 @@ mod read;
 mod registry;
 mod write;
 
+pub use ask::AskTool;
 pub use bash::{BashPresenter, BashTool};
 pub use edit::EditTool;
 pub use fetch::{FetchPresenter, FetchTool};

@@ -1,13 +1,14 @@
 use std::time::Instant;
 
 use crate::{
+    bridge::UiBridge,
     bus::EventBus,
     context::{Context, Message, built_in_workspace_info},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
     tool::{
-        BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolRegistry,
-        WriteFileTool,
+        AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool,
+        ToolRegistry, WriteFileTool,
     },
 };
 use futures::StreamExt;
@@ -34,7 +35,7 @@ pub enum NextTurn {
 pub struct Agent<P> {
     event_bus: EventBus<AgentEvent>,
     view_bus: EventBus<AgentViewEvent>,
-    context: Context<Message>,
+    context: Context,
     tool: ToolRegistry,
     provider: P,
     turn: NextTurn,
@@ -63,8 +64,13 @@ where
         self.view_bus.subscribe()
     }
 
-    pub fn with_internal_tools(&mut self) -> anyhow::Result<&mut Self> {
+    /// Registers the built-in tools. `bridge` is handed to the tools that need
+    /// an answer from the user; note that [`Self::handle_signal`] awaits each
+    /// tool call in turn, so at most one such request is outstanding at a time.
+    pub fn with_internal_tools(&mut self, bridge: UiBridge) -> anyhow::Result<&mut Self> {
         let file_buffers = FileBufferStore::default();
+
+        self.tool.register(AskTool::new(bridge));
 
         self.tool
             .register_with_presenter(
@@ -113,8 +119,7 @@ where
     }
 
     fn merge_text_delta(&mut self) {
-        self.context
-            .finalize_buf(Box::new(|buf| Message::Assistant(buf)));
+        self.context.finalize_buf(Message::Assistant);
         self.context.prepare_buf();
     }
 
@@ -287,7 +292,6 @@ where
 
                     let agent_event: AgentEvent = signal.clone().into();
                     self.event_bus.broadcast(agent_event);
-
                     self.handle_signal(&signal, metrics).await?;
                 }
                 Some(e) => {
@@ -379,7 +383,7 @@ mod tests {
     #[test]
     fn internal_bash_tool_uses_bash_presenter() {
         let mut agent = Agent::new(TestProvider);
-        agent.with_internal_tools().unwrap();
+        agent.with_internal_tools(UiBridge::new().0).unwrap();
         let call = ToolCall::new(
             "call-1",
             "bash",

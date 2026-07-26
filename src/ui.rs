@@ -9,13 +9,13 @@ use iocraft::{hooks, prelude::*};
 use tokio::{
     sync::{
         Mutex,
-        mpsc::{Sender, UnboundedReceiver},
+        mpsc::{Receiver, Sender, UnboundedReceiver},
     },
     time::{MissedTickBehavior, interval},
 };
 
 use crate::{
-    event::AgentViewEvent,
+    event::{AgentViewEvent, UiRequest},
     tool::{DisplayBlock, Presentation, ToolCallStatus},
     ui::{
         banner::render_banner,
@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod banner;
+pub mod choice_list;
 mod markdown;
 mod markdown_view;
 
@@ -179,6 +180,10 @@ fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Re
 pub struct UIProp {
     pub committer: Option<Sender<String>>,
     pub event_rx: Arc<Mutex<Option<UnboundedReceiver<AgentViewEvent>>>>,
+    /// Questions the agent is waiting on. Drain this the way `event_rx` is
+    /// drained, queue what arrives in `ViewState`, and reply through each
+    /// request's `oneshot::Sender`.
+    pub ui_request_rx: Arc<Mutex<Option<Receiver<UiRequest>>>>,
 }
 
 #[component]
