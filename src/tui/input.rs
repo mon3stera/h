@@ -6,15 +6,27 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea};
 
 const PROMPT_MARKER: &str = "❯ ";
 const MARKER_WIDTH: u16 = 2;
+
+/// Prompts kept for recall. Old enough entries are not worth the memory.
+const HISTORY_LIMIT: usize = 200;
 
 const MIN_HEIGHT: u16 = 3;
 const MAX_HEIGHT: u16 = 10;
 /// The top and bottom rules.
 const BORDER_HEIGHT: u16 = 2;
+
+use Direction::{Newer, Older};
+
+/// Which way through the history an arrow is asking to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Older,
+    Newer,
+}
 
 /// The prompt box.
 ///
@@ -24,6 +36,13 @@ const BORDER_HEIGHT: u16 = 2;
 /// arrives as an ESC-prefixed return, which nearly every terminal sends.
 pub struct Input {
     area: TextArea<'static>,
+    /// Prompts already sent, oldest last.
+    history: Vec<String>,
+    /// Which entry the box is showing. `None` means it is showing the draft.
+    recalled: Option<usize>,
+    /// The unsent text set aside while browsing, so leaving the history returns
+    /// whatever was half-typed.
+    draft: String,
 }
 
 impl Default for Input {
@@ -32,7 +51,12 @@ impl Default for Input {
 
         area.set_cursor_line_style(Style::default());
 
-        Self { area }
+        Self {
+            area,
+            history: Vec::new(),
+            recalled: None,
+            draft: String::new(),
+        }
     }
 }
 
@@ -51,8 +75,22 @@ impl Input {
             return self.take();
         }
 
+        // Arrows reach the history only from the edges of the text, so a
+        // multi-line prompt can still be moved around in.
+        match key.code {
+            KeyCode::Up if self.cursor_row() == 0 => return self.recall(Older),
+            KeyCode::Down if self.cursor_row() + 1 == self.area.lines().len() => {
+                return self.recall(Newer);
+            }
+            _ => {}
+        }
+
         self.area.input(key);
         None
+    }
+
+    fn cursor_row(&self) -> usize {
+        self.area.cursor().0
     }
 
     fn take(&mut self) -> Option<String> {
@@ -62,10 +100,67 @@ impl Input {
             return None;
         }
 
-        self.area.select_all();
-        self.area.cut();
+        self.remember(prompt.clone());
+        self.show("");
+        self.recalled = None;
+        self.draft.clear();
 
         Some(prompt)
+    }
+
+    /// Files a sent prompt, skipping a repeat of the newest so holding one key
+    /// does not fill the history with it.
+    fn remember(&mut self, prompt: String) {
+        if self.history.last() == Some(&prompt) {
+            return;
+        }
+
+        if self.history.len() >= HISTORY_LIMIT {
+            self.history.remove(0);
+        }
+
+        self.history.push(prompt);
+    }
+
+    /// Steps through the history, stashing the draft on the way in and putting
+    /// it back on the way out.
+    fn recall(&mut self, direction: Direction) -> Option<String> {
+        let target = match (direction, self.recalled) {
+            (Older, None) => {
+                self.draft = self.area.lines().join("\n");
+                self.history.len().checked_sub(1)
+            }
+            // Already at the oldest; stay rather than wrap around.
+            (Older, Some(index)) => Some(index.saturating_sub(1)),
+            (Newer, None) => None,
+            (Newer, Some(index)) => Some(index + 1),
+        };
+
+        match target.filter(|index| *index < self.history.len()) {
+            Some(index) => {
+                self.recalled = Some(index);
+                let entry = self.history[index].clone();
+                self.show(&entry);
+            }
+            None if self.recalled.is_some() && direction == Newer => {
+                // Past the newest entry is the draft again.
+                self.recalled = None;
+                let draft = std::mem::take(&mut self.draft);
+                self.show(&draft);
+            }
+            None => {}
+        }
+
+        None
+    }
+
+    /// Replaces the box with `text`, cursor at the end so typing continues it.
+    fn show(&mut self, text: &str) {
+        self.area.select_all();
+        self.area.cut();
+        self.area.insert_str(text);
+        self.area.move_cursor(CursorMove::Bottom);
+        self.area.move_cursor(CursorMove::End);
     }
 
     /// Rows the box needs, grown to fit what has been typed and capped so it
@@ -189,6 +284,175 @@ mod tests {
             MAX_HEIGHT,
             "capped so the log stays visible"
         );
+    }
+
+    fn text(input: &Input) -> String {
+        input.area.lines().join("\n")
+    }
+
+    fn submit(input: &mut Input) -> Option<String> {
+        input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+    }
+
+    fn send(input: &mut Input, prompt: &str) {
+        type_text(input, prompt);
+        submit(input);
+    }
+
+    #[test]
+    fn up_recalls_the_last_prompt() {
+        let mut input = Input::default();
+
+        send(&mut input, "first");
+        input.handle_key(press(KeyCode::Up));
+
+        assert_eq!(text(&input), "first");
+    }
+
+    #[test]
+    fn up_walks_further_back_and_down_walks_forward() {
+        let mut input = Input::default();
+
+        send(&mut input, "oldest");
+        send(&mut input, "middle");
+        send(&mut input, "newest");
+
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "newest");
+
+        input.handle_key(press(KeyCode::Up));
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "oldest");
+
+        input.handle_key(press(KeyCode::Down));
+        assert_eq!(text(&input), "middle");
+    }
+
+    #[test]
+    fn the_oldest_entry_is_the_end_of_the_road() {
+        let mut input = Input::default();
+
+        send(&mut input, "only");
+        for _ in 0..5 {
+            input.handle_key(press(KeyCode::Up));
+        }
+
+        assert_eq!(text(&input), "only", "it should not wrap around");
+    }
+
+    #[test]
+    fn coming_back_past_the_newest_restores_the_draft() {
+        let mut input = Input::default();
+
+        send(&mut input, "sent");
+        type_text(&mut input, "half typed");
+
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "sent");
+
+        input.handle_key(press(KeyCode::Down));
+        assert_eq!(
+            text(&input),
+            "half typed",
+            "the draft was set aside, not thrown away"
+        );
+    }
+
+    #[test]
+    fn down_on_a_draft_does_nothing() {
+        let mut input = Input::default();
+
+        send(&mut input, "sent");
+        type_text(&mut input, "typing");
+        input.handle_key(press(KeyCode::Down));
+
+        assert_eq!(text(&input), "typing");
+    }
+
+    #[test]
+    fn an_arrow_inside_a_multiline_prompt_moves_the_cursor() {
+        let mut input = Input::default();
+
+        send(&mut input, "history entry");
+        type_text(&mut input, "top");
+        input.handle_key(press(KeyCode::Enter));
+        type_text(&mut input, "bottom");
+
+        // The cursor is on the last line, so Up belongs to the text.
+        input.handle_key(press(KeyCode::Up));
+
+        assert_eq!(text(&input), "top\nbottom", "the text is untouched");
+        assert_eq!(input.cursor_row(), 0, "the cursor moved instead");
+
+        // Now at the top, Up reaches the history.
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(text(&input), "history entry");
+    }
+
+    #[test]
+    fn a_recalled_prompt_can_be_edited_and_sent_again() {
+        let mut input = Input::default();
+
+        send(&mut input, "cargo test");
+        input.handle_key(press(KeyCode::Up));
+        type_text(&mut input, " --release");
+
+        assert_eq!(submit(&mut input), Some("cargo test --release".to_owned()));
+        assert_eq!(input.history, ["cargo test", "cargo test --release"]);
+    }
+
+    #[test]
+    fn sending_leaves_the_history_at_its_newest_end() {
+        let mut input = Input::default();
+
+        send(&mut input, "one");
+        input.handle_key(press(KeyCode::Up));
+        type_text(&mut input, "!");
+        submit(&mut input);
+
+        assert_eq!(input.recalled, None, "sending leaves the history behind");
+        input.handle_key(press(KeyCode::Up));
+        assert_eq!(
+            text(&input),
+            "one!",
+            "browsing starts from the newest again"
+        );
+    }
+
+    #[test]
+    fn the_same_prompt_twice_is_stored_once() {
+        let mut input = Input::default();
+
+        send(&mut input, "again");
+        send(&mut input, "again");
+
+        assert_eq!(input.history, ["again"]);
+    }
+
+    #[test]
+    fn the_history_does_not_grow_without_bound() {
+        let mut input = Input::default();
+
+        for index in 0..HISTORY_LIMIT + 20 {
+            send(&mut input, &format!("prompt {index}"));
+        }
+
+        assert_eq!(input.history.len(), HISTORY_LIMIT);
+        assert_eq!(
+            input.history.last().unwrap(),
+            &format!("prompt {}", HISTORY_LIMIT + 19),
+            "the newest survives; the oldest are dropped"
+        );
+    }
+
+    #[test]
+    fn an_empty_history_ignores_the_arrows() {
+        let mut input = Input::default();
+
+        type_text(&mut input, "typing");
+        input.handle_key(press(KeyCode::Up));
+
+        assert_eq!(text(&input), "typing");
     }
 
     #[test]
