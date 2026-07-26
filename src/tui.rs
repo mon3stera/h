@@ -1,11 +1,8 @@
-//! The ratatui front end.
+//! The terminal front end.
 //!
-//! Built alongside the iocraft one so the tree keeps compiling while it grows;
-//! `main_loop` switches over once this draws everything the old one could.
-//!
-//! Until that switch nothing outside this module calls in, so the parts that
-//! have landed so far look unused.
-#![allow(dead_code)]
+//! Drawing is immediate mode: every frame states what the screen should hold,
+//! and nothing persists between them except the state in [`app::App`] and the
+//! transcript's cached lines.
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -17,8 +14,12 @@ use ratatui::{
     text::{Line, Span},
 };
 
+pub mod app;
 pub mod banner;
+pub mod choice_list;
+pub mod input;
 pub mod markdown;
+pub mod resume;
 pub mod text;
 pub mod tool;
 pub mod transcript;

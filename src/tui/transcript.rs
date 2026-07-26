@@ -37,6 +37,8 @@ impl Transcript {
         self.built_from = Some(current);
     }
 
+    /// Observation points for tests; drawing goes through [`Self::visible`].
+    #[cfg(test)]
     pub fn height(&self) -> usize {
         self.lines.len()
     }
@@ -50,6 +52,7 @@ impl Transcript {
     }
 
     /// Whether the view is following the newest output.
+    #[cfg(test)]
     pub fn is_pinned(&self) -> bool {
         self.top.is_none()
     }

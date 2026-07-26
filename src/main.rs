@@ -1,14 +1,9 @@
-use std::sync::Arc;
-
 use clap::Parser;
-use iocraft::{ElementExt, element};
-use tokio::sync::Mutex;
 
 use crate::{
     agent::Agent,
     bridge::UiBridge,
     provider::openai::{OpenAIProvider, OpenAIProviderConfig},
-    ui::UI,
 };
 
 mod agent;
@@ -111,14 +106,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         archived
     });
 
-    element!(UI(
-        committer: Some(tx),
-        event_rx: Arc::new(Mutex::new(Some(bus_rx))),
-        ui_request_rx: Arc::new(Mutex::new(Some(ui_request_rx))),
-    ))
-    .render_loop()
-    .fullscreen()
-    .await?;
+    tui::app::run(tx, bus_rx, ui_request_rx).await?;
 
     tracing::info!(event = "app.ui.closed");
 

@@ -9,7 +9,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::ui::choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome};
+use crate::tui::choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome};
 
 #[derive(Debug, Default, Clone)]
 pub struct ResumeEntry {

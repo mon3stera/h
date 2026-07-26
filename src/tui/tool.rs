@@ -373,6 +373,22 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_code_block_still_gets_a_numbered_row() {
+        let lines = render(
+            &presentation(vec![DisplayBlock::CodeBlock {
+                language: None,
+                content: String::new(),
+                truncated_lines: 10,
+                show_line_numbers: true,
+                start_line_number: 42,
+            }]),
+            40,
+        );
+
+        assert_eq!(texts(&lines)[1], "     42 ");
+    }
+
+    #[test]
     fn a_code_block_stops_at_its_truncation_limit() {
         let lines = render(
             &presentation(vec![DisplayBlock::CodeBlock {

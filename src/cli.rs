@@ -3,7 +3,7 @@ use clap::Parser;
 
 use crate::{
     context::list_sessions,
-    ui::resume::{ResumeEntry, pick_session},
+    tui::resume::{ResumeEntry, pick_session},
 };
 
 /// An agentic coding CLI.
