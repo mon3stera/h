@@ -1,9 +1,15 @@
-use std::time::Duration;
+use std::{io::stdout, panic, time::Duration};
 
 use futures::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::{
+        event::{
+            DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
+            KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        },
+        execute,
+    },
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
@@ -29,6 +35,9 @@ const SPINNER_PERIOD: Duration = Duration::from_millis(200);
 /// How far the transcript moves for one page key.
 const PAGE: isize = 10;
 
+/// Rows per notch of the wheel.
+const WHEEL_STEP: isize = 3;
+
 /// Runs the conversation view until the user quits.
 ///
 /// Returns once Ctrl+C is pressed or the agent's event channel closes, at which
@@ -40,11 +49,37 @@ pub async fn run(
     // same as before the move to ratatui.
     _requests: Receiver<UiRequest>,
 ) -> anyhow::Result<()> {
-    let mut terminal = ratatui::init();
+    let mut terminal = enter()?;
     let outcome = drive(&mut terminal, committer, &mut events).await;
 
-    ratatui::restore();
+    leave();
     outcome
+}
+
+/// Takes over the terminal, including the mouse so the wheel reaches us.
+///
+/// Capturing the mouse also takes the terminal's own selection, which most
+/// terminals hand back while Shift is held.
+fn enter() -> anyhow::Result<DefaultTerminal> {
+    let terminal = ratatui::init();
+
+    execute!(stdout(), EnableMouseCapture)?;
+
+    // `ratatui::init` installs a hook that puts the screen back, but it knows
+    // nothing about mouse capture; a panic would otherwise leave the terminal
+    // reporting every mouse move as escape codes.
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), DisableMouseCapture);
+        previous(info);
+    }));
+
+    Ok(terminal)
+}
+
+fn leave() {
+    let _ = execute!(stdout(), DisableMouseCapture);
+    ratatui::restore();
 }
 
 async fn drive(
@@ -68,6 +103,7 @@ async fn drive(
                         return Ok(());
                     }
                 }
+                Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
                 // A closed input stream leaves nothing to drive the view.
                 None => return Ok(()),
                 _ => {}
@@ -158,6 +194,16 @@ impl App {
                 error_class = "prompt_channel_closed"
             );
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let step = match mouse.kind {
+            MouseEventKind::ScrollUp => -WHEEL_STEP,
+            MouseEventKind::ScrollDown => WHEEL_STEP,
+            _ => return,
+        };
+
+        self.transcript.scroll(step, self.viewport as usize);
     }
 
     fn advance_spinner(&mut self) {
@@ -327,6 +373,58 @@ mod tests {
             .await;
 
         assert!(app.transcript.is_pinned());
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_transcript() {
+        let (mut app, mut terminal) = app_with_size(40, 20);
+
+        for index in 0..50 {
+            app.state
+                .units
+                .push(RenderUnit::Prompt(format!("prompt {index}")));
+        }
+        app.state.revision += 1;
+        drawn(&mut app, &mut terminal);
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert!(!app.transcript.is_pinned(), "up moves away from the newest");
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(
+            app.transcript.is_pinned(),
+            "coming back down resumes following"
+        );
+    }
+
+    #[test]
+    fn other_mouse_events_are_ignored() {
+        let (mut app, mut terminal) = app_with_size(40, 20);
+
+        for index in 0..50 {
+            app.state
+                .units
+                .push(RenderUnit::Prompt(format!("prompt {index}")));
+        }
+        app.state.revision += 1;
+        drawn(&mut app, &mut terminal);
+
+        app.handle_mouse(wheel(MouseEventKind::Moved));
+
+        assert!(
+            app.transcript.is_pinned(),
+            "only the wheel scrolls; a move must not"
+        );
     }
 
     #[test]
