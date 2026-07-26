@@ -1472,3 +1472,93 @@ async fn edit_refuses_an_empty_source_rather_than_shredding_the_file() {
 
     fs::remove_file(path).await.unwrap();
 }
+
+fn ask_call(question: &str) -> ToolCall {
+    call(
+        "ask",
+        json!({"question": question, "options": [{"label": "left"}]}),
+    )
+}
+
+#[test]
+fn ask_presenter_shows_the_question_while_it_waits() {
+    let call = ask_call("which way?");
+    let presentation = AskPresenter.running(&call);
+
+    assert_eq!(presentation.name, "Ask");
+    assert_eq!(presentation.target.as_deref(), Some("which way?"));
+    assert!(matches!(presentation.status, ToolCallStatus::Running));
+    assert!(
+        presentation.blocks.is_empty(),
+        "the panel already showed it"
+    );
+}
+
+#[test]
+fn ask_presenter_records_the_answer_on_the_same_line() {
+    let call = ask_call("which way?");
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        json!({"answer": "left", "free_text": false, "option_index": 0}),
+    );
+
+    let presentation = AskPresenter.completed(&call, &result);
+
+    assert_eq!(presentation.target.as_deref(), Some("which way? → left"));
+    assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+    assert!(
+        presentation.blocks.is_empty(),
+        "the exchange is one fact, not a block"
+    );
+}
+
+#[test]
+fn ask_presenter_reports_a_written_answer_the_same_way() {
+    let call = ask_call("which way?");
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        json!({"answer": "neither, go back", "free_text": true, "option_index": null}),
+    );
+
+    assert_eq!(
+        AskPresenter.completed(&call, &result).target.as_deref(),
+        Some("which way? → neither, go back")
+    );
+}
+
+#[test]
+fn ask_presenter_marks_a_dismissed_question_as_failed() {
+    let call = ask_call("which way?");
+    let result = ToolCallResult::failure(call.id.clone(), "the question was dismissed");
+    let presentation = AskPresenter.completed(&call, &result);
+
+    assert_eq!(presentation.target.as_deref(), Some("which way?"));
+    assert!(matches!(
+        &presentation.status,
+        ToolCallStatus::Failed { message } if message == "the question was dismissed"
+    ));
+}
+
+#[test]
+fn ask_presenter_keeps_a_long_exchange_to_one_line() {
+    // Two clipped fields, their ellipses, and the arrow between them.
+    const BUDGET: usize = super::ask::MAX_QUESTION_CHARS + super::ask::MAX_ANSWER_CHARS + 2 + 3;
+
+    let question = "why ".repeat(60);
+    let call = ask_call(&question);
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        json!({"answer": "because ".repeat(30), "free_text": true, "option_index": null}),
+    );
+
+    let target = AskPresenter
+        .completed(&call, &result)
+        .target
+        .expect("a target");
+
+    assert!(
+        target.chars().count() <= BUDGET,
+        "a title that overflows the terminal cannot be read: {} chars",
+        target.chars().count()
+    );
+}

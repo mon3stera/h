@@ -1,12 +1,15 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     bridge::UiBridge,
     event::{AskAnswer, AskOption, AskQuestion},
 };
 
-use super::TypedTool;
+use super::{
+    Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult, ToolCallStatus, TypedTool,
+};
 
 pub struct AskTool {
     bridge: UiBridge,
@@ -89,4 +92,85 @@ impl TypedTool for AskTool {
             },
         })
     }
+}
+
+/// Budgets set by what is left of an eighty-column line once the title's own
+/// furniture — the indicator, the name, the label — has taken its share.
+pub(super) const MAX_QUESTION_CHARS: usize = 48;
+pub(super) const MAX_ANSWER_CHARS: usize = 24;
+
+/// Shortens for a title, where every column counts.
+///
+/// The block helpers spell out `… [truncated]`, which is right in a body and far
+/// too heavy on a single line.
+fn clip(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+
+    text.chars().take(max_chars).chain(['…']).collect()
+}
+
+pub struct AskPresenter;
+
+/// Shows the exchange on the title line and nothing else.
+///
+/// A question and its answer are one fact, and the user just supplied the answer
+/// themselves — spending rows to repeat it back would only push the conversation
+/// off screen.
+impl Presenter for AskPresenter {
+    fn completed(&self, call: &ToolCall, result: &ToolCallResult) -> Presentation {
+        let asked = question(call);
+
+        let (status, target) = match &result.outcome {
+            ToolCallOutcome::Success(output) => {
+                let answer = output
+                    .get("answer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+
+                (
+                    ToolCallStatus::Succeeded,
+                    format!("{asked} → {}", clip(answer, MAX_ANSWER_CHARS)),
+                )
+            }
+            // Dismissed rather than answered; the reason rides on the status.
+            ToolCallOutcome::Failure { message } => (
+                ToolCallStatus::Failed {
+                    message: message.clone(),
+                },
+                asked,
+            ),
+        };
+
+        Presentation {
+            call_id: call.id.clone(),
+            name: "Ask".to_owned(),
+            label: "built-in".to_owned(),
+            target: Some(target),
+            status,
+            blocks: Vec::new(),
+        }
+    }
+
+    fn running(&self, call: &ToolCall) -> Presentation {
+        Presentation {
+            call_id: call.id.clone(),
+            name: "Ask".to_owned(),
+            label: "built-in".to_owned(),
+            target: Some(question(call)),
+            status: ToolCallStatus::Running,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+fn question(call: &ToolCall) -> String {
+    clip(
+        call.arguments
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        MAX_QUESTION_CHARS,
+    )
 }

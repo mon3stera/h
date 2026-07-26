@@ -100,7 +100,8 @@ where
     pub fn with_internal_tools(&mut self, bridge: UiBridge) -> anyhow::Result<&mut Self> {
         let file_buffers = FileBufferStore::default();
 
-        self.tool.register(AskTool::new(bridge));
+        self.tool
+            .register_with_presenter(AskTool::new(bridge), crate::tool::AskPresenter);
 
         self.tool
             .register_with_presenter(

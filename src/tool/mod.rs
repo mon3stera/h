@@ -15,7 +15,7 @@ mod read;
 mod registry;
 mod write;
 
-pub use ask::AskTool;
+pub use ask::{AskPresenter, AskTool};
 pub use bash::{BashPresenter, BashTool};
 pub use edit::{EditPresenter, EditTool};
 pub use fetch::{FetchPresenter, FetchTool};
