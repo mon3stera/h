@@ -519,7 +519,20 @@ fn Textarea<'a>(mut hooks: Hooks, props: &TextareaProp) -> impl Into<AnyElement<
     let in_progress = props.turn_in_progress;
     hooks.use_local_terminal_events(move |event| {
         if let TerminalEvent::Key(key) = event {
-            if key.code == KeyCode::Enter && key.kind == KeyEventKind::Press {
+            // A modified Enter submits; a bare one is left to the text input,
+            // which takes it as a newline.
+            //
+            // Both chords are accepted because they are not equally available.
+            // Ctrl+Enter reaches us only over the kitty keyboard protocol —
+            // without it, terminals send a bare CR for Ctrl+Enter, identical to
+            // Enter. Alt+Enter arrives as an ESC-prefixed CR, which nearly every
+            // terminal sends, so it always works.
+            if key.code == KeyCode::Enter
+                && key.kind == KeyEventKind::Press
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
                 let value = input.read().clone();
 
                 if !in_progress && !value.trim().is_empty() {
