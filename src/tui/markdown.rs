@@ -6,7 +6,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     tui::{
-        rainbow_spans,
+        highlight, rainbow_spans,
         text::{verbatim, wrap},
     },
     ui::markdown::{Inline, MarkdownBlock, TableAlignment},
@@ -93,8 +93,29 @@ fn render_code_block(
         )));
     }
 
-    // Indentation is part of the code, so this must not reflow.
-    body.extend(verbatim(&[Span::raw(plain_text(code))], inner));
+    let highlighted = highlight::highlight(language.as_deref(), &plain_text(code));
+    let gutter = decimal_digits(highlighted.len().max(1) as u64) + 1;
+    let room = inner.saturating_sub(gutter).max(1);
+
+    // Each source line is laid out on its own so a line too wide for the box is
+    // cut without dragging the next one up. Indentation is part of the code, so
+    // none of this may reflow.
+    for (index, line) in highlighted.iter().enumerate() {
+        for (offset, wrapped) in verbatim(line, room).into_iter().enumerate() {
+            // The number belongs to the source line, not to the rows it was cut
+            // into, so a continuation gets blanks instead.
+            let lead = if offset == 0 {
+                format!("{:>width$} ", index + 1, width = gutter - 1)
+            } else {
+                " ".repeat(gutter)
+            };
+
+            let mut spans = vec![Span::styled(lead, border)];
+            spans.extend(wrapped.spans);
+
+            body.push(Line::from(spans));
+        }
+    }
 
     framed(body, inner, border)
 }
@@ -422,9 +443,9 @@ mod tests {
             [
                 "╭────────────────────────────╮",
                 "│ rust                       │",
-                "│ fn main() {                │",
-                "│     let x = 1;             │",
-                "│ }                          │",
+                "│ 1 fn main() {              │",
+                "│ 2     let x = 1;           │",
+                "│ 3 }                        │",
                 "╰────────────────────────────╯",
             ]
         );
@@ -437,10 +458,62 @@ mod tests {
             [
                 "╭──────────────────╮",
                 "│ rust             │",
-                "│ let x = 1;       │",
+                "│ 1 let x = 1;     │",
                 "╰──────────────────╯",
             ]
         );
+    }
+
+    #[test]
+    fn the_gutter_widens_for_the_largest_number() {
+        let body = (1..=10)
+            .map(|index| format!("line {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = render_text(&format!("```rust\n{body}\n```"), 30);
+
+        assert_eq!(lines[2], "│  1 line 1;                 │");
+        assert_eq!(lines[11], "│ 10 line 10;                │");
+    }
+
+    #[test]
+    fn a_cut_line_is_not_renumbered() {
+        let lines = render_text("```rust\nlet a = 1;\nlet bbbbbbbbbbbbbbbb = 2;\n```", 22);
+
+        assert_eq!(
+            lines[2..lines.len() - 1],
+            [
+                "│ 1 let a = 1;       │",
+                "│ 2 let bbbbbbbbbbbb │",
+                "│   bbbb = 2;        │",
+            ],
+            "the continuation lines up under the code, unnumbered"
+        );
+    }
+
+    #[test]
+    fn a_code_block_is_syntax_coloured() {
+        let lines = render(&parse_markdown("```rust\nfn main() {}\n```"), 40);
+        let colours = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| !span.content.contains(['│', '╭', '╰', '─']))
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(colours.len() > 1, "keywords should differ from punctuation");
+    }
+
+    #[test]
+    fn a_block_without_a_language_stays_plain() {
+        let lines = render(&parse_markdown("```\nfn main() {}\n```"), 40);
+        let coloured = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.content.contains("fn main"))
+            .any(|span| span.style.fg.is_some());
+
+        assert!(!coloured, "nothing says which grammar to use");
     }
 
     #[test]
