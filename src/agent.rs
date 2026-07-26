@@ -1,11 +1,14 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crate::{
     bridge::UiBridge,
     bus::EventBus,
     context::{Context, Message, built_in_workspace_info},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
-    provider::Provider,
+    provider::{Provider, ProviderEventStream},
     tool::{
         AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolCall,
         ToolCallResult, ToolRegistry, WriteFileTool,
@@ -16,6 +19,16 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::Instrument;
 use uuid::Uuid;
+
+/// How many times opening a provider stream is attempted before giving up.
+const STREAM_MAX_ATTEMPTS: u32 = 4;
+
+const STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(150);
+
+/// The wait after a failed attempt, doubling each time: 150ms, 300ms, 600ms.
+fn stream_retry_delay(attempt: u32) -> Duration {
+    STREAM_RETRY_BASE_DELAY * 2_u32.pow(attempt.saturating_sub(1))
+}
 
 /// Rebuilds a tool result from the output that was persisted for the provider.
 ///
@@ -356,6 +369,67 @@ where
         );
     }
 
+    /// Opens a provider stream, retrying a failed open with an exponential
+    /// backoff.
+    ///
+    /// Retrying is safe only here: nothing has reached the context or the view
+    /// yet, so a fresh attempt starts from the same state. An error part-way
+    /// through a stream is left alone — deltas have already been broadcast and
+    /// folded into the context, so re-requesting would duplicate them.
+    ///
+    /// Every error is retried. The provider hands back `anyhow::Error`, which
+    /// keeps a refused request (bad key, malformed input) indistinguishable from
+    /// a dropped connection; retrying the former wastes about a second.
+    async fn open_stream(
+        &self,
+        request_index: usize,
+    ) -> anyhow::Result<ProviderEventStream<P::StreamEvent>> {
+        let mut attempt = 1;
+
+        loop {
+            match self.provider.stream(self.context.histories()).await {
+                Ok(stream) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            event = "agent.provider_stream.recovered",
+                            request_index,
+                            attempt
+                        );
+                    }
+
+                    return Ok(stream);
+                }
+                Err(e) if attempt < STREAM_MAX_ATTEMPTS => {
+                    let delay = stream_retry_delay(attempt);
+
+                    tracing::warn!(
+                        event = "agent.provider_stream.retrying",
+                        request_index,
+                        attempt,
+                        max_attempts = STREAM_MAX_ATTEMPTS,
+                        delay_ms = delay.as_millis() as u64,
+                        error_class = "provider_stream_open_error",
+                        error = e.to_string(),
+                    );
+
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event = "agent.provider_stream.exhausted",
+                        request_index,
+                        attempt,
+                        error_class = "provider_stream_open_error",
+                        error = e.to_string(),
+                    );
+
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     async fn next_turn(&mut self, metrics: &mut TurnMetrics) -> anyhow::Result<()> {
         match &self.turn {
             NextTurn::Prompt(prompt) => {
@@ -378,7 +452,7 @@ where
             message_count = self.context.histories().len()
         );
 
-        let mut stream = match self.provider.stream(self.context.histories()).await {
+        let mut stream = match self.open_stream(request_index).await {
             Ok(stream) => stream,
             Err(e) => {
                 self.view_bus.broadcast(AgentViewEvent::Err(e.to_string()));
@@ -426,7 +500,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use futures::{Stream, stream};
     use serde_json::json;
@@ -479,6 +556,112 @@ mod tests {
                 thinking_effort: Some(thinking_effort),
             } if model == "test-model" && thinking_effort == "high"
         ));
+    }
+
+    /// Fails `stream` a set number of times before succeeding, counting every
+    /// attempt so the backoff can be asserted on.
+    struct FlakyProvider {
+        failures_left: AtomicUsize,
+        attempts: AtomicUsize,
+    }
+
+    impl FlakyProvider {
+        fn new(failures: usize) -> Self {
+            Self {
+                failures_left: AtomicUsize::new(failures),
+                attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "flaky-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(ProviderSignal::Unsupported)
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
+        {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+
+            if self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                anyhow::bail!("connection reset by peer");
+            }
+
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[test]
+    fn the_backoff_doubles_from_150ms() {
+        assert_eq!(stream_retry_delay(1), Duration::from_millis(150));
+        assert_eq!(stream_retry_delay(2), Duration::from_millis(300));
+        assert_eq!(stream_retry_delay(3), Duration::from_millis(600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_is_retried_until_the_stream_opens() {
+        let agent = Agent::new(FlakyProvider::new(2));
+        let started = tokio::time::Instant::now();
+
+        assert!(agent.open_stream(1).await.is_ok());
+        assert_eq!(agent.provider.attempts(), 3, "two failures, then a success");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(450),
+            "waited 150ms then 300ms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_never_opens_gives_up_after_the_last_attempt() {
+        let agent = Agent::new(FlakyProvider::new(usize::MAX));
+        let started = tokio::time::Instant::now();
+
+        assert!(agent.open_stream(1).await.is_err());
+        assert_eq!(agent.provider.attempts(), STREAM_MAX_ATTEMPTS as usize);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(1050),
+            "waited 150ms, 300ms, 600ms, then stopped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_opens_first_try_does_not_wait() {
+        let agent = Agent::new(FlakyProvider::new(0));
+        let started = tokio::time::Instant::now();
+
+        assert!(agent.open_stream(1).await.is_ok());
+        assert_eq!(agent.provider.attempts(), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     fn agent_with_histories(histories: Vec<Message>) -> Agent<TestProvider> {

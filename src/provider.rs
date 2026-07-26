@@ -6,7 +6,7 @@ use crate::{context::Message, event::ProviderSignal, tool::ToolDefinition};
 
 pub mod openai;
 
-type ProviderEventStream<C> = Pin<Box<dyn Stream<Item = anyhow::Result<C>> + Send>>;
+pub type ProviderEventStream<C> = Pin<Box<dyn Stream<Item = anyhow::Result<C>> + Send>>;
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync + 'static {

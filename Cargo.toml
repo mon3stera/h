@@ -44,3 +44,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2.2"
 uuid = { version = "1.24.0", features = ["v4", "v7", "fast-rng"] }
 
+[dev-dependencies]
+# `start_paused` runs the backoff tests on virtual time instead of sleeping.
+tokio = { version = "1.53.0", features = ["test-util"] }
+
