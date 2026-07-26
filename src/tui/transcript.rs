@@ -1,4 +1,7 @@
-use ratatui::text::Line;
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
 
 use crate::{
     tui::{banner, markdown, tool},
@@ -15,6 +18,11 @@ use crate::{
 /// Slicing is also what keeps a long session cheap. Only the rows inside the
 /// viewport are handed to the terminal, so a thousand entries cost no more to
 /// draw than a dozen.
+/// Opens the model's own prose, so it is as easy to pick out as a prompt.
+const RESPONSE_MARKER: &str = "❋ ";
+/// What its later rows keep, so the whole answer reads as one block.
+const RESPONSE_INDENT: &str = "  ";
+
 #[derive(Default)]
 pub struct Transcript {
     lines: Vec<Line<'static>>,
@@ -97,8 +105,8 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
             RenderGroup::Tool(presentation) => tool::render(presentation, width),
             RenderGroup::Explore(run) => tool::render(&explore_presentation(&run), width),
             RenderGroup::Unit(unit) => match unit {
-                RenderUnit::Text(text) => markdown::render(&parse_markdown(text), width),
-                RenderUnit::ParsedMarkdown(blocks) => markdown::render(blocks, width),
+                RenderUnit::Text(text) => response(&parse_markdown(text), width),
+                RenderUnit::ParsedMarkdown(blocks) => response(blocks, width),
                 RenderUnit::Prompt(text) => vec![crate::tui::rainbow(&format!("❯ {text}"))],
                 RenderUnit::Err(error) => vec![Line::from(ratatui::text::Span::styled(
                     format!("✖ {error}"),
@@ -123,6 +131,37 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Marks and indents a response so it reads as one answer rather than as loose
+/// paragraphs between the tool calls around it.
+fn response(blocks: &[crate::ui::markdown::MarkdownBlock], width: usize) -> Vec<Line<'static>> {
+    // The marker and indent are the same width, so the text is laid out once for
+    // both and nothing overflows.
+    let inner = width.saturating_sub(RESPONSE_INDENT.len()).max(1);
+
+    markdown::render(blocks, inner)
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            // A blank row between blocks stays blank; indenting it would leave
+            // trailing spaces in anything copied off the screen.
+            if offset > 0 && line.spans.is_empty() {
+                return line;
+            }
+
+            let lead = if offset == 0 {
+                Span::styled(RESPONSE_MARKER, Style::default().fg(Color::Cyan))
+            } else {
+                Span::raw(RESPONSE_INDENT)
+            };
+
+            let mut spans = vec![lead];
+            spans.extend(line.spans);
+
+            Line::from(spans)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -208,6 +247,61 @@ mod tests {
             texts(transcript.visible(10)),
             ["❯ prompt 0", "", "❯ prompt 1"]
         );
+    }
+
+    #[test]
+    fn a_response_is_marked_and_its_later_rows_indented() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Text("alpha beta gamma delta".to_owned())]),
+            14,
+        );
+
+        assert_eq!(
+            texts(transcript.visible(10)),
+            ["❋ alpha beta", "  gamma delta"]
+        );
+    }
+
+    #[test]
+    fn a_marked_response_still_fits_the_width() {
+        const WIDTH: usize = 12;
+
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Text("one two three four five".to_owned())]),
+            WIDTH,
+        );
+
+        for row in texts(transcript.visible(20)) {
+            assert!(
+                row.chars().count() <= WIDTH,
+                "the marker has to be paid for out of the width: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_row_between_blocks_stays_blank() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Text("first\n\nsecond".to_owned())]),
+            40,
+        );
+
+        assert_eq!(
+            texts(transcript.visible(10)),
+            ["❋ first", "", "  second"],
+            "indenting an empty row would leave trailing spaces behind"
+        );
+    }
+
+    #[test]
+    fn a_prompt_is_not_given_the_response_marker() {
+        let mut transcript = Transcript::default();
+        transcript.sync(&state(prompts(1)), 40);
+
+        assert_eq!(texts(transcript.visible(10)), ["❯ prompt 0"]);
     }
 
     #[test]
