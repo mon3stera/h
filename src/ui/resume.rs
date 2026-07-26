@@ -1,9 +1,15 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, time::Duration};
 
-use iocraft::prelude::*;
-use parking_lot::Mutex;
+use ratatui::{
+    DefaultTerminal, Frame,
+    crossterm::event::{self, Event},
+    layout::{Constraint, Layout},
+    style::{Color, Style},
+    text::Line,
+    widgets::Paragraph,
+};
 
-use crate::ui::choice_list::{ChoiceItem, ChoiceList, ChoiceOutcome};
+use crate::ui::choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome};
 
 #[derive(Debug, Default, Clone)]
 pub struct ResumeEntry {
@@ -67,50 +73,77 @@ impl fmt::Display for Elapsed {
     }
 }
 
-#[derive(Debug, Default, Props)]
-pub struct ResumeUIProp {
-    pub items: Vec<ResumeEntry>,
-    pub chosen: Arc<Mutex<String>>,
-}
-
-#[component]
-pub fn ResumeUI<'a>(mut hooks: Hooks, props: &ResumeUIProp) -> impl Into<AnyElement<'a>> {
-    let mut system = hooks.use_context_mut::<SystemContext>();
-    let submitted = hooks.use_state(|| false);
-
-    if submitted.get() {
-        system.exit();
+/// Runs the session picker and reports the id that was chosen.
+///
+/// `None` means the list was dismissed, which the caller treats as a decision
+/// not to resume anything.
+pub async fn pick_session(entries: Vec<ResumeEntry>) -> anyhow::Result<Option<String>> {
+    if entries.is_empty() {
+        return Ok(None);
     }
 
-    // The outcome carries the row's label, which is a title; resuming needs the
-    // id, so keep the ids addressable by the index the outcome reports.
-    let ids = props
-        .items
+    // The outcome carries the row's index; resuming needs the id behind it.
+    let ids = entries
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
+    let items = entries.iter().map(ChoiceItem::from).collect::<Vec<_>>();
 
-    let chosen = props.chosen.clone();
-    let handler = Handler::from(move |outcome: ChoiceOutcome| {
-        let mut submitted = submitted;
+    // The picker owns the terminal and waits on blocking key reads, so it runs
+    // off the runtime rather than holding a worker thread hostage.
+    let outcome = tokio::task::spawn_blocking(move || run(items)).await??;
 
-        if let ChoiceOutcome::Choice { index, .. } = outcome {
-            if let Some(id) = ids.get(index) {
-                *chosen.lock() = id.clone();
-            }
-        }
+    Ok(match outcome {
+        Some(ChoiceOutcome::Choice { index, .. }) => ids.get(index).cloned(),
+        // The list has no free-text row, so nothing else can be chosen.
+        _ => None,
+    })
+}
 
-        submitted.set(true);
-    });
+fn run(items: Vec<ChoiceItem>) -> anyhow::Result<Option<ChoiceOutcome>> {
+    // `init` installs a panic hook that restores the terminal, so only the
+    // ordinary paths have to put it back.
+    let mut terminal = ratatui::init();
+    let outcome = drive(&mut terminal, items);
 
-    let items = props.items.iter().map(ChoiceItem::from).collect::<Vec<_>>();
+    ratatui::restore();
+    outcome
+}
 
-    element! {
-        View(width: 100pct, flex_direction: FlexDirection::Column, row_gap: 2) {
-            Text(content: "Resume a historical session", color: Some(Color::Cyan))
-            ChoiceList(items, on_submit: handler, max_visible: None)
+fn drive(
+    terminal: &mut DefaultTerminal,
+    items: Vec<ChoiceItem>,
+) -> anyhow::Result<Option<ChoiceOutcome>> {
+    let mut list = ChoiceList::new(items);
+
+    loop {
+        terminal.draw(|frame| render(frame, &mut list))?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+
+        match list.handle_key(key) {
+            ChoiceEvent::Idle => {}
+            ChoiceEvent::Submitted(outcome) => return Ok(Some(outcome)),
+            ChoiceEvent::Dismissed => return Ok(None),
         }
     }
+}
+
+fn render(frame: &mut Frame, list: &mut ChoiceList) {
+    let [heading, rows] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "Resume a historical session",
+            Style::default().fg(Color::Cyan),
+        )),
+        heading,
+    );
+
+    list.render(frame, rows);
 }
 
 #[cfg(test)]
@@ -176,14 +209,14 @@ mod tests {
             duration: Duration::from_secs(300),
         };
 
-        assert!(
-            matches!(
-                ChoiceItem::from(&entry),
-                ChoiceItem::Choice { label, description }
-                    if label == "teach me borrow checking"
-                        && description.as_deref() == Some("5 minutes ago")
-            ),
-            "an entry should become a described choice"
+        assert_eq!(
+            ChoiceItem::from(&entry),
+            ChoiceItem::described("teach me borrow checking", "5 minutes ago")
         );
+    }
+
+    #[tokio::test]
+    async fn nothing_to_resume_never_opens_the_picker() {
+        assert_eq!(pick_session(Vec::new()).await.unwrap(), None);
     }
 }

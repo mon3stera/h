@@ -1022,6 +1022,93 @@ mod view_event_tests {
         ));
     }
 
+    #[test]
+    #[ignore = "timing probe, run explicitly"]
+    fn probe_render_cost_by_unit_count() {
+        use std::time::Instant;
+
+        let prose = "Some explanatory prose about the change.\n\nWith a second paragraph and a `code` span.";
+
+        let time = |label: &str, units: Vec<RenderUnit>| {
+            let count = units.len();
+            // Warm up, then measure a few frames.
+            let mut element = element! {
+                DisplayArea(width: 100_u16, startup: None, units: units)
+            };
+            element.render(Some(100));
+
+            let started = Instant::now();
+            for _ in 0..10 {
+                element.render(Some(100));
+            }
+            let per_frame = started.elapsed() / 10;
+            println!("PROBE {label:<28} n={count:<5} {per_frame:?}/frame");
+        };
+
+        for n in [50_usize, 200, 500, 1000] {
+            time(
+                "parsed markdown units",
+                (0..n)
+                    .map(|_| RenderUnit::ParsedMarkdown(parse_markdown(prose)))
+                    .collect(),
+            );
+        }
+
+        for n in [50_usize, 200, 500] {
+            time(
+                "unparsed text units",
+                (0..n).map(|_| RenderUnit::Text(prose.to_owned())).collect(),
+            );
+        }
+
+        for n in [50_usize, 200, 500] {
+            time(
+                "tool units",
+                (0..n)
+                    .map(|index| explored("ReadFile", &format!("src/file{index}.rs")))
+                    .collect(),
+            );
+        }
+
+        const N: usize = 500;
+
+        time(
+            "paragraph, 5 chars",
+            (0..N)
+                .map(|_| RenderUnit::ParsedMarkdown(parse_markdown("hello")))
+                .collect(),
+        );
+        time(
+            "paragraph, 400 chars",
+            (0..N)
+                .map(|_| RenderUnit::ParsedMarkdown(parse_markdown(&"word ".repeat(80))))
+                .collect(),
+        );
+        time(
+            "code block, 20 lines",
+            (0..N)
+                .map(|_| {
+                    RenderUnit::ParsedMarkdown(parse_markdown(&format!(
+                        "```rust\n{}```",
+                        "let x = 1;\n".repeat(20)
+                    )))
+                })
+                .collect(),
+        );
+        time(
+            "prompt (RainbowText)",
+            (0..N)
+                .map(|_| RenderUnit::Prompt("a prompt".to_owned()))
+                .collect(),
+        );
+        time(
+            "raw text, no markdown",
+            (0..N)
+                .map(|_| RenderUnit::ParsedMarkdown(Vec::new()))
+                .collect(),
+        );
+    }
+
     fn diff_line(number: usize, kind: DiffLineKind, text: &str) -> DiffLine {
         DiffLine {
             number,

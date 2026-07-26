@@ -1,7 +1,14 @@
-use iocraft::prelude::*;
+use ratatui::{
+    Frame,
+    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    layout::{Position, Rect},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 
 /// One row of a [`ChoiceList`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChoiceItem {
     /// A fixed option. Enter submits it as-is.
     Choice {
@@ -37,109 +44,205 @@ impl ChoiceItem {
 
 /// What the user settled on. The index refers to the `items` that were passed
 /// in, so callers can map it back to whatever they built the list from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChoiceOutcome {
     Choice { index: usize, label: String },
     FreeText { index: usize, text: String },
 }
 
-#[derive(Default, Props)]
-pub struct ChoiceListProps {
-    pub items: Vec<ChoiceItem>,
-    pub on_submit: Handler<ChoiceOutcome>,
-    /// Rows to show at once. The window follows the selection; `None` shows
-    /// every item.
-    pub max_visible: Option<usize>,
+/// What a key press did to the list. Anything that is not a decision leaves the
+/// caller to draw again and read the next key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChoiceEvent {
+    Idle,
+    Submitted(ChoiceOutcome),
+    /// Dismissed without choosing — Esc or Ctrl+C.
+    Dismissed,
 }
+
+const MARKER_WIDTH: u16 = 2;
 
 /// A keyboard-driven list: Up/Down move the selection (wrapping at the ends),
-/// Enter submits it.
+/// Enter submits it, Esc abandons it.
 ///
-/// The component acts on every key event it receives, because iocraft routes
-/// keyboard input to every registered handler regardless of layout. Mount it
-/// only while it should own the keyboard, and unmount whatever else reads keys.
-#[component]
-pub fn ChoiceList(mut hooks: Hooks, props: &ChoiceListProps) -> impl Into<AnyElement<'static>> {
-    let mut selected = hooks.use_state(|| 0usize);
-    let draft = hooks.use_state(String::new);
+/// Key handling is a plain state transition and drawing reads that state, so the
+/// two can be exercised apart: neither needs a terminal.
+pub struct ChoiceList {
+    items: Vec<ChoiceItem>,
+    selected: usize,
+    /// Kept across moves of the selection, so leaving the free-text row and
+    /// coming back does not lose what was typed.
+    draft: String,
+    max_visible: Option<usize>,
+    /// Where the caret landed on the last draw, for the terminal cursor to
+    /// follow. Only a selected free-text row has one.
+    caret: Option<Position>,
+}
 
-    let count = props.items.len();
-
-    hooks.use_terminal_events({
-        let items = props.items.clone();
-        let on_submit = props.on_submit.clone();
-
-        move |event| {
-            let TerminalEvent::Key(KeyEvent { code, kind, .. }) = event else {
-                return;
-            };
-
-            if kind == KeyEventKind::Release || count == 0 {
-                return;
-            }
-
-            match code {
-                KeyCode::Up => selected.set((selected.get() + count - 1) % count),
-                KeyCode::Down => selected.set((selected.get() + 1) % count),
-                KeyCode::Enter => {
-                    let index = selected.get();
-
-                    match &items[index] {
-                        ChoiceItem::Choice { label, .. } => on_submit(ChoiceOutcome::Choice {
-                            index,
-                            label: label.clone(),
-                        }),
-                        ChoiceItem::FreeText { .. } => {
-                            let text = draft.read().trim().to_owned();
-
-                            if !text.is_empty() {
-                                on_submit(ChoiceOutcome::FreeText { index, text });
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+impl ChoiceList {
+    pub fn new(items: Vec<ChoiceItem>) -> Self {
+        Self {
+            items,
+            selected: 0,
+            draft: String::new(),
+            max_visible: None,
+            caret: None,
         }
-    });
-
-    // Clamp in case the caller shrank the list between renders.
-    if count > 0 && selected.get() >= count {
-        selected.set(count - 1);
     }
 
-    let (start, end) = visible_window(selected.get(), count, props.max_visible);
+    /// Rows to show at once. The window follows the selection; `None` shows
+    /// every item.
+    pub fn with_max_visible(mut self, max_visible: Option<usize>) -> Self {
+        self.max_visible = max_visible;
+        self
+    }
 
-    let rows = props.items[start..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, item)| {
-            let index = start + offset;
-            let is_selected = index == selected.get();
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
 
-            element! {
-                ChoiceRow(item: item.clone(), is_selected, draft)
-            }
-            .into_any()
-        })
-        .collect::<Vec<_>>();
+    fn on_free_text(&self) -> bool {
+        matches!(
+            self.items.get(self.selected),
+            Some(ChoiceItem::FreeText { .. })
+        )
+    }
 
-    element! {
-        View(flex_direction: FlexDirection::Column) {
-            #(overflow_hint(start > 0))
-            #(rows.into_iter())
-            #(overflow_hint(end < count))
+    pub fn handle_key(&mut self, key: KeyEvent) -> ChoiceEvent {
+        // A held key repeats; a released one is the same press arriving twice.
+        if key.kind == KeyEventKind::Release || self.items.is_empty() {
+            return ChoiceEvent::Idle;
         }
+
+        let count = self.items.len();
+
+        match key.code {
+            KeyCode::Esc => return ChoiceEvent::Dismissed,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return ChoiceEvent::Dismissed;
+            }
+            KeyCode::Up => self.selected = (self.selected + count - 1) % count,
+            KeyCode::Down => self.selected = (self.selected + 1) % count,
+            KeyCode::Enter => return self.submit(),
+            // Typing reaches the field only while it is selected, otherwise every
+            // keystroke meant for the list would land in it.
+            KeyCode::Char(character)
+                if self.on_free_text() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.draft.push(character);
+            }
+            KeyCode::Backspace if self.on_free_text() => {
+                self.draft.pop();
+            }
+            _ => {}
+        }
+
+        ChoiceEvent::Idle
+    }
+
+    fn submit(&self) -> ChoiceEvent {
+        let index = self.selected;
+
+        match &self.items[index] {
+            ChoiceItem::Choice { label, .. } => ChoiceEvent::Submitted(ChoiceOutcome::Choice {
+                index,
+                label: label.clone(),
+            }),
+            ChoiceItem::FreeText { .. } => {
+                let text = self.draft.trim().to_owned();
+
+                // A blank field is not an answer.
+                if text.is_empty() {
+                    ChoiceEvent::Idle
+                } else {
+                    ChoiceEvent::Submitted(ChoiceOutcome::FreeText { index, text })
+                }
+            }
+        }
+    }
+
+    /// Where the terminal cursor should sit after the last draw.
+    pub fn caret(&self) -> Option<Position> {
+        self.caret
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let (lines, caret) = self.lines(area);
+
+        frame.render_widget(Paragraph::new(lines), area);
+
+        self.caret = caret;
+        if let Some(caret) = caret {
+            frame.set_cursor_position(caret);
+        }
+    }
+
+    /// The drawn rows, and where the caret belongs among them.
+    fn lines(&self, area: Rect) -> (Vec<Line<'static>>, Option<Position>) {
+        let count = self.items.len();
+        let (start, end) = visible_window(self.selected, count, self.max_visible);
+
+        let mut lines = Vec::new();
+        let mut caret = None;
+
+        if start > 0 {
+            lines.push(overflow_hint());
+        }
+
+        for index in start..end {
+            let is_selected = index == self.selected;
+
+            if is_selected && matches!(self.items[index], ChoiceItem::FreeText { .. }) {
+                caret = Some(Position::new(
+                    area.x + MARKER_WIDTH + self.draft.chars().count() as u16,
+                    area.y + lines.len() as u16,
+                ));
+            }
+
+            lines.push(self.row(index, is_selected));
+        }
+
+        if end < count {
+            lines.push(overflow_hint());
+        }
+
+        (lines, caret)
+    }
+
+    fn row(&self, index: usize, is_selected: bool) -> Line<'static> {
+        let marker = if is_selected { "❯ " } else { "  " };
+        let selected_style = if is_selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let muted = Style::default().fg(Color::DarkGray);
+
+        let mut spans = vec![Span::styled(marker, selected_style)];
+
+        match &self.items[index] {
+            ChoiceItem::Choice { label, description } => {
+                spans.push(Span::styled(label.clone(), selected_style));
+
+                if let Some(description) = description {
+                    spans.push(Span::styled(format!("  {description}"), muted));
+                }
+            }
+            ChoiceItem::FreeText { placeholder } => {
+                if self.draft.is_empty() {
+                    spans.push(Span::styled(placeholder.clone(), muted));
+                } else {
+                    spans.push(Span::styled(self.draft.clone(), selected_style));
+                }
+            }
+        }
+
+        Line::from(spans)
     }
 }
 
-fn overflow_hint(show: bool) -> Option<AnyElement<'static>> {
-    show.then(|| {
-        element! {
-            Text(content: "  ⋯", color: Some(Color::DarkGrey))
-        }
-        .into_any()
-    })
+fn overflow_hint() -> Line<'static> {
+    Line::from(Span::styled("  ⋯", Style::default().fg(Color::DarkGray)))
 }
 
 /// The slice of items to draw, chosen so the selection stays inside it.
@@ -159,164 +262,14 @@ fn visible_window(selected: usize, count: usize, max_visible: Option<usize>) -> 
     (start, start + max_visible)
 }
 
-#[derive(Default, Props)]
-struct ChoiceRowProps {
-    item: Option<ChoiceItem>,
-    is_selected: bool,
-    /// Shared with the parent so the typed text survives moving the selection
-    /// away from the free-text row and back.
-    draft: Option<State<String>>,
-}
-
-#[component]
-fn ChoiceRow(props: &ChoiceRowProps) -> impl Into<AnyElement<'static>> {
-    let Some(item) = props.item.clone() else {
-        return element!(View).into_any();
-    };
-
-    let is_selected = props.is_selected;
-    let marker = if is_selected { "❯ " } else { "  " };
-    let color = is_selected.then_some(Color::Cyan);
-
-    let body = match item {
-        ChoiceItem::Choice { label, description } => {
-            let description = description.map(|description| {
-                element! {
-                    Text(content: format!("  {description}"), color: Some(Color::DarkGrey))
-                }
-                .into_any()
-            });
-
-            element! {
-                View {
-                    Text(content: label, color: color)
-                    #(description)
-                }
-            }
-            .into_any()
-        }
-        ChoiceItem::FreeText { placeholder } => {
-            let Some(mut draft) = props.draft else {
-                return element!(View).into_any();
-            };
-
-            // Only the selected row may take input, otherwise every keystroke
-            // meant for the list would land in the field.
-            if is_selected {
-                element! {
-                    View {
-                        TextInput(
-                            has_focus: true,
-                            value: draft.to_string(),
-                            on_change: move |value| draft.set(value),
-                            color: color,
-                        )
-                    }
-                }
-                .into_any()
-            } else {
-                let text = draft.read().clone();
-                let content = if text.is_empty() { placeholder } else { text };
-
-                element! {
-                    Text(content: content, color: Some(Color::DarkGrey))
-                }
-                .into_any()
-            }
-        }
-    };
-
-    element! {
-        View {
-            Text(content: marker, color: color)
-            #(body)
-        }
-    }
-    .into_any()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
-
-    use futures::stream::{self, StreamExt};
+    use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
 
-    #[derive(Default, Props)]
-    struct HarnessProps {
-        items: Vec<ChoiceItem>,
-        outcome: Option<Arc<Mutex<Option<ChoiceOutcome>>>>,
-    }
-
-    /// Renders a `ChoiceList` and exits as soon as it submits, so the mock
-    /// render loop terminates.
-    #[component]
-    fn Harness(mut hooks: Hooks, props: &HarnessProps) -> impl Into<AnyElement<'static>> {
-        let mut system = hooks.use_context_mut::<SystemContext>();
-        let mut submitted = hooks.use_state(|| false);
-
-        // Every run ends with Esc so the render loop terminates even when the
-        // list refuses to submit.
-        hooks.use_terminal_events(move |event| {
-            if let TerminalEvent::Key(KeyEvent {
-                code: KeyCode::Esc,
-                kind: KeyEventKind::Press,
-                ..
-            }) = event
-            {
-                submitted.set(true);
-            }
-        });
-
-        if submitted.get() {
-            system.exit();
-        }
-
-        let outcome = props.outcome.clone().unwrap();
-        let on_submit = Handler::from(move |value: ChoiceOutcome| {
-            // `State` is `Copy`; take a copy so the closure stays `Fn`.
-            let mut submitted = submitted;
-
-            *outcome.lock().unwrap() = Some(value);
-            submitted.set(true);
-        });
-
-        element! {
-            View(width: 40) {
-                ChoiceList(items: props.items.clone(), on_submit)
-            }
-        }
-    }
-
-    fn press(code: KeyCode) -> TerminalEvent {
-        TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code))
-    }
-
-    /// Drives the list with `keys` and returns what it submitted, plus the last
-    /// canvas it drew.
-    ///
-    /// The events are spaced out so the loop renders between them. Feeding them
-    /// as one burst would dispatch every key to the handlers registered by the
-    /// first render, and rows that only mount once selected would never see
-    /// their input.
-    async fn run(items: Vec<ChoiceItem>, keys: Vec<KeyCode>) -> (Option<ChoiceOutcome>, String) {
-        let outcome = Arc::new(Mutex::new(None));
-        let events = stream::iter(keys.into_iter().chain([KeyCode::Esc])).then(|code| async move {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            press(code)
-        });
-
-        let canvases: Vec<_> = element!(Harness(items, outcome: Some(outcome.clone())))
-            .mock_terminal_render_loop(MockTerminalConfig::with_events(events))
-            .collect()
-            .await;
-
-        let taken = outcome.lock().unwrap().take();
-        (taken, canvases.last().unwrap().to_string())
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     fn options() -> Vec<ChoiceItem> {
@@ -327,83 +280,208 @@ mod tests {
         ]
     }
 
-    #[tokio::test]
-    async fn enter_submits_the_selected_choice() {
-        let (outcome, _) = run(options(), vec![KeyCode::Down, KeyCode::Enter]).await;
+    /// Feeds a list of keys and reports the first decision it reached.
+    fn drive(list: &mut ChoiceList, keys: Vec<KeyCode>) -> ChoiceEvent {
+        for code in keys {
+            match list.handle_key(press(code)) {
+                ChoiceEvent::Idle => {}
+                decided => return decided,
+            }
+        }
 
-        assert!(
-            matches!(outcome, Some(ChoiceOutcome::Choice { index: 1, ref label }) if label == "second"),
-            "{outcome:?}"
-        );
+        ChoiceEvent::Idle
     }
 
-    #[tokio::test]
-    async fn up_wraps_to_the_last_item() {
-        let (outcome, _) = run(
-            options(),
-            vec![KeyCode::Up, KeyCode::Char('h'), KeyCode::Enter],
-        )
-        .await;
+    /// The rows as drawn, with trailing padding removed.
+    fn drawn(list: &mut ChoiceList, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
 
-        assert!(
-            matches!(outcome, Some(ChoiceOutcome::FreeText { index: 2, ref text }) if text == "h"),
-            "{outcome:?}"
-        );
-    }
+        terminal
+            .draw(|frame| list.render(frame, frame.area()))
+            .unwrap();
 
-    #[tokio::test]
-    async fn typing_only_reaches_the_free_text_row_while_it_is_selected() {
-        // 'x' arrives while the first choice is selected, so it must not land
-        // in the field; the answer is the text typed after moving down to it.
-        let (outcome, _) = run(
-            options(),
-            vec![
-                KeyCode::Char('x'),
-                KeyCode::Up,
-                KeyCode::Char('o'),
-                KeyCode::Char('k'),
-                KeyCode::Enter,
-            ],
-        )
-        .await;
-
-        assert!(
-            matches!(outcome, Some(ChoiceOutcome::FreeText { ref text, .. }) if text == "ok"),
-            "{outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn enter_on_a_blank_free_text_row_does_not_submit() {
-        let (outcome, _) = run(options(), vec![KeyCode::Up, KeyCode::Enter]).await;
-
-        assert!(outcome.is_none(), "{outcome:?}");
-    }
-
-    #[tokio::test]
-    async fn the_selected_row_is_marked_and_descriptions_are_shown() {
-        let (_, canvas) = run(options(), vec![KeyCode::Down, KeyCode::Enter]).await;
-
-        assert!(canvas.contains("❯ second"), "{canvas}");
-        assert!(canvas.contains("with detail"), "{canvas}");
-        assert!(canvas.contains("  first"), "{canvas}");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .map(|row| row.trim_end().to_owned())
+            .collect()
     }
 
     #[test]
-    fn window_shows_everything_when_it_fits() {
-        assert_eq!(visible_window(0, 3, Some(5)), (0, 3));
-        assert_eq!(visible_window(2, 3, None), (0, 3));
+    fn enter_submits_the_selected_choice() {
+        let mut list = ChoiceList::new(options());
+
+        assert_eq!(
+            drive(&mut list, vec![KeyCode::Down, KeyCode::Enter]),
+            ChoiceEvent::Submitted(ChoiceOutcome::Choice {
+                index: 1,
+                label: "second".to_owned(),
+            })
+        );
     }
 
     #[test]
-    fn window_follows_the_selection_without_running_past_the_ends() {
-        assert_eq!(visible_window(0, 10, Some(4)), (0, 4));
-        assert_eq!(visible_window(5, 10, Some(4)), (3, 7));
-        assert_eq!(visible_window(9, 10, Some(4)), (6, 10));
+    fn up_wraps_to_the_last_item() {
+        let mut list = ChoiceList::new(options());
+
+        drive(&mut list, vec![KeyCode::Up]);
+
+        assert_eq!(list.selected(), 2);
     }
 
     #[test]
-    fn window_of_zero_is_treated_as_one() {
-        assert_eq!(visible_window(3, 10, Some(0)), (3, 4));
+    fn down_wraps_to_the_first_item() {
+        let mut list = ChoiceList::new(options());
+
+        drive(&mut list, vec![KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+
+        assert_eq!(list.selected(), 0);
+    }
+
+    #[test]
+    fn typing_only_reaches_the_free_text_row_while_it_is_selected() {
+        let mut list = ChoiceList::new(options());
+
+        // Two rows above the field: these keystrokes belong to the list.
+        drive(&mut list, vec![KeyCode::Char('x'), KeyCode::Char('y')]);
+        drive(&mut list, vec![KeyCode::Up]);
+        let outcome = drive(
+            &mut list,
+            vec![KeyCode::Char('o'), KeyCode::Char('k'), KeyCode::Enter],
+        );
+
+        assert_eq!(
+            outcome,
+            ChoiceEvent::Submitted(ChoiceOutcome::FreeText {
+                index: 2,
+                text: "ok".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn enter_on_a_blank_free_text_row_does_not_submit() {
+        let mut list = ChoiceList::new(options());
+
+        assert_eq!(
+            drive(&mut list, vec![KeyCode::Up, KeyCode::Enter]),
+            ChoiceEvent::Idle
+        );
+    }
+
+    #[test]
+    fn a_draft_survives_leaving_the_row_and_coming_back() {
+        let mut list = ChoiceList::new(options());
+
+        drive(
+            &mut list,
+            vec![KeyCode::Up, KeyCode::Char('h'), KeyCode::Char('i')],
+        );
+        drive(&mut list, vec![KeyCode::Down, KeyCode::Up]);
+
+        assert_eq!(
+            drive(&mut list, vec![KeyCode::Enter]),
+            ChoiceEvent::Submitted(ChoiceOutcome::FreeText {
+                index: 2,
+                text: "hi".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn backspace_only_edits_the_field() {
+        let mut list = ChoiceList::new(options());
+
+        drive(
+            &mut list,
+            vec![KeyCode::Up, KeyCode::Char('a'), KeyCode::Char('b')],
+        );
+        drive(&mut list, vec![KeyCode::Backspace]);
+
+        assert_eq!(
+            drive(&mut list, vec![KeyCode::Enter]),
+            ChoiceEvent::Submitted(ChoiceOutcome::FreeText {
+                index: 2,
+                text: "a".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_abandon_the_list() {
+        let mut list = ChoiceList::new(options());
+
+        assert_eq!(list.handle_key(press(KeyCode::Esc)), ChoiceEvent::Dismissed);
+        assert_eq!(
+            list.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ChoiceEvent::Dismissed,
+        );
+    }
+
+    #[test]
+    fn a_control_chord_is_not_typed_into_the_field() {
+        let mut list = ChoiceList::new(options());
+
+        drive(&mut list, vec![KeyCode::Up]);
+        list.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            drive(&mut list, vec![KeyCode::Enter]),
+            ChoiceEvent::Idle,
+            "the field should still be blank"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_ignores_every_key() {
+        let mut list = ChoiceList::new(Vec::new());
+
+        assert_eq!(list.handle_key(press(KeyCode::Enter)), ChoiceEvent::Idle);
+        assert_eq!(list.handle_key(press(KeyCode::Down)), ChoiceEvent::Idle);
+    }
+
+    #[test]
+    fn the_selected_row_is_marked_and_descriptions_are_shown() {
+        let mut list = ChoiceList::new(options());
+
+        assert_eq!(
+            drawn(&mut list, 3),
+            ["❯ first", "  second  with detail", "  something else"]
+        );
+    }
+
+    #[test]
+    fn a_long_list_windows_around_the_selection_and_hints_at_the_rest() {
+        let items = (0..6)
+            .map(|index| ChoiceItem::choice(format!("item {index}")))
+            .collect::<Vec<_>>();
+        let mut list = ChoiceList::new(items).with_max_visible(Some(3));
+
+        drive(&mut list, vec![KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+
+        assert_eq!(
+            drawn(&mut list, 5),
+            ["  ⋯", "  item 2", "❯ item 3", "  item 4", "  ⋯"]
+        );
+    }
+
+    #[test]
+    fn the_caret_follows_the_typed_text() {
+        let mut list = ChoiceList::new(options());
+
+        drive(
+            &mut list,
+            vec![KeyCode::Up, KeyCode::Char('a'), KeyCode::Char('b')],
+        );
+        drawn(&mut list, 3);
+
+        assert_eq!(
+            list.caret(),
+            Some(Position::new(MARKER_WIDTH + 2, 2)),
+            "after the marker and the two typed characters, on the third row"
+        );
     }
 }

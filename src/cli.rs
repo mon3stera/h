@@ -1,13 +1,9 @@
-use std::sync::Arc;
-
 use chrono::Utc;
 use clap::Parser;
-use iocraft::{ElementExt, element};
-use parking_lot::Mutex;
 
 use crate::{
     context::list_sessions,
-    ui::resume::{ResumeEntry, ResumeUI},
+    ui::resume::{ResumeEntry, pick_session},
 };
 
 /// An agentic coding CLI.
@@ -69,23 +65,14 @@ pub async fn resolve_session(args: &Args) -> anyhow::Result<Session> {
         return Ok(Session::Quit);
     }
 
-    let chosen = Arc::new(Mutex::new(String::new()));
-
-    element!(ResumeUI(items: entries, chosen: chosen.clone()))
-        .render_loop()
-        .fullscreen()
-        .await?;
-
-    // The picker leaves this empty when it is dismissed without a selection.
-    let chosen = chosen.lock().clone();
-
-    if chosen.is_empty() {
-        // Dismissing the list is a decision, not a failure; it needs no notice.
-        tracing::info!(event = "cli.resume.dismissed");
-        return Ok(Session::Quit);
+    match pick_session(entries).await? {
+        Some(id) => Ok(Session::Resume(id)),
+        None => {
+            // Dismissing the list is a decision, not a failure; no notice needed.
+            tracing::info!(event = "cli.resume.dismissed");
+            Ok(Session::Quit)
+        }
     }
-
-    Ok(Session::Resume(chosen))
 }
 
 #[cfg(test)]
