@@ -1,9 +1,0 @@
-[package]
-name = "iocraft-textinput-scroll-repro"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-iocraft = "=0.8.4"
-smol = "2.0.2"
