@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use crate::{
     bridge::UiBridge,
@@ -7,14 +7,31 @@ use crate::{
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::Provider,
     tool::{
-        AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool,
-        ToolRegistry, WriteFileTool,
+        AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolCall,
+        ToolCallResult, ToolRegistry, WriteFileTool,
     },
 };
 use futures::StreamExt;
+use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::Instrument;
 use uuid::Uuid;
+
+/// Rebuilds a tool result from the output that was persisted for the provider.
+///
+/// [`ToolCallResult::into_provider_output`] renders a failure as `{"error": …}`,
+/// so that shape reads back as a failure. A successful output that happens to
+/// look the same replays as a failure; the archive keeps nothing that could tell
+/// the two apart.
+fn replayed_result(call_id: &str, output: &str) -> ToolCallResult {
+    let value =
+        serde_json::from_str::<Value>(output).unwrap_or_else(|_| Value::String(output.to_owned()));
+
+    match value.get("error").and_then(Value::as_str) {
+        Some(message) => ToolCallResult::failure(call_id.to_owned(), message),
+        None => ToolCallResult::success(call_id.to_owned(), value),
+    }
+}
 
 #[derive(Default)]
 struct TurnMetrics {
@@ -249,10 +266,94 @@ where
         }
     }
 
-    async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {
+    pub async fn archive(&mut self) -> anyhow::Result<()> {
+        // Starting `h` and quitting straight away should not leave a titleless
+        // row in the session picker.
+        if !self.context.has_exchange() {
+            tracing::info!(event = "agent.archive.skipped", reason = "no_exchange");
+            return Ok(());
+        }
+
+        self.context.archive().await
+    }
+
+    pub async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {
         let context = Context::resume(id).await?;
         self.context = context;
         Ok(self)
+    }
+
+    /// Replays the whole conversation onto the view bus, so a resumed session
+    /// opens on its history instead of a blank screen.
+    ///
+    /// The replay is coarser than the original: streaming granularity is gone,
+    /// so each assistant message arrives as a single delta. `System` messages
+    /// stay hidden, exactly as they were while live.
+    pub fn rebroadcast_all_view(&self) {
+        let histories = self.context.histories();
+
+        // A tool call and the result answering it are separate messages; index
+        // the results so each call can be presented in its finished form.
+        let outputs = histories
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolCallResult { call_id, output } => {
+                    Some((call_id.as_str(), output.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut replayed = 0_usize;
+
+        for message in histories {
+            match message {
+                // Global prompts, workspace info, and results already folded
+                // into the call above them were never on screen.
+                Message::System(_) | Message::ToolCallResult { .. } => continue,
+                Message::User(prompt) => {
+                    self.view_bus
+                        .broadcast(AgentViewEvent::Prompt(prompt.clone()));
+                }
+                Message::Assistant(text) => {
+                    self.view_bus
+                        .broadcast(AgentViewEvent::TextDelta(text.clone()));
+                    // Closes the response the way the live path does, which is
+                    // what draws the rule between exchanges.
+                    self.view_bus.broadcast(AgentViewEvent::Completed);
+                }
+                Message::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let call = ToolCall::new(
+                        call_id.clone(),
+                        name.clone(),
+                        serde_json::from_str(arguments).unwrap_or(Value::Null),
+                    );
+
+                    let presentation = match outputs.get(call_id.as_str()) {
+                        Some(output) => self
+                            .tool
+                            .present_completed(&call, &replayed_result(call_id, output)),
+                        // A call with no recorded result never came back; the
+                        // session was archived or died mid-flight.
+                        None => self.tool.present_running(&call),
+                    };
+
+                    self.view_bus.broadcast(AgentViewEvent::Tool(presentation));
+                }
+            }
+
+            replayed += 1;
+        }
+
+        tracing::info!(
+            event = "agent.view.rebroadcast",
+            message_count = histories.len(),
+            replayed_count = replayed,
+        );
     }
 
     async fn next_turn(&mut self, metrics: &mut TurnMetrics) -> anyhow::Result<()> {
@@ -377,6 +478,176 @@ mod tests {
                 model,
                 thinking_effort: Some(thinking_effort),
             } if model == "test-model" && thinking_effort == "high"
+        ));
+    }
+
+    fn agent_with_histories(histories: Vec<Message>) -> Agent<TestProvider> {
+        let mut agent = Agent::new(TestProvider);
+        *agent.context.histories_mut() = histories;
+
+        agent
+    }
+
+    fn drain(receiver: &mut UnboundedReceiver<AgentViewEvent>) -> Vec<AgentViewEvent> {
+        let mut events = Vec::new();
+
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+
+        events
+    }
+
+    #[test]
+    fn rebroadcast_replays_prompts_and_responses_in_order() {
+        let mut agent = agent_with_histories(vec![
+            Message::System("workspace info".to_owned()),
+            Message::User("first question".to_owned()),
+            Message::Assistant("first answer".to_owned()),
+            Message::User("second question".to_owned()),
+            Message::Assistant("second answer".to_owned()),
+        ]);
+        let mut receiver = agent.subscribe_view();
+
+        agent.rebroadcast_all_view();
+
+        let events = drain(&mut receiver);
+        let described = events
+            .iter()
+            .map(|event| match event {
+                AgentViewEvent::Prompt(prompt) => format!("prompt:{prompt}"),
+                AgentViewEvent::TextDelta(delta) => format!("text:{delta}"),
+                AgentViewEvent::Completed => "completed".to_owned(),
+                other => format!("unexpected:{other:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            described,
+            [
+                "prompt:first question",
+                "text:first answer",
+                "completed",
+                "prompt:second question",
+                "text:second answer",
+                "completed",
+            ]
+        );
+    }
+
+    #[test]
+    fn rebroadcast_hides_system_messages() {
+        let mut agent = agent_with_histories(vec![
+            Message::System("global prompts".to_owned()),
+            Message::System("workspace info".to_owned()),
+        ]);
+        let mut receiver = agent.subscribe_view();
+
+        agent.rebroadcast_all_view();
+
+        assert!(drain(&mut receiver).is_empty());
+    }
+
+    #[test]
+    fn rebroadcast_pairs_a_tool_call_with_its_result() {
+        let mut agent = agent_with_histories(vec![
+            Message::ToolCall {
+                call_id: "call-1".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({"action": "run_blocking", "command": "cargo test"}).to_string(),
+            },
+            Message::ToolCallResult {
+                call_id: "call-1".to_owned(),
+                output: json!({"stdout": "ok", "exit_code": 0}).to_string(),
+            },
+        ]);
+        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        let mut receiver = agent.subscribe_view();
+
+        agent.rebroadcast_all_view();
+
+        let events = drain(&mut receiver);
+
+        assert_eq!(events.len(), 1, "the result folds into the call it answers");
+        assert!(
+            matches!(
+                &events[0],
+                AgentViewEvent::Tool(presentation)
+                    if presentation.name == "Bash"
+                        && presentation.target.as_deref() == Some("cargo test")
+                        && matches!(presentation.status, ToolCallStatus::Succeeded)
+            ),
+            "unexpected replay: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn rebroadcast_reads_a_persisted_error_back_as_a_failure() {
+        let mut agent = agent_with_histories(vec![
+            Message::ToolCall {
+                call_id: "call-1".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({"action": "run_blocking", "command": "cargo test"}).to_string(),
+            },
+            Message::ToolCallResult {
+                call_id: "call-1".to_owned(),
+                output: json!({"error": "command not found"}).to_string(),
+            },
+        ]);
+        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        let mut receiver = agent.subscribe_view();
+
+        agent.rebroadcast_all_view();
+
+        let events = drain(&mut receiver);
+
+        assert!(
+            matches!(
+                &events[0],
+                AgentViewEvent::Tool(presentation)
+                    if matches!(
+                        &presentation.status,
+                        ToolCallStatus::Failed { message } if message == "command not found"
+                    )
+            ),
+            "unexpected replay: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn rebroadcast_leaves_an_unanswered_tool_call_running() {
+        let mut agent = agent_with_histories(vec![Message::ToolCall {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"action": "run_blocking", "command": "cargo test"}).to_string(),
+        }]);
+        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        let mut receiver = agent.subscribe_view();
+
+        agent.rebroadcast_all_view();
+
+        let events = drain(&mut receiver);
+
+        assert!(
+            matches!(
+                &events[0],
+                AgentViewEvent::Tool(presentation)
+                    if matches!(presentation.status, ToolCallStatus::Running)
+            ),
+            "unexpected replay: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn a_persisted_output_that_is_not_json_replays_as_a_success() {
+        let result = replayed_result("call-1", "plain text output");
+
+        assert!(matches!(
+            result.outcome(),
+            crate::tool::ToolCallOutcome::Success(Value::String(text)) if text == "plain text output"
         ));
     }
 

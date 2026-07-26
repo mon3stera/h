@@ -28,6 +28,7 @@ mod banner;
 pub mod choice_list;
 mod markdown;
 mod markdown_view;
+pub mod resume;
 
 impl TryFrom<AgentViewEvent> for RenderUnit {
     type Error = anyhow::Error;
@@ -39,6 +40,7 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
             AgentViewEvent::TurnStart | AgentViewEvent::TurnFinished => {
                 anyhow::bail!("should not be rendered")
             }
+            AgentViewEvent::Prompt(prompt) => Ok(RenderUnit::Prompt(prompt)),
             AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
             AgentViewEvent::Completed => Ok(RenderUnit::Separator),
             AgentViewEvent::Err(e) => Ok(RenderUnit::Err(e)),
@@ -586,7 +588,35 @@ fn WorkingIndicator(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 #[cfg(test)]
 mod view_event_tests {
     use super::*;
-    use crate::tool::{ToolCallId, ToolCallStatus};
+    use crate::{
+        bridge::UiBridge,
+        tool::{ToolCallId, ToolCallStatus},
+    };
+
+    /// Shutdown hangs on this: the agent worker archives once every prompt
+    /// sender is gone, so the UI must not leave one behind when it quits.
+    #[tokio::test]
+    async fn quitting_the_ui_releases_the_prompt_sender() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (_bridge, ui_request_rx) = UiBridge::new();
+        let (_view_tx, view_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut ui = element!(UI(
+            committer: Some(tx),
+            event_rx: Arc::new(Mutex::new(Some(view_rx))),
+            ui_request_rx: Arc::new(Mutex::new(Some(ui_request_rx))),
+        ));
+
+        // Mount it once, so the component clones the sender into its input
+        // handler the way a live session does.
+        ui.render(Some(80));
+        drop(ui);
+
+        assert!(
+            rx.recv().await.is_none(),
+            "a sender outlived the UI, so the worker would wait forever"
+        );
+    }
 
     fn presentation(status: ToolCallStatus) -> Presentation {
         Presentation {

@@ -23,6 +23,10 @@ pub enum AgentViewEvent {
         model: String,
         thinking_effort: Option<String>,
     },
+    /// A prompt the user already submitted. The live path never needs this — the
+    /// UI echoes what was typed as it is committed — but replaying an archived
+    /// session has no other way to put the user's own turns back on screen.
+    Prompt(String),
     TextDelta(String),
     Tool(Presentation),
     TurnStart,

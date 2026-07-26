@@ -1,6 +1,12 @@
-use std::{env::current_dir, io, path::PathBuf};
+use std::{
+    env::current_dir,
+    io,
+    path::{Path, PathBuf},
+};
 
+use anyhow::Context as _;
 use chrono::{DateTime, Local, Utc};
+use futures::{StreamExt, stream};
 use gix::{
     bstr::ByteSlice,
     progress::Discard,
@@ -190,12 +196,23 @@ pub struct Context {
     histories: Vec<Message>,
 }
 
+/// The bulk of an archived session: everything needed to replay it.
 #[derive(Serialize, Deserialize, Clone)]
-struct PersistSession {
+struct PersistHistories {
     id: String,
-    last_modified: DateTime<Utc>,
-    title: String,
     histories: Vec<Message>,
+}
+
+/// The listing view of an archived session, stored in its own file so a session
+/// picker never has to deserialize the conversation to learn a title.
+///
+/// Both fields are derivable from the histories, which makes this file a cache:
+/// losing it costs a listing entry, never a session.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SessionMeta {
+    pub id: String,
+    pub last_modified: DateTime<Utc>,
+    pub title: String,
 }
 
 impl Context {
@@ -288,20 +305,39 @@ impl Context {
         &self.histories
     }
 
+    /// Whether anything happened worth keeping. System messages are injected on
+    /// every start, so a context holding only those is an untouched session.
+    pub fn has_exchange(&self) -> bool {
+        self.histories
+            .iter()
+            .any(|message| !matches!(message, Message::System(_)))
+    }
+
     pub fn histories_mut(&mut self) -> &mut Vec<Message> {
         &mut self.histories
     }
 }
 
 #[inline]
-fn archive_dir() -> PathBuf {
+pub fn archive_dir() -> PathBuf {
     let path = "~/.h/archive";
     let path = shellexpand::tilde(path);
     PathBuf::from(path.to_string())
 }
 
-fn archive_path(id: &str) -> PathBuf {
-    archive_dir().join(format!("{id}.archive"))
+const ARCHIVE_EXTENSION: &str = "archive";
+const META_EXTENSION: &str = "meta";
+
+/// Metadata files are tiny, so reading a whole directory of them concurrently
+/// costs little; the cap only keeps a huge archive from exhausting file handles.
+const MAX_CONCURRENT_META_READS: usize = 32;
+
+fn archive_path_in(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.{ARCHIVE_EXTENSION}"))
+}
+
+fn meta_path_in(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.{META_EXTENSION}"))
 }
 
 const TITLE_CHARS: usize = 60;
@@ -320,12 +356,18 @@ impl Context {
         Ok(fs::create_dir_all(archive_dir()).await?)
     }
 
-    fn to_persist_session(&self) -> PersistSession {
-        PersistSession {
+    fn to_persist_histories(&self) -> PersistHistories {
+        PersistHistories {
+            id: self.id.clone(),
+            histories: self.histories.clone(),
+        }
+    }
+
+    fn to_meta(&self) -> SessionMeta {
+        SessionMeta {
             id: self.id.clone(),
             last_modified: Utc::now(),
             title: self.title(),
-            histories: self.histories.clone(),
         }
     }
 
@@ -340,25 +382,115 @@ impl Context {
     }
 
     pub async fn archive(&self) -> anyhow::Result<()> {
-        let path = archive_path(&self.id);
+        self.archive_in(&archive_dir()).await
+    }
 
-        let serialized = serde_json::to_string(&self.to_persist_session())?;
-        fs::write(path, serialized).await?;
+    async fn archive_in(&self, dir: &Path) -> anyhow::Result<()> {
+        // Archiving is the one path that must not fail for want of a directory,
+        // and creating it is idempotent.
+        fs::create_dir_all(dir).await?;
+
+        // Histories first: metadata must never advertise a session whose
+        // conversation has not landed yet.
+        fs::write(
+            archive_path_in(dir, &self.id),
+            serde_json::to_vec(&self.to_persist_histories())?,
+        )
+        .await?;
+        fs::write(
+            meta_path_in(dir, &self.id),
+            serde_json::to_vec(&self.to_meta())?,
+        )
+        .await?;
+
         Ok(())
     }
 
     pub async fn resume(id: impl AsRef<str>) -> anyhow::Result<Self> {
-        let id = id.as_ref();
-        let path = archive_path(id);
+        Self::resume_in(&archive_dir(), id.as_ref()).await
+    }
 
-        let content = fs::read_to_string(path).await?;
-        let deserialized = serde_json::from_str::<PersistSession>(&content)?;
+    async fn resume_in(dir: &Path, id: &str) -> anyhow::Result<Self> {
+        let path = archive_path_in(dir, id);
+        let content = fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("no archived session {id} at {}", path.display()))?;
+        let deserialized = serde_json::from_str::<PersistHistories>(&content)?;
 
         Ok(Self {
             id: deserialized.id,
             buf: String::new(),
             histories: deserialized.histories,
         })
+    }
+}
+
+/// Every archived session, most recently modified first.
+pub async fn list_sessions() -> anyhow::Result<Vec<SessionMeta>> {
+    list_sessions_in(&archive_dir()).await
+}
+
+async fn list_sessions_in(dir: &Path) -> anyhow::Result<Vec<SessionMeta>> {
+    let mut read_dir = match fs::read_dir(dir).await {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::Error::from(e)),
+    };
+
+    let mut paths = Vec::new();
+
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+
+        if path.extension().and_then(|ext| ext.to_str()) == Some(META_EXTENSION) {
+            paths.push(path);
+        }
+    }
+
+    let total = paths.len();
+    let mut sessions = stream::iter(paths)
+        .map(read_meta)
+        .buffer_unordered(MAX_CONCURRENT_META_READS)
+        .filter_map(|meta| async move { meta })
+        .collect::<Vec<_>>()
+        .await;
+
+    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+
+    tracing::info!(
+        event = "context.sessions.listed",
+        session_count = sessions.len(),
+        skipped = total - sessions.len(),
+    );
+
+    Ok(sessions)
+}
+
+/// Reads one metadata file, reporting rather than propagating failure: a single
+/// unreadable entry should not hide every other session from the listing.
+async fn read_meta(path: PathBuf) -> Option<SessionMeta> {
+    let content = match fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(
+                event = "context.session_meta.unreadable",
+                path = %path.display(),
+                error = e.to_string(),
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&content) {
+        Ok(meta) => Some(meta),
+        Err(e) => {
+            tracing::warn!(
+                event = "context.session_meta.corrupt",
+                path = %path.display(),
+                error = e.to_string(),
+            );
+            None
+        }
     }
 }
 
@@ -379,13 +511,194 @@ mod tests {
 
     #[test]
     fn archive_path_stays_inside_the_archive_directory() {
-        let path = archive_path("0198e5c1-1234-7000-8000-000000000000");
+        let path = archive_path_in(&archive_dir(), "0198e5c1-1234-7000-8000-000000000000");
 
         assert_eq!(path.parent(), Some(archive_dir().as_path()));
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("0198e5c1-1234-7000-8000-000000000000.archive")
         );
+    }
+
+    #[test]
+    fn metadata_sits_beside_its_histories() {
+        let id = "0198e5c1-1234-7000-8000-000000000000";
+        let dir = archive_dir();
+
+        assert_eq!(
+            meta_path_in(&dir, id).parent(),
+            archive_path_in(&dir, id).parent()
+        );
+        assert_eq!(
+            meta_path_in(&dir, id)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("0198e5c1-1234-7000-8000-000000000000.meta")
+        );
+    }
+
+    struct TempArchive {
+        path: PathBuf,
+    }
+
+    impl TempArchive {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("h-archive-{}", Uuid::new_v4()));
+            std_fs::create_dir_all(&path).unwrap();
+
+            Self { path }
+        }
+
+        fn write_meta(&self, id: &str, last_modified: &str, title: &str) {
+            let meta = json!({
+                "id": id,
+                "last_modified": last_modified,
+                "title": title,
+            });
+
+            std_fs::write(meta_path_in(&self.path, id), meta.to_string()).unwrap();
+        }
+    }
+
+    impl Drop for TempArchive {
+        fn drop(&mut self) {
+            let _ = std_fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn context_with_prompt(id: &str, prompt: &str) -> Context {
+        Context {
+            id: id.to_owned(),
+            buf: String::new(),
+            histories: vec![Message::User(prompt.to_owned())],
+        }
+    }
+
+    #[tokio::test]
+    async fn archived_histories_survive_a_resume() {
+        let archive = TempArchive::new();
+        let context = context_with_prompt("session-1", "teach me borrow checking");
+
+        context.archive_in(&archive.path).await.unwrap();
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.id, "session-1");
+        assert!(
+            matches!(
+                resumed.histories.as_slice(),
+                [Message::User(prompt)] if prompt == "teach me borrow checking"
+            ),
+            "unexpected histories: {:?}",
+            resumed.histories.len()
+        );
+    }
+
+    #[test]
+    fn a_context_holding_only_system_messages_has_no_exchange() {
+        let context = Context {
+            id: "session-1".to_owned(),
+            buf: String::new(),
+            histories: vec![
+                Message::System("global prompts".to_owned()),
+                Message::System("workspace info".to_owned()),
+            ],
+        };
+
+        assert!(!context.has_exchange());
+    }
+
+    #[test]
+    fn one_user_message_is_enough_of_an_exchange_to_keep() {
+        let mut context = context_with_prompt("session-1", "teach me borrow checking");
+        context
+            .histories_mut()
+            .insert(0, Message::System("global prompts".to_owned()));
+
+        assert!(context.has_exchange());
+    }
+
+    #[tokio::test]
+    async fn archiving_creates_the_directory_it_writes_into() {
+        let archive = TempArchive::new();
+        let nested = archive.path.join("archive");
+        let context = context_with_prompt("session-1", "teach me borrow checking");
+
+        context.archive_in(&nested).await.unwrap();
+
+        let sessions = list_sessions_in(&nested).await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "session-1");
+    }
+
+    /// The whole point of splitting the files: a listing must not read histories.
+    #[tokio::test]
+    async fn listing_reads_titles_without_the_histories_file() {
+        let archive = TempArchive::new();
+        let context = context_with_prompt("session-1", "teach me borrow checking");
+
+        context.archive_in(&archive.path).await.unwrap();
+        std_fs::remove_file(archive_path_in(&archive.path, "session-1")).unwrap();
+
+        let sessions = list_sessions_in(&archive.path).await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "session-1");
+        assert_eq!(sessions[0].title, "teach me borrow checking");
+    }
+
+    #[tokio::test]
+    async fn listing_puts_the_most_recent_session_first() {
+        let archive = TempArchive::new();
+
+        archive.write_meta("older", "2026-07-20T10:00:00Z", "older session");
+        archive.write_meta("newest", "2026-07-26T10:00:00Z", "newest session");
+        archive.write_meta("middle", "2026-07-24T10:00:00Z", "middle session");
+
+        let ids = list_sessions_in(&archive.path)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["newest", "middle", "older"]);
+    }
+
+    #[tokio::test]
+    async fn listing_skips_a_corrupt_metadata_file() {
+        let archive = TempArchive::new();
+
+        archive.write_meta("intact", "2026-07-26T10:00:00Z", "intact session");
+        std_fs::write(meta_path_in(&archive.path, "truncated"), "{\"id\":").unwrap();
+
+        let sessions = list_sessions_in(&archive.path).await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "intact");
+    }
+
+    #[tokio::test]
+    async fn listing_ignores_files_that_are_not_metadata() {
+        let archive = TempArchive::new();
+
+        archive.write_meta("intact", "2026-07-26T10:00:00Z", "intact session");
+        std_fs::write(archive_path_in(&archive.path, "intact"), "{}").unwrap();
+        std_fs::write(archive.path.join("notes.txt"), "scratch").unwrap();
+
+        let sessions = list_sessions_in(&archive.path).await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "intact");
+    }
+
+    #[tokio::test]
+    async fn listing_an_absent_archive_directory_is_empty() {
+        let missing = std::env::temp_dir().join(format!("h-archive-{}", Uuid::new_v4()));
+
+        assert!(list_sessions_in(&missing).await.unwrap().is_empty());
     }
 
     struct TestRepo {
