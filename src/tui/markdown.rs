@@ -5,7 +5,10 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    tui::text::{verbatim, wrap},
+    tui::{
+        rainbow_spans,
+        text::{verbatim, wrap},
+    },
     ui::markdown::{Inline, MarkdownBlock, TableAlignment},
 };
 
@@ -15,7 +18,6 @@ const BOX_FRAME: usize = 4;
 const QUOTE_FRAME: usize = 2;
 
 const MUTED: Color = Color::DarkGray;
-const CODE: Color = Color::Green;
 
 /// Lays out parsed markdown as terminal lines of a given width.
 ///
@@ -325,9 +327,9 @@ fn append_spans(content: &[Inline], style: Style, result: &mut Vec<Span<'static>
     for inline in content {
         match inline {
             Inline::Text(text) => result.push(Span::styled(text.clone(), style)),
-            // A colour rather than an inverted block: a reversed run reads as a
-            // hole punched in the prose.
-            Inline::Code(code) => result.push(Span::styled(code.clone(), style.fg(CODE))),
+            // The same hue ramp the tool titles use, so code reads as something
+            // the machine said rather than as prose.
+            Inline::Code(code) => result.extend(rainbow_spans(code, style)),
             Inline::Emphasis(content) => {
                 append_spans(content, style.add_modifier(Modifier::ITALIC), result);
             }
@@ -526,19 +528,37 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_is_coloured_rather_than_inverted() {
+    fn inline_code_runs_through_the_hue_ramp() {
         let lines = render(&parse_markdown("run `cargo` now"), 40);
         let code = lines[0]
             .spans
             .iter()
-            .find(|span| span.content == "cargo")
+            .filter(|span| "cargo".contains(span.content.as_ref()) && span.content.len() == 1)
+            .collect::<Vec<_>>();
+
+        assert_eq!(code.len(), 5, "one fragment per character: {:?}", lines[0]);
+        assert!(code.iter().all(|span| span.style.fg.is_some()));
+        assert_ne!(
+            code.first().unwrap().style.fg,
+            code.last().unwrap().style.fg,
+            "the ramp should advance across the span"
+        );
+    }
+
+    #[test]
+    fn inline_code_keeps_the_weight_it_sits_in() {
+        let lines = render(&parse_markdown("**bold `code`**"), 40);
+        let code = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "c")
             .expect("the code span should survive");
 
-        assert_eq!(code.style.fg, Some(CODE));
         assert!(
-            !code.style.add_modifier.contains(Modifier::REVERSED),
-            "an inverted run reads as a hole punched in the prose"
+            code.style.add_modifier.contains(Modifier::BOLD),
+            "the ramp colours it without dropping the surrounding weight"
         );
+        assert!(code.style.fg.is_some());
     }
 
     #[test]

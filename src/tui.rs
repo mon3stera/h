@@ -33,22 +33,25 @@ const HUE_STEP: f32 = 6.0;
 /// The starting hue comes from the text itself, so a given string always gets
 /// the same colours and two different ones rarely collide.
 pub fn rainbow(content: &str) -> Line<'static> {
+    Line::from(rainbow_spans(content, Style::default()))
+}
+
+/// The same ramp as [`rainbow`], as fragments that can sit inside a longer line.
+///
+/// `base` keeps whatever the surrounding text had — weight, italics — while the
+/// colour of each character comes from the ramp.
+pub fn rainbow_spans(content: &str, base: Style) -> Vec<Span<'static>> {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
     let start_hue = (hasher.finish() % 360) as f32;
 
-    Line::from(
-        content
-            .chars()
-            .enumerate()
-            .map(|(index, character)| {
-                Span::styled(
-                    character.to_string(),
-                    Style::default().fg(hue_at(index, start_hue)),
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
+    content
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            Span::styled(character.to_string(), base.fg(hue_at(index, start_hue)))
+        })
+        .collect()
 }
 
 fn hue_at(index: usize, start_hue: f32) -> Color {
