@@ -31,6 +31,71 @@ pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
     wrapped.finish()
 }
 
+/// Lays text out without reflowing it: every newline breaks, every space is
+/// kept, and a line is cut only where it runs past the edge.
+///
+/// Code needs this rather than [`wrap`]: indentation carries meaning there, so
+/// the leading blanks that prose wrapping drops have to survive.
+pub fn verbatim(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+
+    let mut flush = |current: &mut Vec<Span<'static>>, used: &mut usize| {
+        lines.push(Line::from(std::mem::take(current)));
+        *used = 0;
+    };
+
+    for span in spans {
+        for (index, segment) in span.content.split('\n').enumerate() {
+            if index > 0 {
+                flush(&mut current, &mut used);
+            }
+
+            let mut rest = segment;
+
+            while !rest.is_empty() {
+                if used >= width {
+                    flush(&mut current, &mut used);
+                }
+
+                let (fits, tail) = split_at_width(rest, width - used);
+
+                used += fits.width();
+                current.push(Span::styled(fits.to_owned(), span.style));
+                rest = tail;
+            }
+        }
+    }
+
+    // A trailing newline closes the last line rather than opening a blank one,
+    // the way `str::lines` reads it.
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(Line::from(current));
+    }
+
+    lines
+}
+
+/// Splits at the last character boundary that still fits `room` columns.
+fn split_at_width(text: &str, room: usize) -> (&str, &str) {
+    let mut used = 0;
+
+    for (offset, character) in text.char_indices() {
+        let character_width = character.to_string().width();
+
+        if used + character_width > room {
+            return text.split_at(offset);
+        }
+
+        used += character_width;
+    }
+
+    (text, "")
+}
+
 /// Splits a run of text into words and the whitespace between them, keeping
 /// both so a break can be taken at a gap and the gap then dropped.
 fn tokenize(segment: &str) -> Vec<&str> {
@@ -181,6 +246,59 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn verbatim_keeps_leading_indentation() {
+        assert_eq!(
+            texts(&verbatim(&[plain("fn main() {\n    let x = 1;\n}")], 40)),
+            ["fn main() {", "    let x = 1;", "}"],
+            "indentation is part of the code"
+        );
+    }
+
+    #[test]
+    fn verbatim_does_not_reflow_at_spaces() {
+        assert_eq!(
+            texts(&verbatim(&[plain("alpha beta gamma")], 12)),
+            ["alpha beta g", "amma"],
+            "a cut at the edge, not a break at the space"
+        );
+    }
+
+    #[test]
+    fn verbatim_treats_a_trailing_newline_as_a_terminator() {
+        assert_eq!(texts(&verbatim(&[plain("one\ntwo\n")], 40)), ["one", "two"]);
+    }
+
+    #[test]
+    fn verbatim_keeps_interior_blank_lines() {
+        assert_eq!(
+            texts(&verbatim(&[plain("one\n\ntwo")], 40)),
+            ["one", "", "two"]
+        );
+    }
+
+    #[test]
+    fn verbatim_measures_double_width_characters() {
+        assert_eq!(texts(&verbatim(&[plain("中文测试")], 4)), ["中文", "测试"]);
+    }
+
+    #[test]
+    fn verbatim_carries_the_style_across_a_cut() {
+        let spans = vec![Span::styled(
+            "abcdef".to_owned(),
+            Style::default().fg(Color::Green),
+        )];
+
+        let lines = verbatim(&spans, 3);
+
+        assert_eq!(texts(&lines), ["abc", "def"]);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.spans[0].style.fg == Some(Color::Green))
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    tui::text::wrap,
+    tui::text::{verbatim, wrap},
     ui::markdown::{Inline, MarkdownBlock, TableAlignment},
 };
 
@@ -15,6 +15,7 @@ const BOX_FRAME: usize = 4;
 const QUOTE_FRAME: usize = 2;
 
 const MUTED: Color = Color::DarkGray;
+const CODE: Color = Color::Green;
 
 /// Lays out parsed markdown as terminal lines of a given width.
 ///
@@ -90,8 +91,8 @@ fn render_code_block(
         )));
     }
 
-    // Code is shown verbatim; only its own newlines break it.
-    body.extend(wrap(&[Span::raw(plain_text(code))], inner));
+    // Indentation is part of the code, so this must not reflow.
+    body.extend(verbatim(&[Span::raw(plain_text(code))], inner));
 
     framed(body, inner, border)
 }
@@ -324,10 +325,9 @@ fn append_spans(content: &[Inline], style: Style, result: &mut Vec<Span<'static>
     for inline in content {
         match inline {
             Inline::Text(text) => result.push(Span::styled(text.clone(), style)),
-            Inline::Code(code) => result.push(Span::styled(
-                code.clone(),
-                style.add_modifier(Modifier::REVERSED),
-            )),
+            // A colour rather than an inverted block: a reversed run reads as a
+            // hole punched in the prose.
+            Inline::Code(code) => result.push(Span::styled(code.clone(), style.fg(CODE))),
             Inline::Emphasis(content) => {
                 append_spans(content, style.add_modifier(Modifier::ITALIC), result);
             }
@@ -411,6 +411,21 @@ mod tests {
     #[test]
     fn a_heading_keeps_its_hashes() {
         assert_eq!(render_text("## Title", 20), ["## Title"]);
+    }
+
+    #[test]
+    fn a_code_block_keeps_its_indentation() {
+        assert_eq!(
+            render_text("```rust\nfn main() {\n    let x = 1;\n}\n```", 30),
+            [
+                "╭────────────────────────────╮",
+                "│ rust                       │",
+                "│ fn main() {                │",
+                "│     let x = 1;             │",
+                "│ }                          │",
+                "╰────────────────────────────╯",
+            ]
+        );
     }
 
     #[test]
@@ -499,7 +514,7 @@ mod tests {
 
     #[test]
     fn inline_styles_reach_the_spans() {
-        let lines = render(&parse_markdown("*italic* **bold** `code`"), 40);
+        let lines = render(&parse_markdown("*italic* **bold**"), 40);
         let styles = lines[0]
             .spans
             .iter()
@@ -508,10 +523,21 @@ mod tests {
 
         assert!(styles.iter().any(|style| style.contains(Modifier::ITALIC)));
         assert!(styles.iter().any(|style| style.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn inline_code_is_coloured_rather_than_inverted() {
+        let lines = render(&parse_markdown("run `cargo` now"), 40);
+        let code = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "cargo")
+            .expect("the code span should survive");
+
+        assert_eq!(code.style.fg, Some(CODE));
         assert!(
-            styles
-                .iter()
-                .any(|style| style.contains(Modifier::REVERSED))
+            !code.style.add_modifier.contains(Modifier::REVERSED),
+            "an inverted run reads as a hole punched in the prose"
         );
     }
 
