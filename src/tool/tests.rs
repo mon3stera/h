@@ -1029,3 +1029,446 @@ fn truncates_long_multiline_unicode_output_safely() {
     assert!(*truncated_lines > 0);
     assert!(content.is_char_boundary(content.len()));
 }
+
+fn edit_call(source: &str, target: &str) -> ToolCall {
+    call(
+        "edit",
+        json!({"path": "src/main.rs", "source": source, "target": target}),
+    )
+}
+
+fn applied_result(
+    call: &ToolCall,
+    start_line: usize,
+    before: &[&str],
+    after: &[&str],
+) -> ToolCallResult {
+    ToolCallResult {
+        id: call.id.clone(),
+        outcome: ToolCallOutcome::Success(json!({
+            "status": {"Ok": {
+                "start_line": start_line,
+                "context_before": before,
+                "context_after": after,
+            }},
+            "applied": true,
+        })),
+    }
+}
+
+fn diff_of(presentation: &Presentation) -> Vec<DiffLine> {
+    let DisplayBlock::Diff { lines } = &presentation.blocks[1] else {
+        panic!("expected a diff block");
+    };
+
+    lines.clone()
+}
+
+/// `<number> <sign><text>`, the way the view lays a diff line out.
+fn rendered(lines: &[DiffLine]) -> Vec<String> {
+    let width = lines
+        .iter()
+        .map(|line| line.number)
+        .max()
+        .unwrap_or(0)
+        .to_string()
+        .len();
+
+    lines
+        .iter()
+        .map(|line| {
+            let sign = match line.kind {
+                DiffLineKind::Removed => '-',
+                DiffLineKind::Added => '+',
+                DiffLineKind::Context => ' ',
+            };
+
+            format!("{:>width$} {sign}{}", line.number, line.text)
+        })
+        .collect()
+}
+
+#[test]
+fn edit_presenter_tags_removed_added_and_context_lines() {
+    let call = edit_call("old\n", "new\n");
+    let presentation = EditPresenter.completed(&call, &applied_result(&call, 10, &[], &[]));
+
+    assert_eq!(presentation.name, "Edit");
+    assert_eq!(presentation.target.as_deref(), Some("src/main.rs"));
+    assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+
+    let lines = diff_of(&presentation);
+
+    assert_eq!(lines[0].kind, DiffLineKind::Removed);
+    assert_eq!(lines[1].kind, DiffLineKind::Added);
+    assert_eq!(rendered(&lines), ["10 -old", "10 +new"]);
+}
+
+/// A context line that begins with a sign must stay context; this is why the kind
+/// travels with the line instead of being read back out of the text.
+#[test]
+fn edit_presenter_keeps_a_dashed_context_line_as_context() {
+    let call = edit_call("old\n", "new\n");
+    let presentation = EditPresenter.completed(&call, &applied_result(&call, 2, &["---"], &[]));
+
+    let lines = diff_of(&presentation);
+
+    assert_eq!(lines[0].kind, DiffLineKind::Context);
+    assert_eq!(lines[0].text, "---");
+}
+
+#[test]
+fn edit_presenter_frames_the_change_with_file_line_numbers() {
+    let call = edit_call("ten\neleven\n", "TEN\nELEVEN\n");
+    let presentation = EditPresenter.completed(
+        &call,
+        &applied_result(
+            &call,
+            10,
+            &["seven", "eight", "nine"],
+            &["twelve", "thirteen", "fourteen"],
+        ),
+    );
+
+    assert_eq!(
+        rendered(&diff_of(&presentation)),
+        [
+            " 7  seven",
+            " 8  eight",
+            " 9  nine",
+            "10 -ten",
+            "11 -eleven",
+            "10 +TEN",
+            "11 +ELEVEN",
+            "12  twelve",
+            "13  thirteen",
+            "14  fourteen",
+        ]
+    );
+}
+
+/// Adding lines pushes the trailing context down, so it is numbered on the
+/// post-edit side.
+#[test]
+fn edit_presenter_numbers_trailing_context_after_the_new_block() {
+    let call = edit_call("ten\n", "ten\nextra\n");
+    let presentation = EditPresenter.completed(&call, &applied_result(&call, 10, &[], &["eleven"]));
+
+    let lines = diff_of(&presentation);
+    let last = lines.last().unwrap();
+
+    assert_eq!(last.kind, DiffLineKind::Context);
+    assert_eq!(last.text, "eleven");
+    assert_eq!(last.number, 12, "one line was inserted above it");
+}
+
+#[test]
+fn edit_presenter_summarizes_only_changed_lines() {
+    let call = edit_call("keep\na\nb\n", "keep\nc\n");
+    let presentation = EditPresenter.completed(&call, &applied_result(&call, 1, &[], &[]));
+
+    let DisplayBlock::Summary(summary) = &presentation.blocks[0] else {
+        panic!("expected a summary");
+    };
+
+    assert_eq!(summary, "-2 +1 lines", "context lines are not counted");
+}
+
+#[test]
+fn edit_presenter_keeps_every_line_of_a_large_diff() {
+    let source = (0..500)
+        .map(|index| format!("old {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let target = (0..500)
+        .map(|index| format!("new {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let call = edit_call(&source, &target);
+    let presentation = EditPresenter.completed(&call, &applied_result(&call, 1, &[], &[]));
+
+    let lines = diff_of(&presentation);
+
+    assert_eq!(lines.len(), 1000, "500 removed plus 500 added");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Removed)
+            .count(),
+        500
+    );
+}
+
+#[test]
+fn edit_presenter_reports_an_unapplied_edit_as_a_failure() {
+    let call = edit_call("missing\n", "replacement\n");
+    let result = ToolCallResult {
+        id: call.id.clone(),
+        outcome: ToolCallOutcome::Success(json!({
+            "status": {"NoCandidate": {"message": "There is no candidate"}},
+            "applied": false,
+        })),
+    };
+
+    let presentation = EditPresenter.completed(&call, &result);
+
+    assert!(
+        matches!(
+            &presentation.status,
+            ToolCallStatus::Failed { message } if message == "There is no candidate"
+        ),
+        "a rejected edit must not read as a success: {:?}",
+        presentation.status
+    );
+    assert_eq!(
+        presentation.blocks.len(),
+        1,
+        "no diff for an edit that never happened"
+    );
+}
+
+#[test]
+fn edit_presenter_counts_the_candidates_of_an_ambiguous_edit() {
+    let call = edit_call("dup\n", "unique\n");
+    let result = ToolCallResult {
+        id: call.id.clone(),
+        outcome: ToolCallOutcome::Success(json!({
+            "status": {"MultipleExactMatches": {"candidates": [
+                {"start_line": 1, "end_line": 2},
+                {"start_line": 9, "end_line": 10},
+            ]}},
+            "applied": false,
+        })),
+    };
+
+    let presentation = EditPresenter.completed(&call, &result);
+
+    assert!(
+        matches!(
+            &presentation.status,
+            ToolCallStatus::Failed { message }
+                if message == "Source matches 2 places exactly (lines 1, 9); make it unique"
+        ),
+        "{:?}",
+        presentation.status
+    );
+}
+
+#[test]
+fn edit_presenter_names_a_missing_file() {
+    let call = edit_call("a\n", "b\n");
+    let result = ToolCallResult {
+        id: call.id.clone(),
+        outcome: ToolCallOutcome::Success(json!({"status": "FileNotFound", "applied": false})),
+    };
+
+    let presentation = EditPresenter.completed(&call, &result);
+
+    assert!(matches!(
+        &presentation.status,
+        ToolCallStatus::Failed { message } if message == "File not found"
+    ));
+}
+
+#[test]
+fn context_stops_at_the_edges_of_the_file() {
+    let content = "one\ntwo\nthree\n";
+
+    let (before, after) = super::edit::surrounding_context(content, 1, 1);
+    assert!(before.is_empty(), "nothing precedes the first line");
+    assert_eq!(after, ["two", "three"]);
+
+    let (before, after) = super::edit::surrounding_context(content, 3, 1);
+    assert_eq!(before, ["one", "two"]);
+    assert!(after.is_empty(), "nothing follows the last line");
+}
+
+#[test]
+fn context_is_capped_at_three_lines_on_each_side() {
+    let content = (1..=20)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let (before, after) = super::edit::surrounding_context(&content, 10, 2);
+
+    assert_eq!(before, ["line 7", "line 8", "line 9"]);
+    assert_eq!(after, ["line 12", "line 13", "line 14"]);
+}
+
+/// Closes the contract between the tool and its presenter: the other presenter
+/// tests hand-write the output JSON, so only this one proves the presenter reads
+/// the shape the tool actually emits.
+#[tokio::test]
+async fn edit_tool_output_feeds_its_presenter_end_to_end() {
+    let path = temporary_file("edit-end-to-end");
+    let content = (1..=14)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{content}\n")).await.unwrap();
+
+    let output = TypedTool::call(
+        &EditTool,
+        EditToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            source: "line 10\nline 11\n".to_owned(),
+            target: "TEN\nELEVEN\n".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let call = call(
+        "edit",
+        json!({
+            "path": path.to_string_lossy(),
+            "source": "line 10\nline 11\n",
+            "target": "TEN\nELEVEN\n",
+        }),
+    );
+    let result = ToolCallResult::success(call.id.clone(), serde_json::to_value(&output).unwrap());
+    let presentation = EditPresenter.completed(&call, &result);
+
+    assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+    assert_eq!(
+        rendered(&diff_of(&presentation)),
+        [
+            " 7  line 7",
+            " 8  line 8",
+            " 9  line 9",
+            "10 -line 10",
+            "11 -line 11",
+            "10 +TEN",
+            "11 +ELEVEN",
+            "12  line 12",
+            "13  line 13",
+            "14  line 14",
+        ]
+    );
+
+    fs::remove_file(path).await.unwrap();
+}
+
+#[test]
+fn exact_matches_report_every_occurrence_with_its_line_range() {
+    let content = "a\nDUP\nb\nc\nDUP\nd\n";
+
+    let matches = super::edit::exact_matches(content, "DUP\n")
+        .iter()
+        .map(|hit| (hit.start_line(), hit.end_line()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(matches, [(2, 2), (5, 5)]);
+}
+
+#[test]
+fn exact_matches_span_the_lines_of_a_multiline_source() {
+    let content = "one\ntwo\nthree\nfour\n";
+
+    let matches = super::edit::exact_matches(content, "two\nthree\n")
+        .iter()
+        .map(|hit| (hit.start_line(), hit.end_line()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(matches, [(2, 3)]);
+}
+
+#[test]
+fn an_empty_source_matches_nothing() {
+    assert!(super::edit::exact_matches("anything\n", "").is_empty());
+}
+
+#[tokio::test]
+async fn edit_refuses_an_ambiguous_source_and_leaves_the_file_alone() {
+    let path = temporary_file("edit-ambiguous");
+    let content = "a\nDUP\nb\nc\nDUP\nd\n";
+    fs::write(&path, content).await.unwrap();
+
+    let output = TypedTool::call(
+        &EditTool,
+        EditToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            source: "DUP\n".to_owned(),
+            target: "CHANGED\n".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let serialized = serde_json::to_value(&output).unwrap();
+
+    assert_eq!(serialized["applied"], json!(false));
+    assert_eq!(
+        serialized["status"]["MultipleExactMatches"]["candidates"],
+        json!([
+            {"start_line": 2, "end_line": 2},
+            {"start_line": 5, "end_line": 5},
+        ]),
+        "the caller needs the line numbers to widen its source"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).await.unwrap(),
+        content,
+        "an ambiguous edit must not touch the file"
+    );
+
+    fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn edit_replaces_only_the_range_that_matched() {
+    let path = temporary_file("edit-single");
+    fs::write(&path, "keep\nONCE\nkeep\n").await.unwrap();
+
+    let output = TypedTool::call(
+        &EditTool,
+        EditToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            source: "ONCE\n".to_owned(),
+            target: "TWICE\n".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&output).unwrap()["applied"],
+        json!(true)
+    );
+    assert_eq!(
+        fs::read_to_string(&path).await.unwrap(),
+        "keep\nTWICE\nkeep\n"
+    );
+
+    fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn edit_refuses_an_empty_source_rather_than_shredding_the_file() {
+    let path = temporary_file("edit-empty-source");
+    let content = "one\ntwo\n";
+    fs::write(&path, content).await.unwrap();
+
+    let output = TypedTool::call(
+        &EditTool,
+        EditToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            source: String::new(),
+            target: "INJECTED".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let serialized = serde_json::to_value(&output).unwrap();
+
+    assert_eq!(serialized["applied"], json!(false));
+    assert_eq!(
+        serialized["status"]["InvalidRange"]["message"],
+        json!("source must not be empty")
+    );
+    assert_eq!(fs::read_to_string(&path).await.unwrap(), content);
+
+    fs::remove_file(path).await.unwrap();
+}

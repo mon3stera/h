@@ -113,7 +113,7 @@ where
             )
             .register_with_presenter(FetchTool::new()?, crate::tool::FetchPresenter)
             .register_with_presenter(GrepTool, crate::tool::GrepPresenter)
-            .register(EditTool)
+            .register_with_presenter(EditTool, crate::tool::EditPresenter)
             .register_with_presenter(BashTool::new(), crate::tool::BashPresenter);
 
         Ok(self)

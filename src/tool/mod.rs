@@ -17,12 +17,13 @@ mod write;
 
 pub use ask::AskTool;
 pub use bash::{BashPresenter, BashTool};
-pub use edit::EditTool;
+pub use edit::{EditPresenter, EditTool};
 pub use fetch::{FetchPresenter, FetchTool};
 pub use file_buffer::FileBufferStore;
 pub use grep::{GrepPresenter, GrepTool};
 pub use presentation::{
-    DefaultPresenter, DisplayBlock, KeyValueEntry, Presentation, Presenter, ToolCallStatus,
+    DefaultPresenter, DiffLine, DiffLineKind, DisplayBlock, KeyValueEntry, Presentation, Presenter,
+    ToolCallStatus,
 };
 pub use read::{ReadFilePresenter, ReadFileTool};
 pub use registry::ToolRegistry;
@@ -30,6 +31,8 @@ pub use write::{WriteFilePresenter, WriteFileTool};
 
 #[cfg(test)]
 pub use bash::{BashToolArgs, BashToolOutput};
+#[cfg(test)]
+pub use edit::EditToolArgs;
 #[cfg(test)]
 pub use read::ReadFileToolArgs;
 #[cfg(test)]

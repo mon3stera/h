@@ -16,11 +16,11 @@ use tokio::{
 
 use crate::{
     event::{AgentViewEvent, UiRequest},
-    tool::{DisplayBlock, Presentation, ToolCallStatus},
+    tool::{DiffLine, DiffLineKind, DisplayBlock, Presentation, ToolCallId, ToolCallStatus},
     ui::{
         banner::render_banner,
         markdown::{MarkdownBlock, parse_markdown},
-        markdown_view::{render_markdown, render_rule},
+        markdown_view::render_markdown,
     },
 };
 
@@ -377,6 +377,52 @@ fn format_code_lines(
         .collect()
 }
 
+/// Diff row washes, dark enough that the default foreground stays legible on top
+/// of them. A saturated fill reads as a block of colour rather than as code.
+const REMOVED_WASH: Color = Color::Rgb {
+    r: 0x4a,
+    g: 0x1e,
+    b: 0x24,
+};
+const ADDED_WASH: Color = Color::Rgb {
+    r: 0x1c,
+    g: 0x3d,
+    b: 0x28,
+};
+
+/// Lays out one diff line as `<number> <sign><text>` and gives back the
+/// background to wash the row in: red for a removal, green for an addition,
+/// nothing for context.
+///
+/// The colour is a background rather than a foreground because the row is painted
+/// edge to edge; tinting the glyphs the same hue would leave them unreadable
+/// against it.
+///
+/// `width` is shared by every line of a diff so the numbers, and the code after
+/// them, stay in a column.
+fn format_diff_line(line: &DiffLine, width: usize) -> (String, Option<Color>) {
+    let (sign, background) = match line.kind {
+        DiffLineKind::Removed => ('-', Some(REMOVED_WASH)),
+        DiffLineKind::Added => ('+', Some(ADDED_WASH)),
+        DiffLineKind::Context => (' ', None),
+    };
+
+    (
+        format!("     {:>width$} {sign}{}", line.number, line.text),
+        background,
+    )
+}
+
+fn diff_number_width(lines: &[DiffLine]) -> usize {
+    lines
+        .iter()
+        .map(|line| line.number)
+        .max()
+        .unwrap_or(0)
+        .to_string()
+        .len()
+}
+
 fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
     let indicator = match &presentation.status {
         ToolCallStatus::Running => "⟳ ",
@@ -428,6 +474,23 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
                     .map(|content| element! { Text(content: content) }.into_any()),
                 );
             }
+            DisplayBlock::Diff { lines } => {
+                let width = diff_number_width(lines);
+
+                blocks.extend(lines.iter().map(|line| {
+                    let (content, background) = format_diff_line(line, width);
+
+                    // The wrapper is what carries the colour: `Text` has no
+                    // background, and only a full-width box washes the whole row
+                    // rather than just the glyphs.
+                    element! {
+                        View(width: 100pct, background_color: background) {
+                            Text(content: content)
+                        }
+                    }
+                    .into_any()
+                }));
+            }
             DisplayBlock::KeyValue { entries } => blocks.extend(
                 entries
                     .iter()
@@ -450,6 +513,137 @@ fn render_tool<'a>(presentation: &Presentation) -> AnyElement<'a> {
     .into_any()
 }
 
+/// Tools whose whole effect is to look at something. A run of them collapses into
+/// one Explore block: a reader usually cares that exploring happened, not about
+/// each file it touched.
+const EXPLORATORY_TOOLS: [&str; 3] = ["ReadFile", "Grep", "Fetch"];
+
+/// Up to this many distinct targets are named; beyond it the group reports a
+/// count, so a long run of reads stays as compact as a short one.
+const NAMED_TARGET_LIMIT: usize = 3;
+
+/// What a tool counts when there are too many targets to name.
+fn counted_noun(tool: &str, count: usize) -> String {
+    let noun = match tool {
+        "ReadFile" => "file",
+        "Grep" => "path",
+        "Fetch" => "url",
+        _ => "call",
+    };
+
+    match count {
+        1 => format!("1 {noun}"),
+        _ => format!("{count} {noun}s"),
+    }
+}
+
+/// Only finished exploration collapses. A running tool keeps its own row so its
+/// spinner stays visible, and a failed one keeps its own row so the failure is
+/// not buried inside a count.
+fn is_collapsible_exploration(presentation: &Presentation) -> bool {
+    matches!(presentation.status, ToolCallStatus::Succeeded)
+        && EXPLORATORY_TOOLS.contains(&presentation.name.as_str())
+}
+
+/// Folds a run of exploratory presentations into one synthetic presentation, so
+/// the ordinary tool rendering draws it — title, glyphs and all.
+fn explore_presentation(run: &[&Presentation]) -> Presentation {
+    let mut tools: Vec<(&str, Vec<&str>)> = Vec::new();
+
+    for presentation in run {
+        let targets = match tools
+            .iter_mut()
+            .find(|(name, _)| *name == presentation.name.as_str())
+        {
+            Some((_, targets)) => targets,
+            None => {
+                tools.push((presentation.name.as_str(), Vec::new()));
+                &mut tools.last_mut().expect("just pushed").1
+            }
+        };
+
+        // The same file read twice is one file, not two.
+        if let Some(target) = presentation.target.as_deref() {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+
+    let blocks = tools
+        .into_iter()
+        .map(|(name, targets)| {
+            let detail = if targets.is_empty() {
+                counted_noun(name, 0)
+            } else if targets.len() <= NAMED_TARGET_LIMIT {
+                targets.join(", ")
+            } else {
+                counted_noun(name, targets.len())
+            };
+
+            DisplayBlock::Summary(format!("{name} {detail}"))
+        })
+        .collect();
+
+    Presentation {
+        call_id: run
+            .first()
+            .map(|presentation| presentation.call_id.clone())
+            .unwrap_or_else(|| ToolCallId(String::new())),
+        name: "Explore".to_owned(),
+        label: "aggregator".to_owned(),
+        target: Some(counted_noun("", run.len())),
+        status: ToolCallStatus::Succeeded,
+        blocks,
+    }
+}
+
+/// A unit as it will be drawn: on its own, as a single tool, or as a run of
+/// exploration folded together.
+enum RenderGroup<'a> {
+    Unit(&'a RenderUnit),
+    Tool(&'a Presentation),
+    Explore(Vec<&'a Presentation>),
+}
+
+/// Collapses each run of two or more finished exploratory tools. A lone read is
+/// left alone — naming the one file it touched says more than "1 file" would.
+fn group_units(units: &[RenderUnit]) -> Vec<RenderGroup<'_>> {
+    let mut groups: Vec<RenderGroup<'_>> = Vec::new();
+
+    for unit in units {
+        // Each tool round ends with one, so reads arrive with separators between
+        // them. Nothing draws them, so nothing should be split by them either.
+        if matches!(unit, RenderUnit::Separator) {
+            continue;
+        }
+
+        let exploring = match unit {
+            RenderUnit::Tool(presentation) if is_collapsible_exploration(presentation) => {
+                Some(presentation)
+            }
+            _ => None,
+        };
+
+        match (exploring, groups.last_mut()) {
+            (Some(presentation), Some(RenderGroup::Explore(run))) => run.push(presentation),
+            (Some(presentation), _) => groups.push(RenderGroup::Explore(vec![presentation])),
+            (None, _) => groups.push(RenderGroup::Unit(unit)),
+        }
+    }
+
+    // A run of one was never a run; give the tool its own detailed row back.
+    for group in &mut groups {
+        if let RenderGroup::Explore(run) = group {
+            if let [only] = run.as_slice() {
+                *group = RenderGroup::Tool(only);
+            }
+        }
+    }
+
+    groups
+}
+
 #[component]
 fn DisplayArea<'a>(props: &DisplayAreaProp) -> impl Into<AnyElement<'a>> {
     let banner = props.startup.as_ref().map(|startup| {
@@ -463,15 +657,26 @@ fn DisplayArea<'a>(props: &DisplayAreaProp) -> impl Into<AnyElement<'a>> {
     element! {
         View(width: 100pct, flex_direction: FlexDirection::Column, row_gap: 1) {
             #(banner)
-            #(props.units.iter().map(|unit| {
-                match unit {
+            #(group_units(&props.units).into_iter().filter_map(|group| {
+                let unit = match group {
+                    RenderGroup::Tool(presentation) => return Some(render_tool(presentation)),
+                    RenderGroup::Explore(run) => {
+                        return Some(render_tool(&explore_presentation(&run)));
+                    }
+                    RenderGroup::Unit(unit) => unit,
+                };
+
+                Some(match unit {
                     RenderUnit::Text(text) => render_markdown(&parse_markdown(text)),
                     RenderUnit::Prompt(text) => element! { RainbowText(content: format!("❯ {}", text), italic: true) }.into_any(),
                     RenderUnit::ParsedMarkdown(blocks) => render_markdown(blocks),
-                    RenderUnit::Separator => render_rule(),
+                    // `group_units` already drops these; the arm keeps the match
+                    // exhaustive. Separators stay in the unit list only to mark
+                    // where a response begins for `finalize_response_markdown`.
+                    RenderUnit::Separator => return None,
                     RenderUnit::Tool(presentation) => render_tool(presentation),
                     RenderUnit::Err(err) => element! { Text(content: format!("✖ {err}"), color: Some(Color::Red)) }.into_any(),
-                }
+                })
             }))
         }
     }
@@ -605,6 +810,325 @@ mod view_event_tests {
         bridge::UiBridge,
         tool::{ToolCallId, ToolCallStatus},
     };
+
+    fn explored(name: &str, target: &str) -> RenderUnit {
+        tool_unit(name, target, ToolCallStatus::Succeeded)
+    }
+
+    fn tool_unit(name: &str, target: &str, status: ToolCallStatus) -> RenderUnit {
+        RenderUnit::Tool(Presentation {
+            call_id: ToolCallId(format!("{name}-{target}")),
+            name: name.to_owned(),
+            label: "built-in".to_owned(),
+            target: Some(target.to_owned()),
+            status,
+            blocks: Vec::new(),
+        })
+    }
+
+    /// The `└ ` summary lines an Explore group would draw, and its title target.
+    fn explore_of(units: &[RenderUnit]) -> (String, Vec<String>) {
+        let groups = group_units(units);
+
+        let [RenderGroup::Explore(run)] = groups.as_slice() else {
+            panic!(
+                "expected exactly one Explore group, got {} groups",
+                groups.len()
+            );
+        };
+
+        let folded = explore_presentation(run);
+        let summaries = folded
+            .blocks
+            .iter()
+            .map(|block| match block {
+                DisplayBlock::Summary(summary) => summary.clone(),
+                other => panic!("expected summaries, got {other:?}"),
+            })
+            .collect();
+
+        (folded.target.clone().unwrap_or_default(), summaries)
+    }
+
+    /// Reproduces the live sequence: each tool round ends with `Completed`, so
+    /// two reads arrive with a separator between them.
+    #[test]
+    fn a_run_of_reads_folds_across_the_separators_between_rounds() {
+        let mut state = ViewState::default();
+
+        for (index, target) in ["a.rs", "b.rs", "c.rs"].into_iter().enumerate() {
+            let RenderUnit::Tool(mut presentation) = explored("ReadFile", target) else {
+                unreachable!("explored builds a tool unit")
+            };
+            presentation.call_id = ToolCallId(format!("call-{index}"));
+
+            reduce_view_event(&mut state, AgentViewEvent::Tool(presentation)).unwrap();
+            reduce_view_event(&mut state, AgentViewEvent::Completed).unwrap();
+        }
+
+        let groups = group_units(&state.units);
+
+        assert!(
+            matches!(groups.as_slice(), [RenderGroup::Explore(run)] if run.len() == 3),
+            "separators are not drawn, so they must not break a run either: {} groups",
+            groups.len()
+        );
+    }
+
+    #[test]
+    fn a_run_of_reads_folds_into_one_explore_group() {
+        let (target, summaries) = explore_of(&[
+            explored("ReadFile", "src/agent.rs"),
+            explored("ReadFile", "src/ui.rs"),
+            explored("Grep", "src/"),
+        ]);
+
+        assert_eq!(target, "3 calls");
+        assert_eq!(
+            summaries,
+            ["ReadFile src/agent.rs, src/ui.rs", "Grep src/"],
+            "each tool gets a line, in the order it first appeared"
+        );
+    }
+
+    #[test]
+    fn many_targets_are_counted_instead_of_named() {
+        let (_, summaries) = explore_of(&[
+            explored("ReadFile", "a.rs"),
+            explored("ReadFile", "b.rs"),
+            explored("ReadFile", "c.rs"),
+            explored("ReadFile", "d.rs"),
+        ]);
+
+        assert_eq!(summaries, ["ReadFile 4 files"], "over the naming limit");
+    }
+
+    #[test]
+    fn the_naming_limit_is_inclusive() {
+        let (_, summaries) = explore_of(&[
+            explored("ReadFile", "a.rs"),
+            explored("ReadFile", "b.rs"),
+            explored("ReadFile", "c.rs"),
+        ]);
+
+        assert_eq!(summaries, ["ReadFile a.rs, b.rs, c.rs"]);
+    }
+
+    #[test]
+    fn each_tool_counts_in_its_own_terms() {
+        let (_, summaries) = explore_of(&[
+            explored("Grep", "a"),
+            explored("Grep", "b"),
+            explored("Grep", "c"),
+            explored("Grep", "d"),
+            explored("Fetch", "http://1"),
+            explored("Fetch", "http://2"),
+            explored("Fetch", "http://3"),
+            explored("Fetch", "http://4"),
+        ]);
+
+        assert_eq!(summaries, ["Grep 4 paths", "Fetch 4 urls"]);
+    }
+
+    #[test]
+    fn the_same_file_read_twice_counts_once() {
+        let (target, summaries) = explore_of(&[
+            explored("ReadFile", "same.rs"),
+            explored("ReadFile", "same.rs"),
+        ]);
+
+        assert_eq!(target, "2 calls", "the calls really did happen");
+        assert_eq!(summaries, ["ReadFile same.rs"], "but it is one file");
+    }
+
+    #[test]
+    fn a_lone_read_keeps_its_own_row() {
+        let units = [explored("ReadFile", "src/agent.rs")];
+        let groups = group_units(&units);
+
+        assert!(
+            matches!(groups.as_slice(), [RenderGroup::Tool(_)]),
+            "naming the one file says more than \"1 file\" would"
+        );
+    }
+
+    #[test]
+    fn a_writing_tool_breaks_a_run_in_two() {
+        let units = [
+            explored("ReadFile", "a.rs"),
+            explored("ReadFile", "b.rs"),
+            tool_unit("Edit", "a.rs", ToolCallStatus::Succeeded),
+            explored("ReadFile", "c.rs"),
+            explored("ReadFile", "d.rs"),
+        ];
+        let groups = group_units(&units);
+
+        assert!(
+            matches!(
+                groups.as_slice(),
+                [
+                    RenderGroup::Explore(first),
+                    RenderGroup::Unit(_),
+                    RenderGroup::Explore(second),
+                ] if first.len() == 2 && second.len() == 2
+            ),
+            "an edit is not exploration and must stay where it happened"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_or_failed_read_stays_visible_on_its_own() {
+        for status in [
+            ToolCallStatus::Running,
+            ToolCallStatus::Failed {
+                message: "denied".to_owned(),
+            },
+        ] {
+            let units = [
+                explored("ReadFile", "a.rs"),
+                explored("ReadFile", "b.rs"),
+                tool_unit("ReadFile", "c.rs", status.clone()),
+            ];
+            let groups = group_units(&units);
+
+            assert!(
+                matches!(
+                    groups.as_slice(),
+                    [RenderGroup::Explore(run), RenderGroup::Unit(_)] if run.len() == 2
+                ),
+                "{status:?} must not be buried in a count: {} groups",
+                groups.len()
+            );
+        }
+    }
+
+    #[test]
+    fn prose_between_reads_keeps_them_apart() {
+        let units = [
+            explored("ReadFile", "a.rs"),
+            RenderUnit::Text("thinking".to_owned()),
+            explored("ReadFile", "b.rs"),
+        ];
+        let groups = group_units(&units);
+
+        assert_eq!(groups.len(), 3, "neither read has a neighbour to fold with");
+        assert!(matches!(
+            groups.as_slice(),
+            [
+                RenderGroup::Tool(_),
+                RenderGroup::Unit(RenderUnit::Text(_)),
+                RenderGroup::Tool(_),
+            ]
+        ));
+    }
+
+    fn diff_line(number: usize, kind: DiffLineKind, text: &str) -> DiffLine {
+        DiffLine {
+            number,
+            kind,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_diff_line_puts_its_number_before_the_sign() {
+        let (content, background) =
+            format_diff_line(&diff_line(1048, DiffLineKind::Added, "    let x = 1;"), 4);
+
+        assert_eq!(content, "     1048 +    let x = 1;");
+        assert_eq!(background, Some(ADDED_WASH));
+    }
+
+    #[test]
+    fn diff_lines_are_washed_by_their_kind() {
+        let background = |kind| format_diff_line(&diff_line(1, kind, "x"), 1).1;
+
+        assert_eq!(background(DiffLineKind::Removed), Some(REMOVED_WASH));
+        assert_eq!(background(DiffLineKind::Added), Some(ADDED_WASH));
+        assert_eq!(background(DiffLineKind::Context), None);
+    }
+
+    /// The kind decides the colour, so a context line that reads like a removal
+    /// still renders as context.
+    #[test]
+    fn a_context_line_beginning_with_a_dash_stays_unwashed() {
+        let (content, background) =
+            format_diff_line(&diff_line(7, DiffLineKind::Context, "---"), 1);
+
+        assert_eq!(content, "     7  ---");
+        assert_eq!(background, None);
+    }
+
+    /// The colour has to land on the cells, not the glyphs, and has to reach the
+    /// end of the row even where the text stops short.
+    #[test]
+    fn a_changed_row_is_washed_edge_to_edge() {
+        const WIDTH: usize = 40;
+
+        let presentation = Presentation {
+            call_id: ToolCallId("call-1".to_owned()),
+            name: "Edit".to_owned(),
+            label: "built-in".to_owned(),
+            target: Some("src/main.rs".to_owned()),
+            status: ToolCallStatus::Succeeded,
+            blocks: vec![DisplayBlock::Diff {
+                lines: vec![
+                    diff_line(10, DiffLineKind::Removed, "old"),
+                    diff_line(10, DiffLineKind::Added, "new"),
+                    diff_line(11, DiffLineKind::Context, "kept"),
+                ],
+            }],
+        };
+
+        // Wrapped in a fixed-width parent the way the live tree wraps it: a
+        // percentage width has nothing to resolve against on its own.
+        let canvas = element! {
+            View(width: WIDTH as u16) {
+                #(render_tool(&presentation))
+            }
+        }
+        .render(Some(WIDTH));
+
+        let backgrounds = |row: usize| {
+            (0..WIDTH)
+                .map(|column| {
+                    canvas
+                        .cell(column, row)
+                        .and_then(|cell| cell.background_color)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Row 0 is the tool title; the diff starts under it.
+        assert_eq!(
+            backgrounds(1),
+            vec![Some(REMOVED_WASH); WIDTH],
+            "a removal is red across the whole row"
+        );
+        assert_eq!(
+            backgrounds(2),
+            vec![Some(ADDED_WASH); WIDTH],
+            "an addition is green across the whole row"
+        );
+        assert_eq!(
+            backgrounds(3),
+            vec![None; WIDTH],
+            "context keeps the default background"
+        );
+    }
+
+    #[test]
+    fn the_widest_number_sets_the_column_for_every_line() {
+        let lines = vec![
+            diff_line(9, DiffLineKind::Context, "nine"),
+            diff_line(10, DiffLineKind::Removed, "ten"),
+        ];
+        let width = diff_number_width(&lines);
+
+        assert_eq!(width, 2);
+        assert_eq!(format_diff_line(&lines[0], width).0, "      9  nine");
+        assert_eq!(format_diff_line(&lines[1], width).0, "     10 -ten");
+    }
 
     /// Shutdown hangs on this: the agent worker archives once every prompt
     /// sender is gone, so the UI must not leave one behind when it quits.

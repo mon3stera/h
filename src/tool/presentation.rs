@@ -21,6 +21,25 @@ pub struct KeyValueEntry {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Removed,
+    Added,
+    Context,
+}
+
+/// One line of a diff, carrying its own kind so the view never has to recover it
+/// from the rendered text. A context line whose content begins with `-` would be
+/// indistinguishable from a removal otherwise.
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    /// The line's number in the file: the pre-edit number for a removal, the
+    /// post-edit number otherwise.
+    pub number: usize,
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum DisplayBlock {
     Summary(String),
@@ -31,9 +50,10 @@ pub enum DisplayBlock {
         show_line_numbers: bool,
         start_line_number: usize,
     },
+    /// A diff, always shown whole — there is no truncation knob, because a
+    /// partially shown edit cannot be audited.
     Diff {
-        content: String,
-        truncated_lines: usize,
+        lines: Vec<DiffLine>,
     },
     Table {
         headers: Vec<String>,
