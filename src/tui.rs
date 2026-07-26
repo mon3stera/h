@@ -17,9 +17,11 @@ use ratatui::{
     text::{Line, Span},
 };
 
+pub mod banner;
 pub mod markdown;
 pub mod text;
 pub mod tool;
+pub mod transcript;
 
 const SATURATION: f32 = 0.5;
 const BRIGHTNESS: f32 = 0.9;

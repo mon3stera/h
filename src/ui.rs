@@ -132,7 +132,7 @@ fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit
 }
 
 #[derive(Debug, Clone)]
-enum RenderUnit {
+pub enum RenderUnit {
     Text(String),
     ParsedMarkdown(Vec<MarkdownBlock>),
     Tool(Presentation),
@@ -142,19 +142,24 @@ enum RenderUnit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StartupInfo {
-    model: String,
-    thinking_effort: Option<String>,
+pub struct StartupInfo {
+    pub model: String,
+    pub thinking_effort: Option<String>,
 }
 
 #[derive(Debug, Default)]
-struct ViewState {
-    startup: Option<StartupInfo>,
-    units: Vec<RenderUnit>,
-    turn_in_progress: bool,
+pub struct ViewState {
+    pub startup: Option<StartupInfo>,
+    pub units: Vec<RenderUnit>,
+    pub turn_in_progress: bool,
+    /// Bumped on every change, so a renderer can tell whether its cached lines
+    /// are still current without comparing the units themselves.
+    pub revision: u64,
 }
 
-fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Result<()> {
+pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Result<()> {
+    state.revision += 1;
+
     match event {
         AgentViewEvent::Startup {
             model,
@@ -547,7 +552,7 @@ fn is_collapsible_exploration(presentation: &Presentation) -> bool {
 
 /// Folds a run of exploratory presentations into one synthetic presentation, so
 /// the ordinary tool rendering draws it — title, glyphs and all.
-fn explore_presentation(run: &[&Presentation]) -> Presentation {
+pub fn explore_presentation(run: &[&Presentation]) -> Presentation {
     let mut tools: Vec<(&str, Vec<&str>)> = Vec::new();
 
     for presentation in run {
@@ -600,7 +605,7 @@ fn explore_presentation(run: &[&Presentation]) -> Presentation {
 
 /// A unit as it will be drawn: on its own, as a single tool, or as a run of
 /// exploration folded together.
-enum RenderGroup<'a> {
+pub enum RenderGroup<'a> {
     Unit(&'a RenderUnit),
     Tool(&'a Presentation),
     Explore(Vec<&'a Presentation>),
@@ -608,7 +613,7 @@ enum RenderGroup<'a> {
 
 /// Collapses each run of two or more finished exploratory tools. A lone read is
 /// left alone — naming the one file it touched says more than "1 file" would.
-fn group_units(units: &[RenderUnit]) -> Vec<RenderGroup<'_>> {
+pub fn group_units(units: &[RenderUnit]) -> Vec<RenderGroup<'_>> {
     let mut groups: Vec<RenderGroup<'_>> = Vec::new();
 
     for unit in units {
