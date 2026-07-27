@@ -356,7 +356,7 @@ impl App {
         let [transcript, indicator, bottom] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(indicator_height),
-            Constraint::Length(self.bottom_height()),
+            Constraint::Length(self.bottom_height(frame.area().width)),
         ])
         .areas(frame.area());
 
@@ -375,10 +375,10 @@ impl App {
         }
     }
 
-    fn bottom_height(&self) -> u16 {
+    fn bottom_height(&self, width: u16) -> u16 {
         match &self.asking {
             Some(asking) => asking.height(),
-            None => self.input.height(),
+            None => self.input.height(width),
         }
     }
 
@@ -948,6 +948,23 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("─")),
             "the prompt box keeps its rules: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_input_wraps_inside_a_taller_prompt_box() {
+        let (mut app, mut terminal) = app_with_size(12, 8);
+
+        for character in "abcdefghijk".chars() {
+            app.input
+                .handle_key(press(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(
+            rows.windows(2).any(|rows| rows == ["❯ abcdefghi", "  jk"]),
+            "the whole logical line should remain visible: {rows:?}"
         );
     }
 

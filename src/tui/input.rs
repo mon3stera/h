@@ -1,15 +1,20 @@
+use std::cell::Cell;
+
 use ratatui::{
     Frame,
+    buffer::Buffer,
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
-use ratatui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 const PROMPT_MARKER: &str = "❯ ";
 const MARKER_WIDTH: u16 = 2;
+/// 预留空列，避免文本占满视觉行时光标被裁剪。
+const CURSOR_GUTTER_WIDTH: u16 = 1;
 
 /// Prompts kept for recall. Old enough entries are not worth the memory.
 const HISTORY_LIMIT: usize = 200;
@@ -43,6 +48,10 @@ pub struct Input {
     /// The unsent text set aside while browsing, so leaving the history returns
     /// whatever was half-typed.
     draft: String,
+    /// Field width and the wrapped rows measured for it.
+    wrapped: Cell<Option<(u16, u16)>>,
+    /// TextArea 上次渲染时显示的首个视觉行。
+    scroll_top: Cell<u16>,
 }
 
 impl Default for Input {
@@ -50,12 +59,15 @@ impl Default for Input {
         let mut area = TextArea::default();
 
         area.set_cursor_line_style(Style::default());
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
 
         Self {
             area,
             history: Vec::new(),
             recalled: None,
             draft: String::new(),
+            wrapped: Cell::new(None),
+            scroll_top: Cell::new(0),
         }
     }
 }
@@ -76,21 +88,34 @@ impl Input {
         }
 
         // Arrows reach the history only from the edges of the text, so a
-        // multi-line prompt can still be moved around in.
+        // multi-line or soft-wrapped prompt can still be moved around in.
         match key.code {
-            KeyCode::Up if self.cursor_row() == 0 => return self.recall(Older),
-            KeyCode::Down if self.cursor_row() + 1 == self.area.lines().len() => {
+            KeyCode::Up if self.cursor_at_top() => return self.recall(Older),
+            KeyCode::Down if self.cursor_at_bottom() => {
                 return self.recall(Newer);
             }
             _ => {}
         }
 
-        self.area.input(key);
+        if self.area.input(key) {
+            self.wrapped.set(None);
+        }
+
         None
     }
 
-    fn cursor_row(&self) -> usize {
-        self.area.cursor().0
+    fn cursor_at_top(&self) -> bool {
+        self.area.screen_cursor().row == 0
+    }
+
+    fn cursor_at_bottom(&self) -> bool {
+        let row = self.area.screen_cursor().row;
+        let mut end = self.area.clone();
+
+        end.move_cursor(CursorMove::Bottom);
+        end.move_cursor(CursorMove::End);
+
+        row == end.screen_cursor().row
     }
 
     fn take(&mut self) -> Option<String> {
@@ -169,6 +194,7 @@ impl Input {
         self.area.insert_str(text);
         self.area.move_cursor(CursorMove::Bottom);
         self.area.move_cursor(CursorMove::End);
+        self.wrapped.set(None);
     }
 
     /// What the box holds. An observation point for tests; the loop reads it
@@ -180,10 +206,42 @@ impl Input {
 
     /// Rows the box needs, grown to fit what has been typed and capped so it
     /// never crowds out the conversation.
-    pub fn height(&self) -> u16 {
-        (self.area.lines().len() as u16)
+    pub fn height(&self, width: u16) -> u16 {
+        self.wrapped_rows(width)
             .saturating_add(BORDER_HEIGHT)
             .clamp(MIN_HEIGHT, MAX_HEIGHT)
+    }
+
+    fn wrapped_rows(&self, width: u16) -> u16 {
+        let width = width
+            .saturating_sub(MARKER_WIDTH + CURSOR_GUTTER_WIDTH)
+            .max(1);
+
+        if let Some((measured, rows)) = self.wrapped.get()
+            && measured == width
+        {
+            return rows;
+        }
+
+        // Ask the textarea to lay out a clone so height uses exactly the same
+        // word/glyph wrapping as the widget itself, including tabs and CJK.
+        let mut area = self.area.clone();
+        area.move_cursor(CursorMove::Bottom);
+        area.move_cursor(CursorMove::End);
+
+        let rect = Rect::new(0, 0, width, 1);
+        let mut buffer = Buffer::empty(rect);
+        (&area).render(rect, &mut buffer);
+
+        let rows = area
+            .screen_cursor()
+            .row
+            .saturating_add(1)
+            .try_into()
+            .unwrap_or(u16::MAX);
+        self.wrapped.set(Some((width, rows)));
+
+        rows
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -197,8 +255,12 @@ impl Input {
 
         // The marker sits beside the field rather than inside it, so it stays put
         // as the text scrolls and never lands in what gets submitted.
-        let [marker, field] =
-            Layout::horizontal([Constraint::Length(MARKER_WIDTH), Constraint::Min(0)]).areas(inner);
+        let [marker, field, cursor_gutter] = Layout::horizontal([
+            Constraint::Length(MARKER_WIDTH),
+            Constraint::Min(0),
+            Constraint::Length(CURSOR_GUTTER_WIDTH),
+        ])
+        .areas(inner);
 
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -208,12 +270,51 @@ impl Input {
             marker,
         );
         frame.render_widget(&self.area, field);
+
+        self.render_cursor_gutter(frame, field, cursor_gutter);
+    }
+
+    /// TextArea 会裁剪恰好落在字段末尾外侧的行尾光标，这里将它补画到预留列。
+    fn render_cursor_gutter(&self, frame: &mut Frame, field: Rect, gutter: Rect) {
+        let cursor = self.area.screen_cursor();
+        let cursor_row = cursor.row.try_into().unwrap_or(u16::MAX);
+        let scroll_top = next_scroll_top(self.scroll_top.get(), cursor_row, field.height);
+
+        self.scroll_top.set(scroll_top);
+
+        if cursor.col != field.width as usize {
+            return;
+        }
+
+        let row = cursor_row.saturating_sub(scroll_top);
+        if row >= gutter.height {
+            return;
+        }
+
+        let area = Rect::new(gutter.x, gutter.y.saturating_add(row), gutter.width, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(" ", self.area.cursor_style())),
+            area,
+        );
+    }
+}
+
+/// 与 TextArea 的视口滚动规则保持一致，用于定位预留列中的光标。
+fn next_scroll_top(previous: u16, cursor: u16, height: u16) -> u16 {
+    if cursor < previous {
+        cursor
+    } else if previous.saturating_add(height) <= cursor {
+        cursor.saturating_add(1).saturating_sub(height)
+    } else {
+        previous
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_WIDTH: u16 = 40;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -260,7 +361,7 @@ mod tests {
         type_text(&mut input, "hi");
         input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
 
-        assert_eq!(input.height(), MIN_HEIGHT);
+        assert_eq!(input.height(TEST_WIDTH), MIN_HEIGHT);
         assert_eq!(
             input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             None,
@@ -284,20 +385,67 @@ mod tests {
     fn the_box_grows_with_the_text_and_then_stops() {
         let mut input = Input::default();
 
-        assert_eq!(input.height(), MIN_HEIGHT);
+        assert_eq!(input.height(TEST_WIDTH), MIN_HEIGHT);
 
         for _ in 0..3 {
             input.handle_key(press(KeyCode::Enter));
         }
-        assert_eq!(input.height(), 4 + BORDER_HEIGHT);
+        assert_eq!(input.height(TEST_WIDTH), 4 + BORDER_HEIGHT);
 
         for _ in 0..40 {
             input.handle_key(press(KeyCode::Enter));
         }
         assert_eq!(
-            input.height(),
+            input.height(TEST_WIDTH),
             MAX_HEIGHT,
             "capped so the log stays visible"
+        );
+    }
+
+    #[test]
+    fn a_long_logical_line_wraps_and_grows_the_box() {
+        let mut input = Input::default();
+
+        type_text(&mut input, "abcdefghijk");
+
+        assert_eq!(input.area.wrap_mode(), WrapMode::WordOrGlyph);
+        assert_eq!(input.height(12), 2 + BORDER_HEIGHT);
+    }
+
+    #[test]
+    fn wrapped_height_uses_terminal_width_for_cjk() {
+        let mut input = Input::default();
+
+        type_text(&mut input, "中文测试");
+
+        // Seven columns leave four for text after the marker and cursor gutter:
+        // two CJK glyphs per visual row.
+        assert_eq!(input.height(7), 2 + BORDER_HEIGHT);
+    }
+
+    #[test]
+    fn a_full_visual_line_keeps_the_cursor_visible() {
+        use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+
+        let mut input = Input::default();
+
+        // Ten columns leave seven for text and one for the cursor.
+        type_text(&mut input, "abcdefg");
+        assert_eq!(input.height(10), MIN_HEIGHT);
+
+        let mut terminal = Terminal::new(TestBackend::new(10, MIN_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| input.render(frame, frame.area()))
+            .unwrap();
+
+        let cursor = &terminal.backend().buffer()[(9, 1)];
+        assert!(cursor.modifier.contains(Modifier::REVERSED));
+
+        type_text(&mut input, "h");
+        assert_eq!(
+            input.height(10),
+            2 + BORDER_HEIGHT,
+            "text wraps before consuming the cursor column"
         );
     }
 
@@ -318,6 +466,25 @@ mod tests {
         input.handle_key(press(KeyCode::Up));
 
         assert_eq!(input.text(), "first");
+    }
+
+    #[test]
+    fn up_moves_inside_a_soft_wrapped_line_before_recalling_history() {
+        let mut input = Input::default();
+
+        send(&mut input, "history");
+        type_text(&mut input, "abcdefghijk");
+
+        let rect = Rect::new(0, 0, 10, 2);
+        let mut buffer = Buffer::empty(rect);
+        (&input.area).render(rect, &mut buffer);
+
+        assert_eq!(input.area.screen_cursor().row, 1);
+
+        input.handle_key(press(KeyCode::Up));
+
+        assert_eq!(input.text(), "abcdefghijk");
+        assert_eq!(input.area.screen_cursor().row, 0);
     }
 
     #[test]
@@ -393,7 +560,7 @@ mod tests {
         input.handle_key(press(KeyCode::Up));
 
         assert_eq!(input.text(), "top\nbottom", "the text is untouched");
-        assert_eq!(input.cursor_row(), 0, "the cursor moved instead");
+        assert_eq!(input.area.cursor().0, 0, "the cursor moved instead");
 
         // Now at the top, Up reaches the history.
         input.handle_key(press(KeyCode::Up));
@@ -511,6 +678,6 @@ mod tests {
         input.handle_key(release);
         input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
 
-        assert_eq!(input.height(), MIN_HEIGHT, "nothing was typed");
+        assert_eq!(input.height(TEST_WIDTH), MIN_HEIGHT, "nothing was typed");
     }
 }

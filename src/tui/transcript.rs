@@ -4,7 +4,7 @@ use ratatui::{
 };
 
 use crate::{
-    tui::{banner, markdown, tool},
+    tui::{banner, markdown, text, tool},
     ui::markdown::parse_markdown,
     ui::{RenderGroup, RenderUnit, ViewState, explore_presentation, group_units},
 };
@@ -13,6 +13,9 @@ use crate::{
 const RESPONSE_MARKER: &str = "❋ ";
 /// What its later rows keep, so the whole answer reads as one block.
 const RESPONSE_INDENT: &str = "  ";
+
+const PROMPT_MARKER: &str = "❯ ";
+const PROMPT_INDENT: &str = "  ";
 
 /// Closes a finished turn.
 const DONE_MARKER: &str = "❃ ";
@@ -110,7 +113,7 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
             RenderGroup::Unit(unit) => match unit {
                 RenderUnit::Text(text) => response(&parse_markdown(text), width),
                 RenderUnit::ParsedMarkdown(blocks) => response(blocks, width),
-                RenderUnit::Prompt(text) => vec![crate::tui::rainbow(&format!("❯ {text}"))],
+                RenderUnit::Prompt(text) => prompt(text, width),
                 RenderUnit::Done(elapsed) => vec![Line::from(Span::styled(
                     format!("{DONE_MARKER}Done for {}s", elapsed.as_secs()),
                     Style::default().fg(Color::DarkGray),
@@ -138,6 +141,46 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Marks a prompt and wraps its continuation rows past the marker.
+fn prompt(content: &str, width: usize) -> Vec<Line<'static>> {
+    // Colour the original single-line representation first, then split it, so
+    // wrapping does not change the established hue sequence.
+    let mut marker = crate::tui::rainbow(&format!("{PROMPT_MARKER}{content}")).spans;
+    let mut colored = marker.split_off(PROMPT_MARKER.chars().count()).into_iter();
+    let inner = width.saturating_sub(PROMPT_INDENT.len()).max(1);
+
+    text::wrap(&[Span::raw(content.to_owned())], inner)
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            if offset > 0 && line.spans.is_empty() {
+                return line;
+            }
+
+            let content = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let body = content.chars().map(|character| {
+                colored
+                    .by_ref()
+                    .find(|span| span.content.starts_with(character))
+                    .unwrap_or_else(|| Span::raw(character.to_string()))
+            });
+
+            let mut spans = if offset == 0 {
+                marker.clone()
+            } else {
+                vec![Span::raw(PROMPT_INDENT)]
+            };
+            spans.extend(body);
+
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Marks and indents a response so it reads as one answer rather than as loose
@@ -340,6 +383,41 @@ mod tests {
         transcript.sync(&state(prompts(1)), 40);
 
         assert_eq!(texts(transcript.visible(10)), ["❯ prompt 0"]);
+    }
+
+    #[test]
+    fn a_prompt_wraps_past_its_marker() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Prompt(
+                "alpha beta gamma delta".to_owned(),
+            )]),
+            14,
+        );
+
+        assert_eq!(
+            texts(transcript.visible(10)),
+            ["❯ alpha beta", "  gamma delta"]
+        );
+    }
+
+    #[test]
+    fn a_prompt_wraps_cjk_by_display_width() {
+        let mut transcript = Transcript::default();
+        transcript.sync(&state(vec![RenderUnit::Prompt("中文测试".to_owned())]), 6);
+
+        assert_eq!(texts(transcript.visible(10)), ["❯ 中文", "  测试"]);
+    }
+
+    #[test]
+    fn a_multiline_prompt_preserves_blank_rows() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Prompt("one\n\ntwo".to_owned())]),
+            40,
+        );
+
+        assert_eq!(texts(transcript.visible(10)), ["❯ one", "", "  two"]);
     }
 
     #[test]
