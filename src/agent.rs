@@ -17,6 +17,7 @@ use crate::{
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -33,6 +34,8 @@ const STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(150);
 /// otherwise loop forever, and every round leaves another event on an unbounded
 /// bus.
 const MAX_TURN_ROUNDS: usize = 100;
+
+const INTERRUPTED_BY_USER: &str = "interrupted by user";
 
 /// The wait after a failed attempt, doubling each time: 150ms, 300ms, 600ms.
 fn stream_retry_delay(attempt: u32) -> Duration {
@@ -171,6 +174,7 @@ where
         &mut self,
         signal: &ProviderSignal,
         metrics: &mut TurnMetrics,
+        cancellation: &CancellationToken,
     ) -> anyhow::Result<()> {
         match signal {
             ProviderSignal::TextDelta(delta) => {
@@ -194,7 +198,34 @@ where
                 self.view_bus
                     .broadcast(AgentViewEvent::Tool(self.tool.present_running(call)));
 
-                let result = self.handle_tool_call(call).await;
+                // Keep the call future in its own scope so cancellation drops
+                // it before the explicit tool hook runs. This releases any
+                // locks or request handles the hook may need to terminate work.
+                let result = {
+                    let call = self.handle_tool_call(call);
+                    tokio::pin!(call);
+
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => None,
+                        result = &mut call => Some(result),
+                    }
+                };
+                let result = match result {
+                    Some(result) => result,
+                    None => {
+                        if let Err(error) = self.tool.cancel(call).await {
+                            tracing::warn!(
+                                event = "tool.cancel.failed",
+                                tool_name = call.name(),
+                                error_class = "tool_cancel_error",
+                                error = error.to_string(),
+                            );
+                        }
+
+                        ToolCallResult::failure(call.id().clone(), INTERRUPTED_BY_USER)
+                    }
+                };
                 let output = result.clone().into_provider_output();
 
                 self.context.histories_mut().push(Message::ToolCallResult {
@@ -236,7 +267,22 @@ where
         Ok(())
     }
 
-    pub async fn continue_turn(&mut self, prompt: impl Into<String>) -> anyhow::Result<()> {
+    fn finish_interrupted(&mut self, metrics: &mut TurnMetrics) {
+        self.merge_text_delta();
+        metrics.completion_reason = "interrupted";
+
+        self.view_bus
+            .broadcast(AgentViewEvent::Err("Interrupted by user".to_owned()));
+        self.view_bus.broadcast(AgentViewEvent::Completed);
+
+        tracing::info!(event = "agent.turn.interrupted");
+    }
+
+    pub async fn continue_turn(
+        &mut self,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> anyhow::Result<()> {
         let prompt = prompt.into();
         let turn_id = Uuid::now_v7();
         let started = Instant::now();
@@ -247,7 +293,7 @@ where
         let result = async {
             tracing::info!(event = "agent.turn.started");
 
-            let result = self.run_turn(prompt).await;
+            let result = self.run_turn(prompt, &cancellation).await;
             match &result {
                 Ok(metrics) => tracing::info!(
                     event = "agent.turn.completed",
@@ -282,7 +328,11 @@ where
         result.map(|_| ())
     }
 
-    async fn run_turn(&mut self, prompt: String) -> anyhow::Result<TurnMetrics> {
+    async fn run_turn(
+        &mut self,
+        prompt: String,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<TurnMetrics> {
         self.turn = NextTurn::Prompt(prompt);
         let mut metrics = TurnMetrics::default();
 
@@ -308,7 +358,7 @@ where
                 anyhow::bail!(message);
             }
 
-            self.next_turn(&mut metrics).await?
+            self.next_turn(&mut metrics, cancellation).await?
         }
     }
 
@@ -422,11 +472,18 @@ where
     async fn open_stream(
         &self,
         request_index: usize,
-    ) -> anyhow::Result<ProviderEventStream<P::StreamEvent>> {
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<Option<ProviderEventStream<P::StreamEvent>>> {
         let mut attempt = 1;
 
         loop {
-            match self.provider.stream(self.context.histories()).await {
+            let opened = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(None),
+                opened = self.provider.stream(self.context.histories()) => opened,
+            };
+
+            match opened {
                 Ok(stream) => {
                     if attempt > 1 {
                         tracing::info!(
@@ -436,7 +493,7 @@ where
                         );
                     }
 
-                    return Ok(stream);
+                    return Ok(Some(stream));
                 }
                 Err(e) if attempt < STREAM_MAX_ATTEMPTS => {
                     let delay = stream_retry_delay(attempt);
@@ -451,7 +508,12 @@ where
                         error = e.to_string(),
                     );
 
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return Ok(None),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+
                     attempt += 1;
                 }
                 Err(e) => {
@@ -469,7 +531,11 @@ where
         }
     }
 
-    async fn next_turn(&mut self, metrics: &mut TurnMetrics) -> anyhow::Result<()> {
+    async fn next_turn(
+        &mut self,
+        metrics: &mut TurnMetrics,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<()> {
         match &self.turn {
             NextTurn::Prompt(prompt) => {
                 self.append_prompt(prompt.clone());
@@ -491,8 +557,12 @@ where
             message_count = self.context.histories().len()
         );
 
-        let mut stream = match self.open_stream(request_index).await {
-            Ok(stream) => stream,
+        let mut stream = match self.open_stream(request_index, cancellation).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
+                self.finish_interrupted(metrics);
+                return Ok(());
+            }
             Err(e) => {
                 self.view_bus.broadcast(AgentViewEvent::Err(e.to_string()));
                 return Err(e);
@@ -500,13 +570,30 @@ where
         };
 
         loop {
-            match stream.next().await {
+            // This is the main cancellation point: choosing the cancellation
+            // branch drops the provider stream and therefore its in-flight
+            // request according to the Provider contract.
+            let event = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    self.finish_interrupted(metrics);
+                    return Ok(());
+                }
+                event = stream.next() => event,
+            };
+
+            match event {
                 Some(Ok(event)) => {
+                    if cancellation.is_cancelled() {
+                        self.finish_interrupted(metrics);
+                        return Ok(());
+                    }
+
                     let signal = self.provider.handle(event).await?;
 
                     let agent_event: AgentEvent = signal.clone().into();
                     self.event_bus.broadcast(agent_event);
-                    self.handle_signal(&signal, metrics).await?;
+                    self.handle_signal(&signal, metrics, cancellation).await?;
                 }
                 Some(e) => {
                     tracing::warn!(
@@ -541,14 +628,25 @@ where
 mod tests {
     use std::{
         pin::Pin,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Context as TaskContext, Poll},
     };
 
     use futures::{Stream, stream};
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::*;
-    use crate::tool::{ToolCall, ToolCallStatus, ToolDefinition};
+    use crate::tool::{ToolCall, ToolCallStatus, ToolDefinition, TypedTool};
+
+    fn cancellation() -> CancellationToken {
+        CancellationToken::new()
+    }
 
     struct TestProvider;
 
@@ -578,6 +676,168 @@ mod tests {
         ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
         {
             Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    struct PendingStream {
+        polled: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for PendingStream {
+        type Item = anyhow::Result<()>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+            self.polled.notify_one();
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingStreamProvider {
+        polled: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PendingStreamProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "pending-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(ProviderSignal::Unsupported)
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            Ok(Box::pin(PendingStream {
+                polled: self.polled.clone(),
+                dropped: self.dropped.clone(),
+            }))
+        }
+    }
+
+    struct PartialProvider {
+        handled: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PartialProvider {
+        type StreamEvent = String;
+
+        fn model(&self) -> &str {
+            "partial-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            self.handled.notify_one();
+            Ok(ProviderSignal::TextDelta(event))
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            let events =
+                stream::once(async { Ok("partial answer".to_owned()) }).chain(stream::pending());
+
+            Ok(Box::pin(events))
+        }
+    }
+
+    struct ToolProvider {
+        call: ToolCall,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ToolProvider {
+        type StreamEvent = ProviderSignal;
+
+        fn model(&self) -> &str {
+            "tool-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(event)
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            let signal = ProviderSignal::ToolCallStarted(self.call.clone());
+            let events = stream::once(async move { Ok(signal) }).chain(stream::pending());
+
+            Ok(Box::pin(events))
+        }
+    }
+
+    #[derive(Deserialize, JsonSchema)]
+    struct BlockingArgs {}
+
+    #[derive(Serialize)]
+    struct BlockingOutput {}
+
+    struct BlockingTool {
+        started: Arc<Notify>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl TypedTool for BlockingTool {
+        type Arguments = BlockingArgs;
+        type Output = BlockingOutput;
+
+        fn name(&self) -> &'static str {
+            "blocking"
+        }
+
+        fn description(&self) -> &'static str {
+            "wait forever for cancellation tests"
+        }
+
+        async fn call(&self, _arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn cancel(&self, _arguments: Self::Arguments) -> anyhow::Result<()> {
+            self.cancelled.store(true, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -638,6 +898,124 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn cancellation_between_events_drops_the_stream_and_keeps_user_prompts() {
+        let (polled, dropped) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let mut agent = Agent::new(PendingStreamProvider {
+            polled: polled.clone(),
+            dropped: dropped.clone(),
+        });
+        let mut events = agent.subscribe_view();
+
+        agent.append_prompt("earlier prompt");
+
+        let cancellation = cancellation();
+        let trigger = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            polled.notified().await;
+            trigger.cancel();
+        });
+
+        agent
+            .continue_turn("cancel this prompt", cancellation)
+            .await
+            .unwrap();
+        canceller.await.unwrap();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the provider stream terminates its HTTP/SSE connection"
+        );
+        assert_eq!(
+            agent.prompts(),
+            ["earlier prompt", "cancel this prompt"],
+            "cancellation must not roll back user input"
+        );
+
+        let seen = drain(&mut events);
+        assert!(seen.iter().any(
+            |event| matches!(event, AgentViewEvent::Err(message) if message == "Interrupted by user")
+        ));
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, AgentViewEvent::TurnFinished { completed: false }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_text_received_before_the_next_stream_event() {
+        let handled = Arc::new(Notify::new());
+        let mut agent = Agent::new(PartialProvider {
+            handled: handled.clone(),
+        });
+
+        let cancellation = cancellation();
+        let trigger = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            handled.notified().await;
+            trigger.cancel();
+        });
+
+        agent
+            .continue_turn("start answering", cancellation)
+            .await
+            .unwrap();
+        canceller.await.unwrap();
+
+        assert!(agent.context.histories().iter().any(|message| {
+            matches!(message, Message::Assistant(text) if text == "partial answer")
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_tool_calls_its_hook_and_records_an_interrupted_result() {
+        let (started, cancelled) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let call = ToolCall::new("call-1", "blocking", json!({}));
+        let mut agent = Agent::new(ToolProvider { call });
+
+        agent.tool.register(BlockingTool {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        });
+
+        let cancellation = cancellation();
+        let trigger = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            started.notified().await;
+            trigger.cancel();
+        });
+
+        agent
+            .continue_turn("run the blocking tool", cancellation)
+            .await
+            .unwrap();
+        canceller.await.unwrap();
+
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the registry must delegate cancellation to the active tool"
+        );
+
+        let histories = agent.context.histories();
+        let call_count = histories
+            .iter()
+            .filter(|message| matches!(message, Message::ToolCall { .. }))
+            .count();
+        let result = histories.iter().find_map(|message| match message {
+            Message::ToolCallResult { call_id, output } => Some((call_id, output)),
+            _ => None,
+        });
+
+        assert_eq!(call_count, 1);
+        assert!(matches!(
+            result,
+            Some((call_id, output))
+                if call_id == "call-1"
+                    && serde_json::from_str::<Value>(output).unwrap()
+                        == json!({"error": INTERRUPTED_BY_USER})
+        ));
+    }
+
     /// Asks for another tool round forever. Safe to run only because the round
     /// cap stops it; without one this hangs and grows without bound.
     struct RunawayProvider;
@@ -676,7 +1054,10 @@ mod tests {
         let mut agent = Agent::new(RunawayProvider);
         let mut events = agent.subscribe_view();
 
-        let error = agent.continue_turn("ask something").await.unwrap_err();
+        let error = agent
+            .continue_turn("ask something", cancellation())
+            .await
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("without a final answer"),
@@ -704,7 +1085,10 @@ mod tests {
         let mut agent = Agent::new(ScriptedProvider::new([CompletedReason::Final]));
         let mut events = agent.subscribe_view();
 
-        agent.continue_turn("ask something").await.unwrap();
+        agent
+            .continue_turn("ask something", cancellation())
+            .await
+            .unwrap();
 
         assert_eq!(
             turn_finished(&mut events),
@@ -721,7 +1105,10 @@ mod tests {
         ]));
         let mut events = agent.subscribe_view();
 
-        agent.continue_turn("ask something").await.unwrap();
+        agent
+            .continue_turn("ask something", cancellation())
+            .await
+            .unwrap();
 
         assert_eq!(
             turn_finished(&mut events),
@@ -737,7 +1124,10 @@ mod tests {
 
         // The second request reports nothing, which is how this ends rather than
         // asking for another tool round forever.
-        agent.continue_turn("ask something").await.unwrap();
+        agent
+            .continue_turn("ask something", cancellation())
+            .await
+            .unwrap();
 
         assert_eq!(turn_finished(&mut events), Some(false));
     }
@@ -831,7 +1221,7 @@ mod tests {
         let agent = Agent::new(FlakyProvider::new(2));
         let started = tokio::time::Instant::now();
 
-        assert!(agent.open_stream(1).await.is_ok());
+        assert!(agent.open_stream(1, &cancellation()).await.is_ok());
         assert_eq!(agent.provider.attempts(), 3, "two failures, then a success");
         assert_eq!(
             started.elapsed(),
@@ -845,7 +1235,7 @@ mod tests {
         let agent = Agent::new(FlakyProvider::new(usize::MAX));
         let started = tokio::time::Instant::now();
 
-        assert!(agent.open_stream(1).await.is_err());
+        assert!(agent.open_stream(1, &cancellation()).await.is_err());
         assert_eq!(agent.provider.attempts(), STREAM_MAX_ATTEMPTS as usize);
         assert_eq!(
             started.elapsed(),
@@ -859,9 +1249,21 @@ mod tests {
         let agent = Agent::new(FlakyProvider::new(0));
         let started = tokio::time::Instant::now();
 
-        assert!(agent.open_stream(1).await.is_ok());
+        assert!(agent.open_stream(1, &cancellation()).await.is_ok());
         assert_eq!(agent.provider.attempts(), 1);
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_stream_open_never_contacts_the_provider() {
+        let agent = Agent::new(FlakyProvider::new(0));
+        let cancellation = cancellation();
+
+        cancellation.cancel();
+        let stream = agent.open_stream(1, &cancellation).await.unwrap();
+
+        assert!(stream.is_none());
+        assert_eq!(agent.provider.attempts(), 0);
     }
 
     fn agent_with_histories(histories: Vec<Message>) -> Agent<TestProvider> {
@@ -900,6 +1302,7 @@ mod tests {
                     json!({}),
                 )),
                 &mut metrics,
+                &cancellation(),
             )
             .await
             .unwrap();
@@ -907,6 +1310,7 @@ mod tests {
             .handle_signal(
                 &ProviderSignal::Completed(CompletedReason::Final),
                 &mut metrics,
+                &cancellation(),
             )
             .await
             .unwrap();

@@ -2,6 +2,12 @@ use tokio::sync::oneshot;
 
 use crate::tool::{Presentation, ToolCall, ToolCallResult};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCommand {
+    Prompt(String),
+    Cancel,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum CompletedReason {
     Final,

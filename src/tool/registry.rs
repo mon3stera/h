@@ -119,4 +119,16 @@ impl ToolRegistry {
             }
         }
     }
+
+    pub async fn cancel(&self, call: &ToolCall) -> anyhow::Result<()> {
+        let Some(registered) = self.tools.get(call.name()) else {
+            return Ok(());
+        };
+
+        tracing::info!(event = "tool.cancel.started", tool_name = call.name());
+        registered.tool.cancel(call.arguments().clone()).await?;
+        tracing::info!(event = "tool.cancel.completed", tool_name = call.name());
+
+        Ok(())
+    }
 }

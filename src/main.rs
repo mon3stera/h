@@ -1,9 +1,17 @@
+use std::collections::VecDeque;
+
 use clap::Parser;
+use tokio::sync::mpsc::{self, Receiver, error::TryRecvError};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::Agent,
     bridge::UiBridge,
-    provider::openai::{OpenAIProvider, OpenAIProviderConfig},
+    event::AgentCommand,
+    provider::{
+        Provider,
+        openai::{OpenAIProvider, OpenAIProviderConfig},
+    },
 };
 
 mod agent;
@@ -72,53 +80,121 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
     // seed the prompt box so they can be recalled.
     let history = agent.prompts();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (commands, command_rx) = mpsc::channel::<AgentCommand>(8);
 
     tracing::info!(event = "app.ready");
 
-    let worker = tokio::spawn(async move {
-        while let Some(prompt) = rx.recv().await {
-            match agent.continue_turn(prompt).await {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(
-                        event = "agent.worker.failed",
-                        operation = "continue_turn",
-                        error_class = "agent_turn_error",
-                        error = e.to_string(),
-                    );
-                }
-            }
-        }
+    let worker = tokio::spawn(run_agent(agent, command_rx));
 
-        tracing::info!(event = "agent.worker.closed");
-
-        // The loop above ends only once every prompt sender is gone, which means
-        // the UI is down and this task is the last owner of the session. Archive
-        // here rather than in `main_loop`, which no longer holds the agent.
-        let archived = agent.archive().await;
-
-        if let Err(e) = &archived {
-            tracing::error!(
-                event = "agent.archive.failed",
-                operation = "archive",
-                error_class = "archive_error",
-                error = e.to_string(),
-            );
-        }
-
-        archived
-    });
-
-    tui::app::run(tx, bus_rx, ui_request_rx, history).await?;
+    tui::app::run(commands, bus_rx, ui_request_rx, history).await?;
 
     tracing::info!(event = "app.ui.closed");
 
-    // Quitting the UI dropped the last prompt sender, so the worker is either
+    // Quitting the UI dropped the last command sender, so the worker is either
     // done or finishing the turn it was in the middle of. Wait for it, both to
     // let that turn land in the archive and to surface a failed write.
     worker.await??;
 
     tracing::info!(event = "app.archived");
     Ok(())
+}
+
+/// Owns the mutable agent while still listening for UI control commands during
+/// a turn. Prompts may queue, but `Cancel` always targets the turn currently
+/// being polled.
+async fn run_agent<P>(
+    mut agent: Agent<P>,
+    mut commands: Receiver<AgentCommand>,
+) -> anyhow::Result<()>
+where
+    P: Provider,
+{
+    let (mut queued, mut accepting) = (VecDeque::new(), true);
+
+    loop {
+        let prompt = loop {
+            if !accepting {
+                break None;
+            }
+
+            if let Some(prompt) = queued.pop_front() {
+                break Some(prompt);
+            }
+
+            match commands.recv().await {
+                Some(AgentCommand::Prompt(prompt)) => break Some(prompt),
+                Some(AgentCommand::Cancel) => {}
+                None => {
+                    accepting = false;
+                    break None;
+                }
+            }
+        };
+        let Some(prompt) = prompt else {
+            break;
+        };
+
+        let cancellation = CancellationToken::new();
+        let result = {
+            let turn = agent.continue_turn(prompt, cancellation.clone());
+            tokio::pin!(turn);
+
+            loop {
+                tokio::select! {
+                    result = &mut turn => break result,
+                    command = commands.recv(), if accepting => match command {
+                        Some(AgentCommand::Prompt(prompt)) => queued.push_back(prompt),
+                        Some(AgentCommand::Cancel) => cancellation.cancel(),
+                        None => {
+                            accepting = false;
+                            queued.clear();
+                            cancellation.cancel();
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Err(e) = result {
+            tracing::error!(
+                event = "agent.worker.failed",
+                operation = "continue_turn",
+                error_class = "agent_turn_error",
+                error = e.to_string(),
+            );
+        }
+
+        // If the turn and a queued Esc become ready together, the turn has
+        // already ended. Discard that stale cancellation before starting the
+        // next queued prompt.
+        loop {
+            match commands.try_recv() {
+                Ok(AgentCommand::Prompt(prompt)) => queued.push_back(prompt),
+                Ok(AgentCommand::Cancel) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    accepting = false;
+                    queued.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::info!(event = "agent.worker.closed");
+
+    // The UI is down and this task is the last owner of the session. Archive
+    // here rather than in `main_loop`, which no longer holds the agent.
+    let archived = agent.archive().await;
+
+    if let Err(e) = &archived {
+        tracing::error!(
+            event = "agent.archive.failed",
+            operation = "archive",
+            error_class = "archive_error",
+            error = e.to_string(),
+        );
+    }
+
+    archived
 }

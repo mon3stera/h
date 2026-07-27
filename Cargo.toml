@@ -38,6 +38,7 @@ strsim = "0.11.1"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 textwrap = "0.16.2"
 tokio = { version = "1.53.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -48,4 +49,3 @@ uuid = { version = "1.24.0", features = ["v4", "v7", "fast-rng"] }
 [dev-dependencies]
 # `start_paused` runs the backoff tests on virtual time instead of sleeping.
 tokio = { version = "1.53.0", features = ["test-util"] }
-

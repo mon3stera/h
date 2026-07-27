@@ -968,6 +968,9 @@ impl Provider for OpenAIProvider {
 
         let request = self.build_request(input)?;
 
+        // Keep this as a foreground Responses request. OpenAI's explicit
+        // `/cancel` endpoint is background-only; synchronous cancellation is
+        // performed by dropping this stream, which closes the SSE connection.
         let stream = self
             .client
             .responses()

@@ -20,6 +20,9 @@ pub trait Provider: Send + Sync + 'static {
 
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal>;
 
+    /// Opens one in-flight provider request. The returned stream owns that
+    /// request, so dropping it must release the connection and stop upstream
+    /// work for providers whose protocol supports cancellation by disconnect.
     async fn stream(
         &self,
         input: &[Message],

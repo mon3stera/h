@@ -87,6 +87,14 @@ pub trait TypedTool: Send + Sync + 'static {
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output>;
+
+    /// Stops external work started by the current call. Most async tools need
+    /// no hook because dropping their call future is sufficient; tools that own
+    /// subprocesses or other out-of-process work should override this method.
+    /// The registry invokes it only after the call future has been dropped.
+    async fn cancel(&self, _arguments: Self::Arguments) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -100,6 +108,8 @@ pub trait DynTool: Send + Sync {
     fn definition(&self) -> anyhow::Result<ToolDefinition>;
 
     async fn call(&self, arguments: Value) -> anyhow::Result<Value>;
+
+    async fn cancel(&self, arguments: Value) -> anyhow::Result<()>;
 }
 
 #[async_trait::async_trait]
@@ -128,6 +138,11 @@ where
         let output = TypedTool::call(self, arguments).await?;
 
         Ok(serde_json::to_value(output)?)
+    }
+
+    async fn cancel(&self, arguments: Value) -> anyhow::Result<()> {
+        let arguments = serde_json::from_value::<T::Arguments>(arguments)?;
+        TypedTool::cancel(self, arguments).await
     }
 }
 

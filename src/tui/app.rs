@@ -25,7 +25,7 @@ use tokio::sync::{
 };
 
 use crate::{
-    event::{AgentViewEvent, AskAnswer, UiRequest},
+    event::{AgentCommand, AgentViewEvent, AskAnswer, UiRequest},
     tui::{
         choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
         input::Input,
@@ -59,9 +59,9 @@ const ASK_FRAME: u16 = 3;
 /// Runs the conversation view until the user quits.
 ///
 /// Returns once Ctrl+C is pressed or the agent's event channel closes, at which
-/// point dropping `committer` is what tells the worker to archive and stop.
+/// point dropping `commands` tells the worker to cancel, archive, and stop.
 pub async fn run(
-    committer: Sender<String>,
+    commands: Sender<AgentCommand>,
     mut events: UnboundedReceiver<AgentViewEvent>,
     // Questions the agent is waiting on, each carrying the channel to answer on.
     mut requests: Receiver<UiRequest>,
@@ -69,14 +69,7 @@ pub async fn run(
     history: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut terminal = enter()?;
-    let outcome = drive(
-        &mut terminal,
-        committer,
-        &mut events,
-        &mut requests,
-        history,
-    )
-    .await;
+    let outcome = drive(&mut terminal, commands, &mut events, &mut requests, history).await;
 
     leave();
     outcome
@@ -110,7 +103,7 @@ fn leave() {
 
 async fn drive(
     terminal: &mut DefaultTerminal,
-    committer: Sender<String>,
+    commands: Sender<AgentCommand>,
     events: &mut UnboundedReceiver<AgentViewEvent>,
     requests: &mut Receiver<UiRequest>,
     history: Vec<String>,
@@ -129,7 +122,7 @@ async fn drive(
         tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(Event::Key(key))) => {
-                    if app.handle_key(key, &committer).await == Flow::Quit {
+                    if app.handle_key(key, &commands).await == Flow::Quit {
                         return Ok(());
                     }
                 }
@@ -189,6 +182,12 @@ impl App {
         match &event {
             AgentViewEvent::TurnStart => self.started = Some(Instant::now()),
             AgentViewEvent::TurnFinished { completed } => {
+                // A cancelled `ask` keeps its reply sender alive until the
+                // agent has observed cancellation and written the interrupted
+                // tool result. Dropping it earlier could race into an ordinary
+                // "question dismissed" result instead.
+                self.asking = None;
+
                 if let Some(started) = self.started.take() {
                     if *completed {
                         self.state.units.push(RenderUnit::Done(started.elapsed()));
@@ -252,7 +251,7 @@ impl App {
         }
     }
 
-    async fn handle_key(&mut self, key: KeyEvent, committer: &Sender<String>) -> Flow {
+    async fn handle_key(&mut self, key: KeyEvent, commands: &Sender<AgentCommand>) -> Flow {
         if key.kind == KeyEventKind::Release {
             return Flow::Continue;
         }
@@ -261,6 +260,15 @@ impl App {
         // abandoned when the reply channel closes with the process.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Flow::Quit;
+        }
+
+        if key.code == KeyCode::Esc {
+            // Keep an outstanding ask alive until TurnFinished so cancellation
+            // wins over its reply channel closing; the agent can then record
+            // the canonical interrupted ToolResult.
+            self.cancel(commands).await;
+
+            return Flow::Continue;
         }
 
         // An unanswered question owns the keyboard.
@@ -289,7 +297,7 @@ impl App {
             }
             _ => {
                 if let Some(prompt) = self.input.handle_key(key) {
-                    self.submit(prompt, committer).await;
+                    self.submit(prompt, commands).await;
                 }
             }
         }
@@ -297,7 +305,7 @@ impl App {
         Flow::Continue
     }
 
-    async fn submit(&mut self, prompt: String, committer: &Sender<String>) {
+    async fn submit(&mut self, prompt: String, commands: &Sender<AgentCommand>) {
         // Echo it locally: nothing on the event bus carries the user's own turn
         // back to the view.
         self.state.units.push(RenderUnit::Prompt(prompt.clone()));
@@ -308,11 +316,23 @@ impl App {
 
         tracing::info!(event = "ui.prompt_submitted");
 
-        if committer.send(prompt).await.is_err() {
+        if commands.send(AgentCommand::Prompt(prompt)).await.is_err() {
             tracing::warn!(
                 event = "ui.prompt_send.failed",
                 operation = "prompt_channel_send",
                 error_class = "prompt_channel_closed"
+            );
+        }
+    }
+
+    async fn cancel(&self, commands: &Sender<AgentCommand>) {
+        tracing::info!(event = "ui.turn_cancel_requested");
+
+        if commands.send(AgentCommand::Cancel).await.is_err() {
+            tracing::warn!(
+                event = "ui.turn_cancel_send.failed",
+                operation = "command_channel_send",
+                error_class = "command_channel_closed"
             );
         }
     }
@@ -383,6 +403,7 @@ impl App {
                 format!("{word:<SPINNER_WIDTH$}{elapsed}"),
                 Style::default().fg(Color::DarkGray),
             ),
+            Span::styled("  Esc to cancel", Style::default().fg(Color::DarkGray)),
         ])
     }
 }
@@ -462,6 +483,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escape_sends_a_turn_cancellation() {
+        let (mut app, _) = app_with_size(40, 10);
+        let (committer, mut received) = mpsc::channel(1);
+
+        assert_eq!(
+            app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE), &committer)
+                .await,
+            Flow::Continue
+        );
+        assert_eq!(received.recv().await, Some(AgentCommand::Cancel));
+    }
+
+    #[tokio::test]
     async fn a_submitted_prompt_is_echoed_and_sent() {
         let (mut app, _) = app_with_size(40, 10);
         let (committer, mut received) = mpsc::channel(1);
@@ -476,7 +510,10 @@ mod tests {
         app.handle_key(press(KeyCode::Enter, KeyModifiers::ALT), &committer)
             .await;
 
-        assert_eq!(received.recv().await, Some("hello".to_owned()));
+        assert_eq!(
+            received.recv().await,
+            Some(AgentCommand::Prompt("hello".to_owned()))
+        );
         assert!(
             matches!(app.state.units.as_slice(), [RenderUnit::Prompt(text)] if text == "hello"),
             "the view has to echo the user's own turn"
@@ -691,19 +728,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dismissing_tells_the_agent_the_question_went_unanswered() {
+    async fn escape_cancels_the_turn_and_drops_the_pending_question() {
         let (mut app, _) = app_with_size(40, 12);
-        let (committer, _rx) = mpsc::channel(1);
+        let (committer, mut received) = mpsc::channel(1);
         let (request, answer) = ask(&[("left", None)]);
 
         app.begin_ask(request);
         app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE), &committer)
             .await;
 
+        assert!(
+            app.is_asking(),
+            "the reply stays alive until cancellation lands"
+        );
+        assert_eq!(received.recv().await, Some(AgentCommand::Cancel));
+
+        app.handle_agent_event(AgentViewEvent::TurnFinished { completed: false });
+
         assert!(!app.is_asking());
         assert!(
             answer.await.is_err(),
-            "a dropped reply channel is how the tool hears it"
+            "cancelling also drops the tool's pending reply channel"
         );
     }
 
@@ -774,6 +819,10 @@ mod tests {
         let busy = drawn(&mut app, &mut terminal);
 
         assert!(busy.iter().any(|row| row.contains("h-...")), "{busy:?}");
+        assert!(
+            busy.iter().any(|row| row.contains("Esc to cancel")),
+            "{busy:?}"
+        );
     }
 
     #[test]

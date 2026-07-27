@@ -373,7 +373,10 @@ impl BashTool {
             anyhow::bail!("Empty command");
         }
 
-        let output = Command::new("bash").arg("-c").arg(command).output().await?;
+        let mut process = Command::new("bash");
+        process.arg("-c").arg(command).kill_on_drop(true);
+
+        let output = process.output().await?;
         let (stdout, stderr) = (
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
@@ -457,6 +460,25 @@ impl TypedTool for BashTool {
             BashToolArgs::Wait { session_id } => self.wait(session_id).await,
             BashToolArgs::Terminate { session_id } => self.terminate(session_id).await,
         }
+    }
+
+    async fn cancel(&self, args: Self::Arguments) -> anyhow::Result<()> {
+        let session_id = match args {
+            BashToolArgs::RunBackground {
+                session_id: Some(session_id),
+                ..
+            }
+            | BashToolArgs::Wait { session_id } => Some(session_id),
+            _ => None,
+        };
+
+        if let Some(session_id) = session_id {
+            let _ = self.terminate(session_id).await?;
+        }
+
+        // A blocking command is owned by its call future and configured with
+        // `kill_on_drop`, so dropping that future is its cancellation hook.
+        Ok(())
     }
 }
 
