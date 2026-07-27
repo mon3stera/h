@@ -13,7 +13,7 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 const PROMPT_MARKER: &str = "❯ ";
 const MARKER_WIDTH: u16 = 2;
-/// 预留空列，避免文本占满视觉行时光标被裁剪。
+/// Kept empty so the cursor remains visible when text fills a visual line.
 const CURSOR_GUTTER_WIDTH: u16 = 1;
 
 /// Prompts kept for recall. Old enough entries are not worth the memory.
@@ -50,7 +50,7 @@ pub struct Input {
     draft: String,
     /// Field width and the wrapped rows measured for it.
     wrapped: Cell<Option<(u16, u16)>>,
-    /// TextArea 上次渲染时显示的首个视觉行。
+    /// First visual row shown by the textarea on its last render.
     scroll_top: Cell<u16>,
 }
 
@@ -274,7 +274,8 @@ impl Input {
         self.render_cursor_gutter(frame, field, cursor_gutter);
     }
 
-    /// TextArea 会裁剪恰好落在字段末尾外侧的行尾光标，这里将它补画到预留列。
+    /// Draws the synthetic end-of-line cursor that the textarea clips when it
+    /// lands immediately beyond the field's final column.
     fn render_cursor_gutter(&self, frame: &mut Frame, field: Rect, gutter: Rect) {
         let cursor = self.area.screen_cursor();
         let cursor_row = cursor.row.try_into().unwrap_or(u16::MAX);
@@ -299,7 +300,7 @@ impl Input {
     }
 }
 
-/// 与 TextArea 的视口滚动规则保持一致，用于定位预留列中的光标。
+/// Mirrors the textarea's viewport rule to place a cursor in the gutter.
 fn next_scroll_top(previous: u16, cursor: u16, height: u16) -> u16 {
     if cursor < previous {
         cursor

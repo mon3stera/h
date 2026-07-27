@@ -1,7 +1,12 @@
 use std::{
+    env,
+    ffi::OsStr,
     io::{self, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::{Command as StdCommand, Output, Stdio},
     sync::Arc,
+    time::Duration,
 };
 
 use dashmap::{
@@ -20,8 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     process::Command,
+    sync::Mutex as AsyncMutex,
+    time::{sleep, timeout},
 };
 use uuid::Uuid;
 
@@ -34,6 +41,9 @@ use super::{
 };
 
 const MAX_INLINE_OUTPUT_BYTES: usize = 512;
+const TMUX_HISTORY_LIMIT: &str = "100000";
+const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TMUX_TERMINATE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn preview_end(content: &str) -> usize {
     (0..=MAX_INLINE_OUTPUT_BYTES.min(content.len()))
@@ -212,12 +222,12 @@ impl BashSession {
     }
 }
 
-pub struct BashTool {
+struct PtyBashTool {
     sessions: DashMap<String, BashSession>,
 }
 
-impl BashTool {
-    pub fn new() -> Self {
+impl PtyBashTool {
+    fn new() -> Self {
         Self {
             sessions: DashMap::new(),
         }
@@ -368,26 +378,682 @@ impl BashTool {
         Ok(BashToolOutput::Sent)
     }
 
-    async fn run_blocking(&self, command: String) -> anyhow::Result<BashToolOutput> {
-        if command.split_whitespace().next().is_none() {
-            anyhow::bail!("Empty command");
+    async fn call(&self, args: BashToolArgs) -> anyhow::Result<BashToolOutput> {
+        match args {
+            BashToolArgs::RunBackground {
+                command,
+                session_id,
+            } => self.run_background(session_id, command).await,
+            BashToolArgs::LogFilePath { session_id } => Ok(self.log_path(session_id).await),
+            BashToolArgs::Send { session_id, input } => self.send(session_id, input).await,
+            BashToolArgs::View { session_id } => self.view(session_id).await,
+            BashToolArgs::Wait { session_id } => self.wait(session_id).await,
+            BashToolArgs::Terminate { session_id } => self.terminate(session_id).await,
+            BashToolArgs::RunBlocking { .. } => unreachable!("blocking calls bypass the backend"),
+        }
+    }
+
+    async fn cancel(&self, args: BashToolArgs) -> anyhow::Result<()> {
+        let session_id = match args {
+            BashToolArgs::RunBackground {
+                session_id: Some(session_id),
+                ..
+            }
+            | BashToolArgs::Wait { session_id } => Some(session_id),
+            _ => None,
+        };
+
+        if let Some(session_id) = session_id {
+            let _ = self.terminate(session_id).await?;
         }
 
-        let mut process = Command::new("bash");
-        process.arg("-c").arg(command).kill_on_drop(true);
-
-        let output = process.output().await?;
-        let (stdout, stderr) = (
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let (stdout, stderr) = (
-            write_temp_and_mention(stdout).await?,
-            write_temp_and_mention(stderr).await?,
-        );
-
-        Ok(BashToolOutput::RanBlocking { stdout, stderr })
+        Ok(())
     }
+}
+
+struct TmuxSession {
+    target: String,
+    channel: String,
+    worker_file: PathBuf,
+    command_file: PathBuf,
+    marker_file: PathBuf,
+    history_file: PathBuf,
+    offset: u64,
+    marker: Option<String>,
+    active: bool,
+}
+
+struct TmuxBashTool {
+    executable: PathBuf,
+    socket: String,
+    socket_path: Mutex<Option<PathBuf>>,
+    sessions: DashMap<String, Arc<AsyncMutex<TmuxSession>>>,
+    /// A newly allocated session is recorded before tmux starts it. If the
+    /// call future is dropped, the cancellation hook can still remove it.
+    pending: Mutex<Option<String>>,
+}
+
+impl TmuxBashTool {
+    fn available() -> bool {
+        Self::find_executable().is_some_and(|executable| {
+            StdCommand::new(executable)
+                .arg("-V")
+                .env_remove("TMUX")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
+    fn find_executable() -> Option<PathBuf> {
+        let path = env::var_os("PATH")?;
+
+        env::split_paths(&path).find_map(|directory| {
+            let executable = directory.join("tmux");
+            let metadata = executable.metadata().ok()?;
+
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+
+            executable.canonicalize().ok()
+        })
+    }
+
+    fn new() -> Self {
+        Self::with_socket(format!(
+            "h-bash-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ))
+    }
+
+    fn with_socket(socket: String) -> Self {
+        Self {
+            executable: Self::find_executable().unwrap_or_else(|| PathBuf::from("tmux")),
+            socket,
+            socket_path: Mutex::new(None),
+            sessions: DashMap::new(),
+            pending: Mutex::new(None),
+        }
+    }
+
+    fn session(&self, session_id: &str) -> Option<Arc<AsyncMutex<TmuxSession>>> {
+        self.sessions
+            .get(session_id)
+            .map(|session| Arc::clone(session.value()))
+    }
+
+    async fn tmux<I, S>(&self, args: I) -> anyhow::Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = Command::new(&self.executable)
+            .arg("-L")
+            .arg(&self.socket)
+            .args(args)
+            .env_remove("TMUX")
+            .output()
+            .await?;
+
+        if output.status.success() {
+            return Ok(output);
+        }
+
+        let error = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux command failed: {}", error.trim());
+    }
+
+    async fn has_session(&self, target: &str) -> anyhow::Result<bool> {
+        let status = Command::new(&self.executable)
+            .arg("-L")
+            .arg(&self.socket)
+            .args(["has-session", "-t", target])
+            .env_remove("TMUX")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+
+        Ok(status.success())
+    }
+
+    async fn pane_dead(&self, target: &str) -> anyhow::Result<bool> {
+        let output = self
+            .tmux(["display-message", "-p", "-t", target, "#{pane_dead}"])
+            .await?;
+
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            value => anyhow::bail!("tmux returned an invalid pane state: {value}"),
+        }
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn path_string(path: &Path) -> anyhow::Result<&str> {
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("tmux does not support a non-UTF-8 temporary path"))
+    }
+
+    async fn write_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+
+        file.write_all(content).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn create_session(&self, session: &TmuxSession) -> anyhow::Result<()> {
+        let (executable, command_file, marker_file) = (
+            Self::shell_quote(Self::path_string(&self.executable)?),
+            Self::shell_quote(Self::path_string(&session.command_file)?),
+            Self::shell_quote(Self::path_string(&session.marker_file)?),
+        );
+        let (socket, channel, target) = (
+            Self::shell_quote(&self.socket),
+            Self::shell_quote(&session.channel),
+            Self::shell_quote(&session.target),
+        );
+        let worker = format!(
+            "shopt -s expand_aliases\n\
+             while {executable} -L {socket} wait-for {channel}; do\n\
+                 builtin source {command_file} || true\n\
+                 {executable} -L {socket} set-option -p -t {target} @h_done \"$(< {marker_file})\"\n\
+             done\n"
+        );
+        Self::write_file(&session.worker_file, worker.as_bytes()).await?;
+        Self::write_file(&session.command_file, &[]).await?;
+        Self::write_file(&session.marker_file, &[]).await?;
+        Self::write_file(&session.history_file, &[]).await?;
+
+        let (cwd, worker_file) = (
+            env::current_dir()?,
+            Self::shell_quote(Self::path_string(&session.worker_file)?),
+        );
+        let bootstrap = format!("exec bash --noprofile --norc {worker_file}");
+        self.tmux([
+            OsStr::new("new-session"),
+            OsStr::new("-d"),
+            OsStr::new("-s"),
+            OsStr::new(&session.target),
+            OsStr::new("-c"),
+            cwd.as_os_str(),
+            OsStr::new(&bootstrap),
+        ])
+        .await?;
+
+        let socket_path = self
+            .tmux(["display-message", "-p", "#{socket_path}"])
+            .await?;
+        let socket_path = String::from_utf8_lossy(&socket_path.stdout)
+            .trim()
+            .to_owned();
+        *self.socket_path.lock() = Some(PathBuf::from(socket_path));
+
+        let history_file = Self::shell_quote(Self::path_string(&session.history_file)?);
+        let pipe = format!("cat >> {history_file}");
+        let setup = async {
+            self.tmux([
+                "set-option",
+                "-w",
+                "-t",
+                &session.target,
+                "remain-on-exit",
+                "on",
+            ])
+            .await?;
+            self.tmux([
+                "set-option",
+                "-w",
+                "-t",
+                &session.target,
+                "history-limit",
+                TMUX_HISTORY_LIMIT,
+            ])
+            .await?;
+            self.tmux(["pipe-pane", "-t", &session.target, &pipe])
+                .await?;
+
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = setup {
+            let _ = self.tmux(["kill-session", "-t", &session.target]).await;
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    async fn start(&self, session: &mut TmuxSession, command: &str) -> anyhow::Result<()> {
+        let marker = Uuid::new_v4().simple().to_string();
+        Self::write_file(&session.command_file, command.as_bytes()).await?;
+        Self::write_file(&session.marker_file, marker.as_bytes()).await?;
+
+        let history_len = fs::metadata(&session.history_file).await?.len();
+        self.tmux(["set-option", "-p", "-t", &session.target, "@h_done", ""])
+            .await?;
+
+        session.offset = history_len;
+        session.marker = Some(marker);
+        session.active = true;
+
+        if let Err(error) = self.tmux(["wait-for", "-S", &session.channel]).await {
+            session.marker = None;
+            session.active = false;
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    async fn command_done(&self, session: &TmuxSession) -> anyhow::Result<bool> {
+        let Some(marker) = &session.marker else {
+            return Ok(!session.active);
+        };
+
+        if !self.has_session(&session.target).await? || self.pane_dead(&session.target).await? {
+            return Ok(true);
+        }
+
+        let output = self
+            .tmux(["show-options", "-p", "-v", "-t", &session.target, "@h_done"])
+            .await?;
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim() == marker)
+    }
+
+    async fn wait_for_completion(&self, session: &TmuxSession) -> anyhow::Result<()> {
+        while !self.command_done(session).await? {
+            sleep(TMUX_POLL_INTERVAL).await;
+        }
+
+        // Completion is signalled from the pane after the command returns.
+        // Give pipe-pane one scheduling interval to flush the preceding bytes.
+        sleep(TMUX_POLL_INTERVAL).await;
+        Ok(())
+    }
+
+    async fn read_new(session: &mut TmuxSession) -> anyhow::Result<String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&session.history_file)
+            .await?;
+
+        file.seek(SeekFrom::Start(session.offset)).await?;
+
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).await?;
+        session.offset = session.offset.saturating_add(content.len() as u64);
+
+        let content = strip_ansi_escapes::strip(content);
+        Ok(String::from_utf8_lossy(&content).into_owned())
+    }
+
+    async fn run_background(
+        &self,
+        session_id: Option<String>,
+        command: String,
+    ) -> anyhow::Result<BashToolOutput> {
+        if let Some(session_id) = session_id {
+            let Some(session) = self.session(&session_id) else {
+                return Ok(BashToolOutput::SessionNotExist);
+            };
+            let mut session = session.lock().await;
+
+            if !self.has_session(&session.target).await? || self.pane_dead(&session.target).await? {
+                return Ok(BashToolOutput::SessionNotExist);
+            }
+
+            if session.active {
+                if !self.command_done(&session).await? {
+                    return Ok(BashToolOutput::SessionBusy);
+                }
+
+                self.wait_for_completion(&session).await?;
+                session.active = false;
+                session.marker = None;
+            }
+
+            if self.pane_dead(&session.target).await? {
+                return Ok(BashToolOutput::SessionNotExist);
+            }
+
+            self.start(&mut session, &command).await?;
+            return Ok(BashToolOutput::Spawned { session_id });
+        }
+
+        let session_id = Uuid::new_v4().to_string();
+        let file_prefix = env::temp_dir().join(format!("h_tmux_{session_id}"));
+        let session = Arc::new(AsyncMutex::new(TmuxSession {
+            target: format!("h-{session_id}"),
+            channel: format!("h-command-{session_id}"),
+            worker_file: file_prefix.with_extension("worker.sh"),
+            command_file: file_prefix.with_extension("command.sh"),
+            marker_file: file_prefix.with_extension("marker"),
+            history_file: file_prefix.with_extension("log"),
+            offset: 0,
+            marker: None,
+            active: false,
+        }));
+
+        self.sessions
+            .insert(session_id.clone(), Arc::clone(&session));
+        *self.pending.lock() = Some(session_id.clone());
+
+        let result = {
+            let mut session = session.lock().await;
+
+            match self.create_session(&session).await {
+                Ok(()) => self.start(&mut session, &command).await,
+                Err(error) => Err(error),
+            }
+        };
+
+        {
+            let mut pending = self.pending.lock();
+            if pending.as_deref() == Some(&session_id) {
+                pending.take();
+            }
+        }
+
+        if let Err(error) = result {
+            let session = session.lock().await;
+            if self.has_session(&session.target).await.unwrap_or(false) {
+                let _ = self.tmux(["kill-session", "-t", &session.target]).await;
+            }
+            Self::cleanup_files(&session).await;
+            drop(session);
+
+            self.sessions.remove(&session_id);
+            return Err(error);
+        }
+
+        Ok(BashToolOutput::Spawned { session_id })
+    }
+
+    async fn view(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
+        let Some(session) = self.session(&session_id) else {
+            return Ok(BashToolOutput::SessionNotExist);
+        };
+        let mut session = session.lock().await;
+
+        if !session.active {
+            return Ok(BashToolOutput::NoBusyCommand);
+        }
+
+        let output = Self::read_new(&mut session).await?;
+        let output = truncate_session_output(
+            output,
+            &session.history_file,
+            "to find all inputs and outputs of the session",
+        );
+
+        Ok(BashToolOutput::Output { output })
+    }
+
+    async fn wait(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
+        let Some(session) = self.session(&session_id) else {
+            return Ok(BashToolOutput::SessionNotExist);
+        };
+        let mut session = session.lock().await;
+
+        if !session.active {
+            return Ok(BashToolOutput::NoBusyCommand);
+        }
+
+        self.wait_for_completion(&session).await?;
+
+        let output = Self::read_new(&mut session).await?;
+        let output = truncate_session_output(
+            output,
+            &session.history_file,
+            "to find all inputs and outputs",
+        );
+
+        session.active = false;
+        session.marker = None;
+        Ok(BashToolOutput::Output { output })
+    }
+
+    async fn terminate(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
+        let Some(session) = self.session(&session_id) else {
+            return Ok(BashToolOutput::SessionNotExist);
+        };
+        let mut session = session.lock().await;
+
+        if !session.active || self.command_done(&session).await? {
+            session.active = false;
+            session.marker = None;
+            return Ok(BashToolOutput::NoBusyCommand);
+        }
+
+        self.tmux(["send-keys", "-t", &session.target, "C-c"])
+            .await?;
+
+        let completed = timeout(TMUX_TERMINATE_TIMEOUT, self.wait_for_completion(&session)).await;
+        if completed.is_err() {
+            self.tmux(["kill-session", "-t", &session.target]).await?;
+        } else {
+            completed??;
+        }
+
+        session.active = false;
+        session.marker = None;
+        Ok(BashToolOutput::Terminated)
+    }
+
+    async fn log_path(&self, session_id: String) -> BashToolOutput {
+        let Some(session) = self.session(&session_id) else {
+            return BashToolOutput::SessionNotExist;
+        };
+        let session = session.lock().await;
+
+        BashToolOutput::FilePath {
+            path: session.history_file.display().to_string(),
+        }
+    }
+
+    async fn send(&self, session_id: String, input: String) -> anyhow::Result<BashToolOutput> {
+        let Some(session) = self.session(&session_id) else {
+            return Ok(BashToolOutput::SessionNotExist);
+        };
+        let session = session.lock().await;
+
+        if !session.active || self.command_done(&session).await? {
+            return Ok(BashToolOutput::NoBusyCommand);
+        }
+
+        let buffer = format!("h-input-{}", Uuid::new_v4().simple());
+        let mut process = Command::new(&self.executable)
+            .arg("-L")
+            .arg(&self.socket)
+            .args(["load-buffer", "-b", &buffer, "-"])
+            .env_remove("TMUX")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = process
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("tmux input pipe was not created"))?;
+
+        stdin.write_all(input.as_bytes()).await?;
+        drop(stdin);
+
+        let output = process.wait_with_output().await?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux command failed: {}", error.trim());
+        }
+
+        self.tmux(["paste-buffer", "-d", "-b", &buffer, "-t", &session.target])
+            .await?;
+        Ok(BashToolOutput::Sent)
+    }
+
+    async fn cleanup_files(session: &TmuxSession) {
+        for path in [
+            &session.worker_file,
+            &session.command_file,
+            &session.marker_file,
+            &session.history_file,
+        ] {
+            let _ = fs::remove_file(path).await;
+        }
+    }
+
+    async fn call(&self, args: BashToolArgs) -> anyhow::Result<BashToolOutput> {
+        match args {
+            BashToolArgs::RunBackground {
+                command,
+                session_id,
+            } => self.run_background(session_id, command).await,
+            BashToolArgs::LogFilePath { session_id } => Ok(self.log_path(session_id).await),
+            BashToolArgs::Send { session_id, input } => self.send(session_id, input).await,
+            BashToolArgs::View { session_id } => self.view(session_id).await,
+            BashToolArgs::Wait { session_id } => self.wait(session_id).await,
+            BashToolArgs::Terminate { session_id } => self.terminate(session_id).await,
+            BashToolArgs::RunBlocking { .. } => unreachable!("blocking calls bypass the backend"),
+        }
+    }
+
+    async fn cancel(&self, args: BashToolArgs) -> anyhow::Result<()> {
+        let (session_id, was_pending) = match args {
+            BashToolArgs::RunBackground {
+                session_id: Some(session_id),
+                ..
+            }
+            | BashToolArgs::Wait { session_id } => (Some(session_id), false),
+            BashToolArgs::RunBackground {
+                session_id: None, ..
+            } => (self.pending.lock().take(), true),
+            _ => (None, false),
+        };
+
+        if let Some(session_id) = session_id {
+            if was_pending && let Some((_, session)) = self.sessions.remove(&session_id) {
+                let session = session.lock().await;
+                if self.has_session(&session.target).await? {
+                    let _ = self.tmux(["kill-session", "-t", &session.target]).await;
+                }
+                Self::cleanup_files(&session).await;
+            } else {
+                let _ = self.terminate(session_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for TmuxBashTool {
+    fn drop(&mut self) {
+        let _ = StdCommand::new(&self.executable)
+            .arg("-L")
+            .arg(&self.socket)
+            .arg("kill-server")
+            .env_remove("TMUX")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        if let Some(socket_path) = self.socket_path.get_mut().take() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+
+        for session in &self.sessions {
+            if let Ok(session) = session.value().try_lock() {
+                for path in [
+                    &session.worker_file,
+                    &session.command_file,
+                    &session.marker_file,
+                    &session.history_file,
+                ] {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
+enum BashBackend {
+    Pty(PtyBashTool),
+    Tmux(TmuxBashTool),
+}
+
+pub struct BashTool {
+    backend: BashBackend,
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self::with_tmux_available(TmuxBashTool::available())
+    }
+
+    fn with_tmux_available(available: bool) -> Self {
+        let backend = if available {
+            BashBackend::Tmux(TmuxBashTool::new())
+        } else {
+            BashBackend::Pty(PtyBashTool::new())
+        };
+        let name = match &backend {
+            BashBackend::Pty(_) => "pty",
+            BashBackend::Tmux(_) => "tmux",
+        };
+
+        tracing::info!(event = "tool.bash.backend.selected", backend = name);
+        Self { backend }
+    }
+
+    async fn call_backend(&self, args: BashToolArgs) -> anyhow::Result<BashToolOutput> {
+        match &self.backend {
+            BashBackend::Pty(tool) => tool.call(args).await,
+            BashBackend::Tmux(tool) => tool.call(args).await,
+        }
+    }
+
+    async fn cancel_backend(&self, args: BashToolArgs) -> anyhow::Result<()> {
+        match &self.backend {
+            BashBackend::Pty(tool) => tool.cancel(args).await,
+            BashBackend::Tmux(tool) => tool.cancel(args).await,
+        }
+    }
+}
+
+async fn run_blocking(command: String) -> anyhow::Result<BashToolOutput> {
+    if command.split_whitespace().next().is_none() {
+        anyhow::bail!("Empty command");
+    }
+
+    let mut process = Command::new("bash");
+    process.arg("-c").arg(command).kill_on_drop(true);
+
+    let output = process.output().await?;
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let (stdout, stderr) = (
+        write_temp_and_mention(stdout).await?,
+        write_temp_and_mention(stderr).await?,
+    );
+
+    Ok(BashToolOutput::RanBlocking { stdout, stderr })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -449,36 +1115,19 @@ impl TypedTool for BashTool {
 
     async fn call(&self, args: Self::Arguments) -> anyhow::Result<Self::Output> {
         match args {
-            BashToolArgs::RunBlocking { command } => self.run_blocking(command).await,
-            BashToolArgs::RunBackground {
-                command,
-                session_id,
-            } => self.run_background(session_id, command).await,
-            BashToolArgs::LogFilePath { session_id } => Ok(self.log_path(session_id).await),
-            BashToolArgs::Send { session_id, input } => self.send(session_id, input).await,
-            BashToolArgs::View { session_id } => self.view(session_id).await,
-            BashToolArgs::Wait { session_id } => self.wait(session_id).await,
-            BashToolArgs::Terminate { session_id } => self.terminate(session_id).await,
+            BashToolArgs::RunBlocking { command } => run_blocking(command).await,
+            args => self.call_backend(args).await,
         }
     }
 
     async fn cancel(&self, args: Self::Arguments) -> anyhow::Result<()> {
-        let session_id = match args {
-            BashToolArgs::RunBackground {
-                session_id: Some(session_id),
-                ..
-            }
-            | BashToolArgs::Wait { session_id } => Some(session_id),
-            _ => None,
-        };
-
-        if let Some(session_id) = session_id {
-            let _ = self.terminate(session_id).await?;
+        if matches!(&args, BashToolArgs::RunBlocking { .. }) {
+            // A blocking command is owned by its call future and configured
+            // with `kill_on_drop`, so dropping that future is sufficient.
+            return Ok(());
         }
 
-        // A blocking command is owned by its call future and configured with
-        // `kill_on_drop`, so dropping that future is its cancellation hook.
-        Ok(())
+        self.cancel_backend(args).await
     }
 }
 
@@ -708,6 +1357,43 @@ impl Presenter for BashPresenter {
 mod tests {
     use super::*;
 
+    fn tmux_tool() -> Option<TmuxBashTool> {
+        TmuxBashTool::available()
+            .then(|| TmuxBashTool::with_socket(format!("h-bash-test-{}", Uuid::new_v4().simple())))
+    }
+
+    fn spawned(output: BashToolOutput) -> String {
+        match output {
+            BashToolOutput::Spawned { session_id } => session_id,
+            output => panic!("expected a spawned session, got {output:?}"),
+        }
+    }
+
+    fn output(output: BashToolOutput) -> String {
+        match output {
+            BashToolOutput::Output { output } => output,
+            output => panic!("expected session output, got {output:?}"),
+        }
+    }
+
+    async fn wait_until_done(tool: &TmuxBashTool, session_id: &str) {
+        let session = tool.session(session_id).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let session = session.lock().await;
+                if tool.command_done(&session).await.unwrap() {
+                    break;
+                }
+                drop(session);
+
+                sleep(TMUX_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the tmux command should finish");
+    }
+
     #[test]
     fn output_preview_ends_on_a_unicode_boundary() {
         let output = "界".repeat(200);
@@ -716,5 +1402,237 @@ mod tests {
         assert!(end <= MAX_INLINE_OUTPUT_BYTES);
         assert!(output.is_char_boundary(end));
         assert_eq!(end, 510);
+    }
+
+    #[test]
+    fn bash_tool_selects_the_available_backend() {
+        assert!(matches!(
+            BashTool::with_tmux_available(true).backend,
+            BashBackend::Tmux(_)
+        ));
+        assert!(matches!(
+            BashTool::with_tmux_available(false).backend,
+            BashBackend::Pty(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_waits_for_output_and_reuses_a_finished_session() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(None, "printf first".to_owned())
+                .await
+                .unwrap(),
+        );
+        let first = output(tool.wait(session_id.clone()).await.unwrap());
+        assert_eq!(first, "first");
+
+        let reused = spawned(
+            tool.run_background(Some(session_id.clone()), "printf second".to_owned())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(reused, session_id);
+
+        let second = output(tool.wait(session_id).await.unwrap());
+        assert_eq!(second, "second");
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_preserves_shell_state_between_commands() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let directory = env::temp_dir();
+        let command = format!(
+            "cd {}; export H_TMUX_TEST_STATE=preserved",
+            TmuxBashTool::shell_quote(directory.to_str().unwrap())
+        );
+        let session_id = spawned(tool.run_background(None, command).await.unwrap());
+        assert_eq!(output(tool.wait(session_id.clone()).await.unwrap()), "");
+
+        let session_id = spawned(
+            tool.run_background(
+                Some(session_id),
+                "printf '%s:%s' \"$PWD\" \"$H_TMUX_TEST_STATE\"".to_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = output(tool.wait(session_id).await.unwrap());
+
+        assert_eq!(state, format!("{}:preserved", directory.display()));
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_keeps_historical_output_in_its_log() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(None, "printf first".to_owned())
+                .await
+                .unwrap(),
+        );
+        tool.wait(session_id.clone()).await.unwrap();
+        let session_id = spawned(
+            tool.run_background(Some(session_id), "printf second".to_owned())
+                .await
+                .unwrap(),
+        );
+        tool.wait(session_id.clone()).await.unwrap();
+
+        let BashToolOutput::FilePath { path } = tool.log_path(session_id).await else {
+            panic!("expected a log file path");
+        };
+        let history = fs::read_to_string(path).await.unwrap();
+
+        assert!(history.contains("first"));
+        assert!(history.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_notices_completion_without_an_explicit_wait() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(None, "printf first".to_owned())
+                .await
+                .unwrap(),
+        );
+        wait_until_done(&tool, &session_id).await;
+
+        let reused = tool
+            .run_background(Some(session_id.clone()), "printf second".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(spawned(reused), session_id);
+        assert_eq!(output(tool.wait(session_id).await.unwrap()), "second");
+    }
+
+    #[tokio::test]
+    async fn bash_tool_dispatches_background_calls_to_tmux() {
+        let Some(backend) = tmux_tool() else {
+            return;
+        };
+        let tool = BashTool {
+            backend: BashBackend::Tmux(backend),
+        };
+
+        let session_id = spawned(
+            TypedTool::call(
+                &tool,
+                BashToolArgs::RunBackground {
+                    command: "printf dispatched".to_owned(),
+                    session_id: None,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let waited = TypedTool::call(&tool, BashToolArgs::Wait { session_id })
+            .await
+            .unwrap();
+
+        assert_eq!(output(waited), "dispatched");
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_sends_literal_input_to_a_running_command() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(
+                None,
+                "read value; printf 'received:%s' \"$value\"".to_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        tool.send(session_id.clone(), "hello world\n".to_owned())
+            .await
+            .unwrap();
+
+        let waited = tokio::time::timeout(Duration::from_secs(2), tool.wait(session_id))
+            .await
+            .expect("the newline should submit the input")
+            .unwrap();
+        assert!(output(waited).contains("received:hello world"));
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_terminates_the_session() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(None, "sleep 30".to_owned())
+                .await
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            tool.terminate(session_id.clone()).await.unwrap(),
+            BashToolOutput::Terminated
+        ));
+        assert!(matches!(
+            tool.view(session_id).await.unwrap(),
+            BashToolOutput::NoBusyCommand
+        ));
+    }
+
+    #[tokio::test]
+    async fn tmux_backend_rejects_a_second_command_while_busy() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(None, "sleep 30".to_owned())
+                .await
+                .unwrap(),
+        );
+        let second = tool
+            .run_background(Some(session_id.clone()), "printf second".to_owned())
+            .await
+            .unwrap();
+
+        assert!(matches!(second, BashToolOutput::SessionBusy));
+        tool.terminate(session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_tmux_wait_terminates_its_session() {
+        let Some(tool) = tmux_tool() else {
+            return;
+        };
+
+        let session_id = spawned(
+            tool.run_background(None, "sleep 30".to_owned())
+                .await
+                .unwrap(),
+        );
+
+        tool.cancel(BashToolArgs::Wait {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            tool.view(session_id).await.unwrap(),
+            BashToolOutput::NoBusyCommand
+        ));
     }
 }
