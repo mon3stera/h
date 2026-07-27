@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent::Agent,
     bridge::UiBridge,
+    config::{Config, ProviderConfig},
     event::AgentCommand,
     provider::{
         Provider,
@@ -18,6 +19,7 @@ mod agent;
 mod bridge;
 mod bus;
 mod cli;
+mod config;
 mod context;
 mod event;
 mod logger;
@@ -46,7 +48,28 @@ async fn main() -> anyhow::Result<()> {
 /// Runs one session to completion. `id` names an archived session to pick up
 /// where it left off; `None` starts a fresh one.
 async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
-    let provider = OpenAIProvider::from_config(OpenAIProviderConfig::from_env()?);
+    let config = Config::load().await?;
+    let ProviderConfig::OpenAI(openai) = config.provider();
+
+    let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
+        openai.base_url(),
+        openai.bearer_token(),
+        config.model(),
+        config.reasoning_effort(),
+    ));
+
+    tracing::info!(
+        event = "config.loaded",
+        provider_id = config.provider_id(),
+        provider_name = openai.name(),
+        model = config.model(),
+        context_window = config.context_window(),
+        auto_compact_token_limit = config.auto_compact_token_limit(),
+    );
+
+    // The provider owns its copied credential now; do not keep a second copy
+    // in the parsed configuration for the lifetime of the session.
+    drop(config);
 
     let (bridge, ui_request_rx) = UiBridge::new();
 

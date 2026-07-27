@@ -10,7 +10,8 @@ use async_openai::{
         FunctionTool, FunctionToolCall, FunctionToolCallOutputResource,
         InputItem::{self, EasyMessage},
         Item, MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning,
-        ReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool, WebSearchTool,
+        ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool,
+        WebSearchTool,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -18,50 +19,34 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
 use crate::{
+    config::ReasoningEffort,
     context::{Context, Message},
     event::{CompletedReason, ProviderSignal},
     provider::{Provider, ProviderEventStream},
     tool::{ToolCall, ToolCallResult, ToolDefinition},
 };
 
-macro_rules! expect_env {
-    ($value:expr) => {
-        std::env::var($value)?
-    };
-}
-
-const REASONING_EFFORT_VALUES: &str = "none, minimal, low, medium, high, xhigh";
-
-fn parse_reasoning_effort(value: &str) -> anyhow::Result<ReasoningEffort> {
-    match value {
-        "none" => Ok(ReasoningEffort::None),
-        "minimal" => Ok(ReasoningEffort::Minimal),
-        "low" => Ok(ReasoningEffort::Low),
-        "medium" => Ok(ReasoningEffort::Medium),
-        "high" => Ok(ReasoningEffort::High),
-        "xhigh" => Ok(ReasoningEffort::Xhigh),
-        _ => anyhow::bail!(
-            "invalid OPENAI_REASONING_EFFORT {value:?}; expected one of: {REASONING_EFFORT_VALUES}"
-        ),
-    }
-}
-
-fn reasoning_effort_from_env() -> anyhow::Result<Option<ReasoningEffort>> {
-    match std::env::var("OPENAI_REASONING_EFFORT") {
-        Ok(value) => parse_reasoning_effort(&value).map(Some),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(anyhow::anyhow!("OPENAI_REASONING_EFFORT: {error}")),
-    }
-}
-
-fn reasoning_effort_name(effort: &ReasoningEffort) -> &'static str {
+fn reasoning_effort_name(effort: &OpenAIReasoningEffort) -> &'static str {
     match effort {
-        ReasoningEffort::None => "none",
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh => "xhigh",
+        OpenAIReasoningEffort::None => "none",
+        OpenAIReasoningEffort::Minimal => "minimal",
+        OpenAIReasoningEffort::Low => "low",
+        OpenAIReasoningEffort::Medium => "medium",
+        OpenAIReasoningEffort::High => "high",
+        OpenAIReasoningEffort::Xhigh => "xhigh",
+    }
+}
+
+impl From<ReasoningEffort> for OpenAIReasoningEffort {
+    fn from(value: ReasoningEffort) -> Self {
+        match value {
+            ReasoningEffort::None => Self::None,
+            ReasoningEffort::Minimal => Self::Minimal,
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::High => Self::High,
+            ReasoningEffort::Xhigh | ReasoningEffort::Max => Self::Xhigh,
+        }
     }
 }
 
@@ -78,56 +63,24 @@ fn is_ignorable_stream_event(error: &OpenAIError) -> bool {
 
 pub struct OpenAIProviderConfig {
     base_url: String,
-    api_key: String,
+    bearer_token: String,
     model: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: OpenAIReasoningEffort,
 }
 
 impl OpenAIProviderConfig {
-    pub fn new() -> Self {
-        Self {
-            base_url: String::new(),
-            api_key: String::new(),
-            model: String::new(),
-            reasoning_effort: None,
-        }
-    }
-
-    pub fn with_base_url(self, base_url: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        bearer_token: impl Into<String>,
+        model: impl Into<String>,
+        reasoning_effort: ReasoningEffort,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
-            ..self
-        }
-    }
-
-    pub fn with_api_key(self, api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            ..self
-        }
-    }
-
-    pub fn with_model(self, model: impl Into<String>) -> Self {
-        Self {
+            bearer_token: bearer_token.into(),
             model: model.into(),
-            ..self
+            reasoning_effort: reasoning_effort.into(),
         }
-    }
-
-    pub fn with_reasoning_effort(self, reasoning_effort: ReasoningEffort) -> Self {
-        Self {
-            reasoning_effort: Some(reasoning_effort),
-            ..self
-        }
-    }
-
-    pub fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
-            base_url: expect_env!("OPENAI_BASE_URL"),
-            api_key: expect_env!("OPENAI_API_KEY"),
-            model: expect_env!("OPENAI_MODEL"),
-            reasoning_effort: reasoning_effort_from_env()?,
-        })
     }
 }
 
@@ -141,7 +94,7 @@ impl OpenAIProvider {
     pub fn from_config(config: OpenAIProviderConfig) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_base(&config.base_url)
-            .with_api_key(&config.api_key);
+            .with_api_key(&config.bearer_token);
 
         let client = Client::with_config(client_config);
 
@@ -164,9 +117,7 @@ impl OpenAIProvider {
             .tools(self.tools.clone())
             .stream(true);
 
-        if let Some(effort) = self.config.reasoning_effort.clone() {
-            request.reasoning(Reasoning::from(effort));
-        }
+        request.reasoning(Reasoning::from(self.config.reasoning_effort.clone()));
 
         Ok(request.build()?)
     }
@@ -868,10 +819,7 @@ impl Provider for OpenAIProvider {
     }
 
     fn thinking_effort(&self) -> Option<&str> {
-        self.config
-            .reasoning_effort
-            .as_ref()
-            .map(reasoning_effort_name)
+        Some(reasoning_effort_name(&self.config.reasoning_effort))
     }
 
     fn define_tools(&mut self, specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
@@ -1014,45 +962,35 @@ mod tests {
     };
     use serde_json::json;
 
-    fn provider(reasoning_effort: Option<ReasoningEffort>) -> OpenAIProvider {
-        let mut config = OpenAIProviderConfig::new()
-            .with_base_url("https://example.com")
-            .with_api_key("secret")
-            .with_model("gpt-5.6-sol");
-        if let Some(reasoning_effort) = reasoning_effort {
-            config = config.with_reasoning_effort(reasoning_effort);
-        }
-
-        OpenAIProvider::from_config(config)
+    fn provider(reasoning_effort: ReasoningEffort) -> OpenAIProvider {
+        OpenAIProvider::from_config(OpenAIProviderConfig::new(
+            "https://example.com",
+            "secret",
+            "gpt-5.6-sol",
+            reasoning_effort,
+        ))
     }
 
     #[test]
-    fn parses_supported_reasoning_efforts() {
-        for (name, expected) in [
-            ("none", ReasoningEffort::None),
-            ("minimal", ReasoningEffort::Minimal),
-            ("low", ReasoningEffort::Low),
-            ("medium", ReasoningEffort::Medium),
-            ("high", ReasoningEffort::High),
-            ("xhigh", ReasoningEffort::Xhigh),
+    fn maps_configured_reasoning_efforts() {
+        for (configured, effective) in [
+            (ReasoningEffort::None, "none"),
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "xhigh"),
         ] {
-            assert_eq!(parse_reasoning_effort(name).unwrap(), expected);
-            assert_eq!(reasoning_effort_name(&expected), name);
-        }
-    }
+            let provider = provider(configured);
 
-    #[test]
-    fn rejects_invalid_reasoning_efforts() {
-        for value in ["", "max", "HIGH", "unknown"] {
-            let error = parse_reasoning_effort(value).unwrap_err().to_string();
-            assert!(error.contains("OPENAI_REASONING_EFFORT"));
-            assert!(error.contains(REASONING_EFFORT_VALUES));
+            assert_eq!(provider.thinking_effort(), Some(effective));
         }
     }
 
     #[test]
     fn request_and_accessors_use_configured_reasoning_effort() {
-        let provider = provider(Some(ReasoningEffort::High));
+        let provider = provider(ReasoningEffort::High);
         let request = provider.build_request(Vec::new()).unwrap();
         let value = serde_json::to_value(request).unwrap();
 
@@ -1064,13 +1002,12 @@ mod tests {
     }
 
     #[test]
-    fn request_omits_reasoning_when_effort_is_not_configured() {
-        let provider = provider(None);
+    fn max_reasoning_effort_is_sent_as_xhigh() {
+        let provider = provider(ReasoningEffort::Max);
         let request = provider.build_request(Vec::new()).unwrap();
         let value = serde_json::to_value(request).unwrap();
 
-        assert_eq!(provider.thinking_effort(), None);
-        assert!(value.get("reasoning").is_none());
+        assert_eq!(value["reasoning"]["effort"], "xhigh");
     }
 
     #[test]
