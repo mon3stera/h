@@ -4,7 +4,7 @@ use ratatui::{
 };
 
 use crate::{
-    tui::{banner, markdown, text, tool},
+    tui::{banner, format_tokens, markdown, text, tool},
     ui::markdown::parse_markdown,
     ui::{RenderGroup, RenderUnit, ViewState, explore_presentation, group_units},
 };
@@ -114,10 +114,16 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
                 RenderUnit::Text(text) => response(&parse_markdown(text), width),
                 RenderUnit::ParsedMarkdown(blocks) => response(blocks, width),
                 RenderUnit::Prompt(text) => prompt(text, width),
-                RenderUnit::Done(elapsed) => vec![Line::from(Span::styled(
-                    format!("{DONE_MARKER}Done for {}s", elapsed.as_secs()),
-                    Style::default().fg(Color::DarkGray),
-                ))],
+                RenderUnit::Done(elapsed, tokens) => {
+                    let tokens = tokens
+                        .map(|tokens| format!(" ↓ {}", format_tokens(tokens)))
+                        .unwrap_or_default();
+
+                    vec![Line::from(Span::styled(
+                        format!("{DONE_MARKER}Done for {}s{tokens}", elapsed.as_secs()),
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                }
                 RenderUnit::Err(error) => vec![Line::from(ratatui::text::Span::styled(
                     format!("✖ {error}"),
                     ratatui::style::Style::default().fg(ratatui::style::Color::Red),
@@ -221,10 +227,9 @@ mod tests {
 
     fn state(units: Vec<RenderUnit>) -> ViewState {
         ViewState {
-            startup: None,
             units,
-            turn_in_progress: false,
             revision: 1,
+            ..ViewState::default()
         }
     }
 
@@ -350,13 +355,16 @@ mod tests {
     fn a_finished_turn_is_summarised_in_grey() {
         let mut transcript = Transcript::default();
         transcript.sync(
-            &state(vec![RenderUnit::Done(std::time::Duration::from_secs(48))]),
+            &state(vec![RenderUnit::Done(
+                std::time::Duration::from_secs(48),
+                Some(5_500),
+            )]),
             40,
         );
 
         let lines = transcript.visible(10);
 
-        assert_eq!(texts(lines), ["❃ Done for 48s"]);
+        assert_eq!(texts(lines), ["❃ Done for 48s ↓ 5.5K"]);
         assert_eq!(
             lines[0].spans[0].style.fg,
             Some(Color::DarkGray),
@@ -368,9 +376,10 @@ mod tests {
     fn a_summary_rounds_down_to_whole_seconds() {
         let mut transcript = Transcript::default();
         transcript.sync(
-            &state(vec![RenderUnit::Done(std::time::Duration::from_millis(
-                1_900,
-            ))]),
+            &state(vec![RenderUnit::Done(
+                std::time::Duration::from_millis(1_900),
+                None,
+            )]),
             40,
         );
 

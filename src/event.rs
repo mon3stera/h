@@ -14,6 +14,14 @@ pub enum CompletedReason {
     NeedCall,
 }
 
+/// Provider-reported usage for one completed request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: usize,
+    pub output: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TextDelta(String),
@@ -36,6 +44,12 @@ pub enum AgentViewEvent {
     TextDelta(String),
     Tool(Presentation),
     TurnStart,
+    /// `context` is the locally tokenized provider-facing history, while
+    /// `turn` accumulates provider-reported usage for the current user turn.
+    TokenUsage {
+        context: Option<usize>,
+        turn: Option<usize>,
+    },
     /// `completed` is true when the turn ended because the model finished
     /// speaking, rather than because it failed part way through.
     TurnFinished {
@@ -85,7 +99,10 @@ pub enum ProviderSignal {
     TextDelta(String),
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolCallResult),
-    Completed(CompletedReason),
+    Completed {
+        reason: CompletedReason,
+        usage: Option<TokenUsage>,
+    },
     Unsupported,
 }
 
@@ -95,7 +112,7 @@ impl From<ProviderSignal> for AgentEvent {
             ProviderSignal::TextDelta(delta) => AgentEvent::TextDelta(delta),
             ProviderSignal::ToolCallStarted(call) => AgentEvent::ToolCallStarted(call),
             ProviderSignal::ToolCallCompleted(result) => AgentEvent::ToolCallCompleted(result),
-            ProviderSignal::Completed(_) => AgentEvent::Completed,
+            ProviderSignal::Completed { .. } => AgentEvent::Completed,
             ProviderSignal::Unsupported => AgentEvent::Unsupported,
         }
     }

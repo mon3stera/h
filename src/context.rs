@@ -201,6 +201,9 @@ pub struct Context {
     id: String,
     buf: String,
     histories: Vec<Message>,
+    /// The latest tokenized size of the provider-facing history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_count: Option<usize>,
     #[serde(default)]
     tool_compaction: ToolCompaction,
 }
@@ -224,6 +227,8 @@ struct FrozenToolRun {
 struct PersistHistories {
     id: String,
     histories: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_count: Option<usize>,
     #[serde(default)]
     tool_compaction: ToolCompaction,
 }
@@ -342,6 +347,7 @@ impl Context {
             id: Uuid::new_v4().to_string(),
             buf: String::new(),
             histories: Vec::new(),
+            token_count: None,
             tool_compaction: ToolCompaction::default(),
         }
     }
@@ -377,6 +383,14 @@ impl Context {
 
     pub fn histories(&self) -> &[Message] {
         &self.histories
+    }
+
+    pub fn token_count(&self) -> Option<usize> {
+        self.token_count
+    }
+
+    pub fn set_token_count(&mut self, count: Option<usize>) {
+        self.token_count = count;
     }
 
     /// Provider-facing projection. Frozen tool runs become compact assistant
@@ -575,6 +589,7 @@ impl Context {
         PersistHistories {
             id: self.id.clone(),
             histories: self.histories.clone(),
+            token_count: self.token_count,
             tool_compaction: self.tool_compaction.clone(),
         }
     }
@@ -637,6 +652,7 @@ impl Context {
             id: deserialized.id,
             buf: String::new(),
             histories: deserialized.histories,
+            token_count: deserialized.token_count,
             tool_compaction: deserialized.tool_compaction,
         })
     }
@@ -822,6 +838,7 @@ mod tests {
             id: id.to_owned(),
             buf: String::new(),
             histories: vec![Message::User(prompt.to_owned())],
+            token_count: None,
             tool_compaction: ToolCompaction::default(),
         }
     }
@@ -829,7 +846,8 @@ mod tests {
     #[tokio::test]
     async fn archived_histories_survive_a_resume() {
         let archive = TempArchive::new();
-        let context = context_with_prompt("session-1", "teach me borrow checking");
+        let mut context = context_with_prompt("session-1", "teach me borrow checking");
+        context.set_token_count(Some(2_400));
 
         context.archive_in(&archive.path).await.unwrap();
         let resumed = Context::resume_in(&archive.path, "session-1")
@@ -837,6 +855,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resumed.id, "session-1");
+        assert_eq!(resumed.token_count(), Some(2_400));
         assert!(
             matches!(
                 resumed.histories.as_slice(),
@@ -845,6 +864,17 @@ mod tests {
             "unexpected histories: {:?}",
             resumed.histories.len()
         );
+    }
+
+    #[test]
+    fn archives_without_a_token_count_remain_readable() {
+        let persisted = serde_json::from_value::<PersistHistories>(json!({
+            "id": "older-session",
+            "histories": []
+        }))
+        .unwrap();
+
+        assert_eq!(persisted.token_count, None);
     }
 
     #[test]
@@ -1071,6 +1101,7 @@ mod tests {
                 },
                 Message::User("second".to_owned()),
             ],
+            token_count: None,
             tool_compaction: ToolCompaction::default(),
         };
 
@@ -1086,6 +1117,7 @@ mod tests {
                 Message::System("global prompts".to_owned()),
                 Message::System("workspace info".to_owned()),
             ],
+            token_count: None,
             tool_compaction: ToolCompaction::default(),
         };
 

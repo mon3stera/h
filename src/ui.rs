@@ -35,7 +35,9 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
         match value {
             AgentViewEvent::Startup { .. } => anyhow::bail!("must update startup state"),
             AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
-            AgentViewEvent::TurnStart | AgentViewEvent::TurnFinished { .. } => {
+            AgentViewEvent::TurnStart
+            | AgentViewEvent::TokenUsage { .. }
+            | AgentViewEvent::TurnFinished { .. } => {
                 anyhow::bail!("should not be rendered")
             }
             AgentViewEvent::Prompt(prompt) => Ok(RenderUnit::Prompt(prompt)),
@@ -132,9 +134,9 @@ fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit
 #[derive(Debug, Clone)]
 pub enum RenderUnit {
     Text(String),
-    /// How long a finished turn took, kept in the transcript so the record of a
-    /// long wait survives scrolling away from it.
-    Done(Duration),
+    /// Duration and provider-reported token usage kept in the transcript so the
+    /// turn summary survives scrolling away from it.
+    Done(Duration, Option<usize>),
     ParsedMarkdown(Vec<MarkdownBlock>),
     Tool(Presentation),
     Prompt(String),
@@ -153,6 +155,8 @@ pub struct ViewState {
     pub startup: Option<StartupInfo>,
     pub units: Vec<RenderUnit>,
     pub turn_in_progress: bool,
+    pub context_tokens: Option<usize>,
+    pub turn_tokens: Option<usize>,
     /// Bumped on every change, so a renderer can tell whether its cached lines
     /// are still current without comparing the units themselves.
     pub revision: u64,
@@ -174,6 +178,12 @@ pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow
         }
         AgentViewEvent::TurnStart => {
             state.turn_in_progress = true;
+            state.turn_tokens = None;
+            Ok(())
+        }
+        AgentViewEvent::TokenUsage { context, turn } => {
+            state.context_tokens = context;
+            state.turn_tokens = turn;
             Ok(())
         }
         AgentViewEvent::TurnFinished { .. } => {
@@ -599,6 +609,28 @@ mod view_event_tests {
                 thinking_effort: Some("xhigh".to_owned()),
             })
         );
+    }
+
+    #[test]
+    fn token_usage_updates_the_current_context_and_running_turn() {
+        let mut state = ViewState::default();
+
+        reduce_view_event(&mut state, AgentViewEvent::TurnStart).unwrap();
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TokenUsage {
+                context: Some(2_400),
+                turn: Some(5_500),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.context_tokens, Some(2_400));
+        assert_eq!(state.turn_tokens, Some(5_500));
+
+        reduce_view_event(&mut state, AgentViewEvent::TurnStart).unwrap();
+        assert_eq!(state.turn_tokens, None, "a new turn starts a fresh total");
+        assert_eq!(state.context_tokens, Some(2_400));
     }
 
     #[test]

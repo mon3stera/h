@@ -57,14 +57,15 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         config.model(),
         config.reasoning_effort(),
     ));
-    let tool_summary_turn_interval = config.tool_summary_turn_interval();
+    let (context_window, tool_summary_turn_interval) =
+        (config.context_window(), config.tool_summary_turn_interval());
 
     tracing::info!(
         event = "config.loaded",
         provider_id = config.provider_id(),
         provider_name = openai.name(),
         model = config.model(),
-        context_window = config.context_window(),
+        context_window,
         auto_compact_token_limit = config.auto_compact_token_limit(),
         tool_summary_turn_interval = tool_summary_turn_interval.get(),
     );
@@ -112,7 +113,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
 
     let worker = tokio::spawn(run_agent(agent, command_rx));
 
-    tui::app::run(commands, bus_rx, ui_request_rx, history).await?;
+    tui::app::run(commands, bus_rx, ui_request_rx, history, context_window).await?;
 
     tracing::info!(event = "app.ui.closed");
 

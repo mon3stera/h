@@ -14,7 +14,7 @@ use ratatui::{
         },
         execute,
     },
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -28,6 +28,7 @@ use crate::{
     event::{AgentCommand, AgentViewEvent, AskAnswer, UiRequest},
     tui::{
         choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
+        format_tokens,
         input::Input,
         transcript::Transcript,
     },
@@ -56,6 +57,8 @@ const WHEEL_STEP: isize = 3;
 /// The two rules and the question line around a set of options.
 const ASK_FRAME: u16 = 3;
 
+const STATUS_HEIGHT: u16 = 1;
+
 /// Runs the conversation view until the user quits.
 ///
 /// Returns once Ctrl+C is pressed or the agent's event channel closes, at which
@@ -67,9 +70,18 @@ pub async fn run(
     mut requests: Receiver<UiRequest>,
     // What a resumed session already asked, so recall reaches back into it.
     history: Vec<String>,
+    context_window: usize,
 ) -> anyhow::Result<()> {
     let mut terminal = enter()?;
-    let outcome = drive(&mut terminal, commands, &mut events, &mut requests, history).await;
+    let outcome = drive(
+        &mut terminal,
+        commands,
+        &mut events,
+        &mut requests,
+        history,
+        context_window,
+    )
+    .await;
 
     leave();
     outcome
@@ -107,8 +119,12 @@ async fn drive(
     events: &mut UnboundedReceiver<AgentViewEvent>,
     requests: &mut Receiver<UiRequest>,
     history: Vec<String>,
+    context_window: usize,
 ) -> anyhow::Result<()> {
-    let mut app = App::default();
+    let mut app = App {
+        context_window,
+        ..App::default()
+    };
 
     app.input.seed(history);
     let mut keys = EventStream::new();
@@ -175,6 +191,7 @@ struct App {
     /// When the running turn began. A turn spans every provider request its tool
     /// calls set off, so this is not reset between them.
     started: Option<Instant>,
+    context_window: usize,
 }
 
 impl App {
@@ -190,7 +207,9 @@ impl App {
 
                 if let Some(started) = self.started.take() {
                     if *completed {
-                        self.state.units.push(RenderUnit::Done(started.elapsed()));
+                        self.state
+                            .units
+                            .push(RenderUnit::Done(started.elapsed(), self.state.turn_tokens));
                     }
                 }
             }
@@ -367,19 +386,26 @@ impl App {
             frame.render_widget(Paragraph::new(self.spinner_line()), indicator);
         }
 
+        let [composer, status] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(bottom);
+
         // The question takes the prompt box's place: answering it is the only
         // thing that moves the session forward.
         match &mut self.asking {
-            Some(asking) => render_ask(frame, bottom, asking),
-            None => self.input.render(frame, bottom),
+            Some(asking) => render_ask(frame, composer, asking),
+            None => self.input.render(frame, composer),
         }
+
+        frame.render_widget(Paragraph::new(self.context_line()), status);
     }
 
     fn bottom_height(&self, width: u16) -> u16 {
-        match &self.asking {
+        let composer = match &self.asking {
             Some(asking) => asking.height(),
             None => self.input.height(width),
-        }
+        };
+
+        composer.saturating_add(STATUS_HEIGHT)
     }
 
     fn render_transcript(&mut self, frame: &mut Frame, area: Rect) {
@@ -394,7 +420,15 @@ impl App {
         let (glyph, word) = SPINNER[self.spinner];
         let elapsed = self
             .started
-            .map(|started| format!(" ({}s)", started.elapsed().as_secs()))
+            .map(|started| {
+                let tokens = self
+                    .state
+                    .turn_tokens
+                    .map(|tokens| format!(" ↓ {}", format_tokens(tokens)))
+                    .unwrap_or_default();
+
+                format!(" ({}s{tokens})", started.elapsed().as_secs())
+            })
             .unwrap_or_default();
 
         Line::from(vec![
@@ -405,6 +439,21 @@ impl App {
             ),
             Span::styled("  Esc to cancel", Style::default().fg(Color::DarkGray)),
         ])
+    }
+
+    fn context_line(&self) -> Line<'static> {
+        let current = self
+            .state
+            .context_tokens
+            .map(format_tokens)
+            .unwrap_or_else(|| "?".to_owned());
+        let limit = format_tokens(self.context_window);
+
+        Line::from(Span::styled(
+            format!("context {current}/{limit}"),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Right)
     }
 }
 
@@ -446,7 +495,10 @@ mod tests {
 
     fn app_with_size(width: u16, height: u16) -> (App, Terminal<TestBackend>) {
         (
-            App::default(),
+            App {
+                context_window: 200_000,
+                ..App::default()
+            },
             Terminal::new(TestBackend::new(width, height)).unwrap(),
         )
     }
@@ -857,6 +909,23 @@ mod tests {
     }
 
     #[test]
+    fn the_spinner_shows_accumulated_turn_tokens_after_elapsed_time() {
+        let (mut app, mut terminal) = app_with_size(40, 8);
+
+        app.handle_agent_event(AgentViewEvent::TurnStart);
+        app.handle_agent_event(AgentViewEvent::TokenUsage {
+            context: Some(2_400),
+            turn: Some(5_500),
+        });
+
+        assert!(
+            drawn(&mut app, &mut terminal)
+                .iter()
+                .any(|row| row.contains("(0s ↓ 5.5K)"))
+        );
+    }
+
+    #[test]
     fn the_counter_appears_only_once_a_turn_is_running() {
         let (mut app, mut terminal) = app_with_size(40, 8);
         app.state.turn_in_progress = true;
@@ -882,13 +951,35 @@ mod tests {
         let (mut app, mut terminal) = app_with_size(40, 10);
 
         app.handle_agent_event(AgentViewEvent::TurnStart);
+        app.handle_agent_event(AgentViewEvent::TokenUsage {
+            context: Some(2_400),
+            turn: Some(5_500),
+        });
         app.handle_agent_event(AgentViewEvent::TurnFinished { completed: true });
 
         assert!(
             drawn(&mut app, &mut terminal)
                 .iter()
-                .any(|row| row.starts_with("❃ Done for")),
+                .any(|row| row.starts_with("❃ Done for") && row.contains("↓ 5.5K")),
             "the record of the wait should outlive the spinner"
+        );
+    }
+
+    #[test]
+    fn context_usage_sits_below_the_input_and_uses_the_configured_limit() {
+        let (mut app, mut terminal) = app_with_size(40, 8);
+
+        app.handle_agent_event(AgentViewEvent::TokenUsage {
+            context: Some(2_400),
+            turn: None,
+        });
+
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.ends_with("context 2.4K/200K")),
+            "the status belongs on the bottom row: {rows:?}"
         );
     }
 

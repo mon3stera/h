@@ -29,6 +29,27 @@ const SATURATION: f32 = 0.5;
 const BRIGHTNESS: f32 = 0.9;
 const HUE_STEP: f32 = 6.0;
 
+pub(crate) fn format_tokens(count: usize) -> String {
+    const KILO: usize = 1_000;
+    const MEGA: usize = 1_000_000;
+
+    let (divisor, suffix) = if count >= MEGA - KILO / 20 {
+        (MEGA, "M")
+    } else if count >= KILO {
+        (KILO, "K")
+    } else {
+        return count.to_string();
+    };
+
+    let mut value = format!("{:.1}", count as f64 / divisor as f64);
+
+    if value.ends_with(".0") {
+        value.truncate(value.len() - 2);
+    }
+
+    format!("{value}{suffix}")
+}
+
 /// Colours a string one character at a time along a hue ramp.
 ///
 /// The starting hue comes from the text itself, so a given string always gets
@@ -115,5 +136,14 @@ mod tests {
         let line = rainbow("abc");
 
         assert_ne!(line.spans[0].style.fg, line.spans[2].style.fg);
+    }
+
+    #[test]
+    fn token_counts_use_compact_decimal_units() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1K");
+        assert_eq!(format_tokens(2_400), "2.4K");
+        assert_eq!(format_tokens(200_000), "200K");
+        assert_eq!(format_tokens(5_500_000), "5.5M");
     }
 }

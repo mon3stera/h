@@ -8,7 +8,7 @@ use crate::{
     bridge::UiBridge,
     bus::EventBus,
     context::{Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, built_in_workspace_info},
-    event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
+    event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal, TokenUsage},
     provider::{Provider, ProviderEventStream},
     tool::{
         AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolCall,
@@ -67,6 +67,23 @@ struct TurnMetrics {
     tool_call_count: usize,
     unsupported_signal_count: usize,
     completion_reason: &'static str,
+    total_tokens: Option<usize>,
+}
+
+impl TurnMetrics {
+    fn new() -> Self {
+        Self {
+            total_tokens: Some(0),
+            ..Self::default()
+        }
+    }
+
+    fn add_usage(&mut self, usage: Option<TokenUsage>) {
+        self.total_tokens = match (self.total_tokens, usage) {
+            (Some(total), Some(usage)) => Some(total.saturating_add(usage.total)),
+            _ => None,
+        };
+    }
 }
 
 enum RequestAttempt {
@@ -170,8 +187,30 @@ where
             model: self.provider.model().to_owned(),
             thinking_effort: self.provider.thinking_effort().map(str::to_owned),
         });
+        self.refresh_token_count(None);
 
         Ok(())
+    }
+
+    fn refresh_token_count(&mut self, turn: Option<usize>) {
+        let messages = self.context.provider_messages();
+        let count = match self.provider.count_tokens(&messages) {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    event = "context.token_count.failed",
+                    error_class = "tokenizer_error",
+                    error = error.to_string(),
+                );
+                None
+            }
+        };
+
+        self.context.set_token_count(count);
+        self.view_bus.broadcast(AgentViewEvent::TokenUsage {
+            context: count,
+            turn,
+        });
     }
 
     fn append_prompt(&mut self, prompt: impl AsRef<str>) {
@@ -258,6 +297,7 @@ where
                 self.view_bus.broadcast(AgentViewEvent::Tool(
                     self.tool.present_completed(call, &result),
                 ));
+                self.refresh_token_count(metrics.total_tokens);
             }
             ProviderSignal::ToolCallCompleted(result) => {
                 self.merge_text_delta();
@@ -267,8 +307,11 @@ where
                     output: result.clone().into_provider_output(),
                     summary: result.summary().cloned(),
                 });
+                self.refresh_token_count(metrics.total_tokens);
             }
-            ProviderSignal::Completed(reason) => {
+            ProviderSignal::Completed { reason, usage } => {
+                metrics.add_usage(*usage);
+
                 metrics.completion_reason = match reason {
                     CompletedReason::NeedCall => "needs_tool_call",
                     CompletedReason::Final => "final",
@@ -282,6 +325,8 @@ where
                     self.context
                         .complete_turn(self.tool_summary_turn_interval, &self.tool);
                 }
+
+                self.refresh_token_count(metrics.total_tokens);
             }
             ProviderSignal::Unsupported => {
                 metrics.unsupported_signal_count += 1;
@@ -298,6 +343,7 @@ where
         self.view_bus
             .broadcast(AgentViewEvent::Err("Interrupted by user".to_owned()));
         self.view_bus.broadcast(AgentViewEvent::Completed);
+        self.refresh_token_count(metrics.total_tokens);
 
         tracing::info!(event = "agent.turn.interrupted");
     }
@@ -326,6 +372,7 @@ where
                     text_delta_bytes = metrics.text_delta_bytes,
                     tool_call_count = metrics.tool_call_count,
                     unsupported_signal_count = metrics.unsupported_signal_count,
+                    total_tokens = metrics.total_tokens,
                     completion_reason = metrics.completion_reason,
                     duration_ms = started.elapsed().as_millis() as u64
                 ),
@@ -358,7 +405,7 @@ where
         cancellation: &CancellationToken,
     ) -> anyhow::Result<TurnMetrics> {
         self.turn = NextTurn::Prompt(prompt);
-        let mut metrics = TurnMetrics::default();
+        let mut metrics = TurnMetrics::new();
 
         loop {
             if matches!(self.turn, NextTurn::Stop) {
@@ -527,7 +574,7 @@ where
                     }
 
                     let signal = self.provider.handle(event).await?;
-                    let completed = matches!(&signal, ProviderSignal::Completed(_));
+                    let completed = matches!(&signal, ProviderSignal::Completed { .. });
                     had_output |= !matches!(&signal, ProviderSignal::Unsupported);
 
                     let agent_event: AgentEvent = signal.clone().into();
@@ -572,6 +619,7 @@ where
         self.turn = NextTurn::Stop;
 
         self.context.prepare_buf();
+        self.refresh_token_count(metrics.total_tokens);
 
         metrics.provider_requests += 1;
         let request_index = metrics.provider_requests;
@@ -611,6 +659,7 @@ where
                     if had_output {
                         self.view_bus.broadcast(AgentViewEvent::Completed);
                     }
+                    self.refresh_token_count(metrics.total_tokens);
 
                     if attempt == STREAM_MAX_ATTEMPTS {
                         tracing::error!(
@@ -681,6 +730,24 @@ mod tests {
         CancellationToken::new()
     }
 
+    fn completed(reason: CompletedReason) -> ProviderSignal {
+        ProviderSignal::Completed {
+            reason,
+            usage: None,
+        }
+    }
+
+    fn completed_with_usage(reason: CompletedReason, total: usize) -> ProviderSignal {
+        ProviderSignal::Completed {
+            reason,
+            usage: Some(TokenUsage {
+                input: total,
+                output: 0,
+                total,
+            }),
+        }
+    }
+
     struct TestProvider;
 
     #[async_trait::async_trait]
@@ -697,6 +764,10 @@ mod tests {
 
         fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        fn count_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(input.len()))
         }
 
         async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
@@ -948,7 +1019,57 @@ mod tests {
             Ok(self
                 .reasons
                 .pop_front()
-                .map_or(ProviderSignal::Unsupported, ProviderSignal::Completed))
+                .map_or(ProviderSignal::Unsupported, completed))
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
+        {
+            Ok(Box::pin(stream::once(async { Ok(()) })))
+        }
+    }
+
+    struct UsageProvider {
+        completions: std::collections::VecDeque<(CompletedReason, usize)>,
+    }
+
+    impl UsageProvider {
+        fn new(completions: impl IntoIterator<Item = (CompletedReason, usize)>) -> Self {
+            Self {
+                completions: completions.into_iter().collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for UsageProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "usage-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn count_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(input.len()))
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(self
+                .completions
+                .pop_front()
+                .map_or(ProviderSignal::Unsupported, |(reason, total)| {
+                    completed_with_usage(reason, total)
+                }))
         }
 
         async fn stream(
@@ -1010,7 +1131,7 @@ mod tests {
 
         agent
             .handle_signal(
-                &ProviderSignal::Completed(CompletedReason::NeedCall),
+                &completed(CompletedReason::NeedCall),
                 &mut metrics,
                 &cancellation(),
             )
@@ -1021,7 +1142,7 @@ mod tests {
 
         agent
             .handle_signal(
-                &ProviderSignal::Completed(CompletedReason::Final),
+                &completed(CompletedReason::Final),
                 &mut metrics,
                 &cancellation(),
             )
@@ -1039,7 +1160,7 @@ mod tests {
         for _ in 0..7 {
             agent
                 .handle_signal(
-                    &ProviderSignal::Completed(CompletedReason::Final),
+                    &completed(CompletedReason::Final),
                     &mut metrics,
                     &cancellation(),
                 )
@@ -1051,7 +1172,7 @@ mod tests {
 
         agent
             .handle_signal(
-                &ProviderSignal::Completed(CompletedReason::Final),
+                &completed(CompletedReason::Final),
                 &mut metrics,
                 &cancellation(),
             )
@@ -1059,6 +1180,26 @@ mod tests {
             .unwrap();
 
         assert!(has_frozen_tool_summary(&agent));
+    }
+
+    #[tokio::test]
+    async fn compaction_recomputes_the_tokenized_context_size() {
+        let mut agent = agent_with_read_summary();
+        agent.with_tool_summary_turn_interval(NonZeroUsize::new(1).unwrap());
+        let mut metrics = TurnMetrics::new();
+
+        agent
+            .handle_signal(
+                &completed_with_usage(CompletedReason::Final, 2_400),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(has_frozen_tool_summary(&agent));
+        assert_eq!(agent.context.token_count(), Some(1));
+        assert_eq!(metrics.total_tokens, Some(2_400));
     }
 
     #[tokio::test]
@@ -1243,7 +1384,7 @@ mod tests {
         }
 
         async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(ProviderSignal::Completed(CompletedReason::NeedCall))
+            Ok(completed(CompletedReason::NeedCall))
         }
 
         async fn stream(
@@ -1321,6 +1462,29 @@ mod tests {
             Some(true),
             "the final answer came on the second request, and it still counts"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_usage_accumulates_across_every_request_in_a_turn() {
+        let mut agent = Agent::new(UsageProvider::new([
+            (CompletedReason::NeedCall, 2_400),
+            (CompletedReason::Final, 3_100),
+        ]));
+        let mut events = agent.subscribe_view();
+
+        agent
+            .continue_turn("ask something", cancellation())
+            .await
+            .unwrap();
+
+        let seen = drain(&mut events);
+        let last_usage = seen.iter().rev().find_map(|event| match event {
+            AgentViewEvent::TokenUsage { context, turn } => Some((*context, *turn)),
+            _ => None,
+        });
+
+        assert_eq!(last_usage, Some((Some(1), Some(5_500))));
+        assert_eq!(agent.context.token_count(), Some(1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1431,7 +1595,7 @@ mod tests {
             }
 
             Ok(Box::pin(stream::once(async {
-                Ok(ProviderSignal::Completed(CompletedReason::Final))
+                Ok(completed(CompletedReason::Final))
             })))
         }
     }
@@ -1477,7 +1641,7 @@ mod tests {
 
                 events
             } else {
-                vec![Ok(ProviderSignal::Completed(CompletedReason::Final))]
+                vec![Ok(completed(CompletedReason::Final))]
             };
 
             Ok(Box::pin(stream::iter(events)))
@@ -1645,7 +1809,7 @@ mod tests {
             .unwrap();
         agent
             .handle_signal(
-                &ProviderSignal::Completed(CompletedReason::Final),
+                &completed(CompletedReason::Final),
                 &mut metrics,
                 &cancellation(),
             )

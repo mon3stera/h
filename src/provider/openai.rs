@@ -10,21 +10,62 @@ use async_openai::{
         FunctionTool, FunctionToolCall, FunctionToolCallOutputResource,
         InputItem::{self, EasyMessage},
         Item, MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning,
-        ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool,
-        WebSearchTool,
+        ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, ResponseUsage, Role,
+        Tool as OpenAITool, WebSearchTool,
     },
 };
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
+use tiktoken_rs::{bpe_for_model, o200k_base_singleton};
 
 use crate::{
     config::ReasoningEffort,
     context::{Context, Message},
-    event::{CompletedReason, ProviderSignal},
+    event::{CompletedReason, ProviderSignal, TokenUsage},
     provider::{Provider, ProviderEventStream},
     tool::{ToolCall, ToolCallResult, ToolDefinition},
 };
+
+impl From<&ResponseUsage> for TokenUsage {
+    fn from(usage: &ResponseUsage) -> Self {
+        Self {
+            input: usage.input_tokens as usize,
+            output: usage.output_tokens as usize,
+            total: usage.total_tokens as usize,
+        }
+    }
+}
+
+/// OpenAI does not publish the exact Responses framing. The tokenizer tracks
+/// the visible request, then the latest server `input_tokens` corrects its bias.
+#[derive(Default)]
+struct TokenEstimator {
+    pending: Option<usize>,
+    offset: isize,
+}
+
+impl TokenEstimator {
+    fn begin(&mut self, estimate: usize) {
+        self.pending = Some(estimate);
+    }
+
+    fn calibrate(&mut self, actual: Option<usize>) {
+        let (Some(estimate), Some(actual)) = (self.pending.take(), actual) else {
+            return;
+        };
+
+        self.offset = if actual >= estimate {
+            isize::try_from(actual - estimate).unwrap_or(isize::MAX)
+        } else {
+            -isize::try_from(estimate - actual).unwrap_or(isize::MAX)
+        };
+    }
+
+    fn apply(&self, estimate: usize) -> usize {
+        estimate.saturating_add_signed(self.offset)
+    }
+}
 
 fn reasoning_effort_name(effort: &OpenAIReasoningEffort) -> &'static str {
     match effort {
@@ -88,6 +129,7 @@ pub struct OpenAIProvider {
     config: OpenAIProviderConfig,
     client: Client<OpenAIConfig>,
     tools: Vec<OpenAITool>,
+    tokens: Mutex<TokenEstimator>,
 }
 
 impl OpenAIProvider {
@@ -106,7 +148,25 @@ impl OpenAIProvider {
             config,
             client,
             tools,
+            tokens: Mutex::new(TokenEstimator::default()),
         }
+    }
+
+    fn input(messages: &[Message]) -> Vec<InputItem> {
+        messages.iter().cloned().map(InputItem::from).collect()
+    }
+
+    fn estimate_tokens(&self, messages: &[Message]) -> anyhow::Result<usize> {
+        // Serialize the same input items and tools sent by `stream` so changes
+        // to roles, call IDs, arguments, outputs, and schemas all affect the count.
+        let (input, tools) = (
+            serde_json::to_string(&Self::input(messages))?,
+            serde_json::to_string(&self.tools)?,
+        );
+        let tokenizer =
+            bpe_for_model(&self.config.model).unwrap_or_else(|_| o200k_base_singleton());
+
+        Ok(tokenizer.count_ordinary(&input) + tokenizer.count_ordinary(&tools))
     }
 
     fn build_request(&self, input: Vec<InputItem>) -> anyhow::Result<CreateResponse> {
@@ -839,6 +899,12 @@ impl Provider for OpenAIProvider {
         Ok(())
     }
 
+    fn count_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+        let estimate = self.estimate_tokens(input)?;
+
+        Ok(Some(self.tokens.lock().apply(estimate)))
+    }
+
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
         match &event {
             /* ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
@@ -882,6 +948,8 @@ impl Provider for OpenAIProvider {
                     .output
                     .iter()
                     .any(|e| matches!(e, OutputItem::FunctionCall(_)));
+                let usage = completed.response.usage.as_ref().map(TokenUsage::from);
+                self.tokens.lock().calibrate(usage.map(|usage| usage.input));
 
                 tracing::info!(
                     event = "provider.response.completed",
@@ -890,14 +958,20 @@ impl Provider for OpenAIProvider {
                         "needs_tool_call"
                     } else {
                         "final"
-                    }
+                    },
+                    input_tokens = usage.map(|usage| usage.input),
+                    output_tokens = usage.map(|usage| usage.output),
+                    total_tokens = usage.map(|usage| usage.total),
                 );
 
-                Ok(ProviderSignal::Completed(if need_call {
-                    CompletedReason::NeedCall
-                } else {
-                    CompletedReason::Final
-                }))
+                Ok(ProviderSignal::Completed {
+                    reason: if need_call {
+                        CompletedReason::NeedCall
+                    } else {
+                        CompletedReason::Final
+                    },
+                    usage,
+                })
             }
             _ => Ok(ProviderSignal::Unsupported),
         }
@@ -909,13 +983,11 @@ impl Provider for OpenAIProvider {
     ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
         let message_count = messages.len();
         let tool_count = self.tools.len();
-        let input = messages
-            .iter()
-            .cloned()
-            .map(|e| e.into())
-            .collect::<Vec<InputItem>>();
+        let input = Self::input(messages);
 
         let request = self.build_request(input)?;
+        let estimate = self.estimate_tokens(messages)?;
+        self.tokens.lock().begin(estimate);
 
         // Keep this as a foreground Responses request. OpenAI's explicit
         // `/cancel` endpoint is background-only; synchronous cancellation is
@@ -1000,6 +1072,56 @@ mod tests {
         assert_eq!(value["model"], "gpt-5.6-sol");
         assert_eq!(value["reasoning"]["effort"], "high");
         assert!(!value.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn response_usage_maps_to_provider_independent_token_counts() {
+        let usage = serde_json::from_value::<ResponseUsage>(json!({
+            "input_tokens": 2_400,
+            "input_tokens_details": {"cached_tokens": 1_200},
+            "output_tokens": 600,
+            "output_tokens_details": {"reasoning_tokens": 300},
+            "total_tokens": 3_000
+        }))
+        .unwrap();
+
+        assert_eq!(
+            TokenUsage::from(&usage),
+            TokenUsage {
+                input: 2_400,
+                output: 600,
+                total: 3_000,
+            }
+        );
+    }
+
+    #[test]
+    fn tokenizer_counts_messages_and_registered_tools() {
+        let provider = provider(ReasoningEffort::High);
+        let empty = provider.count_tokens(&[]).unwrap().unwrap();
+        let messages = [
+            Message::System("You are a coding agent.".to_owned()),
+            Message::User("Inspect the repository.".to_owned()),
+        ];
+        let populated = provider.count_tokens(&messages).unwrap().unwrap();
+
+        assert!(empty > 0, "registered tools occupy context too");
+        assert!(populated > empty, "message text must add tokens");
+    }
+
+    #[test]
+    fn provider_input_usage_calibrates_local_token_estimates() {
+        let provider = provider(ReasoningEffort::High);
+        let messages = [Message::User("calibrate this request".to_owned())];
+        let estimate = provider.estimate_tokens(&messages).unwrap();
+
+        provider.tokens.lock().begin(estimate);
+        provider.tokens.lock().calibrate(Some(estimate + 17));
+
+        assert_eq!(
+            provider.count_tokens(&messages).unwrap(),
+            Some(estimate + 17)
+        );
     }
 
     #[test]

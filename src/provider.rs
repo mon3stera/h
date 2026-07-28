@@ -18,6 +18,12 @@ pub trait Provider: Send + Sync + 'static {
 
     fn define_tools(&mut self, specs: Vec<ToolDefinition>) -> anyhow::Result<()>;
 
+    /// Estimates the tokens occupied by the next provider request. Providers
+    /// own this because message framing and tool definitions are protocol-specific.
+    fn count_tokens(&self, _input: &[Message]) -> anyhow::Result<Option<usize>> {
+        Ok(None)
+    }
+
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal>;
 
     /// Opens one in-flight provider request. The returned stream owns that
