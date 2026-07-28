@@ -20,7 +20,7 @@ fn temporary_file(name: &str) -> PathBuf {
 #[tokio::test]
 async fn read_file_defaults_to_a_bounded_first_page() {
     let path = temporary_file("bounded-read");
-    let content = (1..=250)
+    let content = (1..=MAX_READ_LINES + 50)
         .map(|line| format!("line {line}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -39,12 +39,12 @@ async fn read_file_defaults_to_a_bounded_first_page() {
     .unwrap();
 
     assert_eq!(output.start_line, 1);
-    assert_eq!(output.end_line, Some(200));
+    assert_eq!(output.end_line, Some(MAX_READ_LINES));
     assert_eq!(output.total_lines, None);
     assert!(output.has_more);
-    assert_eq!(output.content.lines().count(), 200);
+    assert_eq!(output.content.lines().count(), MAX_READ_LINES);
     assert!(output.content.starts_with("line 1\n"));
-    assert!(output.content.ends_with("line 200"));
+    assert!(output.content.ends_with(&format!("line {MAX_READ_LINES}")));
 
     fs::remove_file(path).await.unwrap();
 }
@@ -87,11 +87,6 @@ async fn read_file_validates_ranges_before_reading() {
             Some(4),
             "end_line must be greater than or equal to start_line",
         ),
-        (
-            Some(1),
-            Some(MAX_READ_LINES + 1),
-            "cannot read more than 200 lines at once",
-        ),
     ] {
         let error = TypedTool::call(
             &tool,
@@ -105,6 +100,48 @@ async fn read_file_validates_ranges_before_reading() {
         .unwrap_err();
         assert_eq!(error.to_string(), expected);
     }
+}
+
+#[tokio::test]
+async fn read_file_clamps_explicit_ranges_to_the_page_limit() {
+    let path = temporary_file("clamped-read");
+    let content = (1..=MAX_READ_LINES + 100)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, content).await.unwrap();
+
+    let tool = ReadFileTool::new(FileBufferStore::default());
+    let output = TypedTool::call(
+        &tool,
+        ReadFileToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            start_line: Some(2),
+            end_line: Some(MAX_READ_LINES + 100),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.start_line, 2);
+    assert_eq!(output.end_line, Some(MAX_READ_LINES + 1));
+    assert_eq!(output.content.lines().count(), MAX_READ_LINES);
+    assert!(output.content.starts_with("line 2\n"));
+    assert!(
+        output
+            .content
+            .ends_with(&format!("line {}", MAX_READ_LINES + 1))
+    );
+    assert!(output.has_more);
+
+    fs::remove_file(path).await.unwrap();
+}
+
+#[test]
+fn read_file_description_explains_the_clamp() {
+    let tool = ReadFileTool::new(FileBufferStore::default());
+
+    assert!(TypedTool::description(&tool).contains("clamped to 500"));
 }
 
 #[tokio::test]
@@ -136,7 +173,7 @@ async fn read_file_handles_empty_and_past_eof_ranges() {
 #[tokio::test]
 async fn file_indexes_extend_lazily_and_refresh_external_changes() {
     let path = temporary_file("index-refresh");
-    let content = (1..=250)
+    let content = (1..=MAX_READ_LINES + 50)
         .map(|line| format!("line {line}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -158,7 +195,7 @@ async fn file_indexes_extend_lazily_and_refresh_external_changes() {
 
     let index = buffers.files.read().await.values().next().cloned().unwrap();
     let indexed = index.lock().await;
-    assert_eq!(indexed.line_starts.len(), 201);
+    assert_eq!(indexed.line_starts.len(), MAX_READ_LINES + 1);
     assert!(indexed.scanned_to < fs::metadata(&path).await.unwrap().len());
     drop(indexed);
 

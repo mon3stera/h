@@ -15,7 +15,7 @@ use super::{
     summary::Targets,
 };
 
-pub(super) const MAX_READ_LINES: usize = 200;
+pub(super) const MAX_READ_LINES: usize = 500;
 const SUMMARY_VERSION: u32 = 1;
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -24,7 +24,7 @@ pub struct ReadFileToolArgs {
     pub(super) path: String,
     /// First line to read. Line numbers are 1-based and inclusive. Defaults to 1.
     pub(super) start_line: Option<usize>,
-    /// Last line to read. Line numbers are 1-based and inclusive. If omitted, reads up to 200 lines.
+    /// Last line to read. Line numbers are 1-based and inclusive. If omitted, reads up to 500 lines. Ranges longer than 500 lines are clamped to 500.
     pub(super) end_line: Option<usize>,
 }
 
@@ -242,7 +242,7 @@ impl TypedTool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "read a 1-based inclusive range from a file; returns at most 200 lines and total_lines is null until EOF is reached"
+        "read a 1-based inclusive range from a file; ranges longer than 500 lines are clamped to 500, and total_lines is null until EOF is reached"
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
@@ -254,19 +254,10 @@ impl TypedTool for ReadFileTool {
                 end_line >= start_line,
                 "end_line must be greater than or equal to start_line"
             );
-            let requested_lines = end_line
-                .checked_sub(start_line)
-                .and_then(|distance| distance.checked_add(1))
-                .ok_or_else(|| anyhow::anyhow!("requested line range is too large"))?;
-            anyhow::ensure!(
-                requested_lines <= MAX_READ_LINES,
-                "cannot read more than {MAX_READ_LINES} lines at once"
-            );
         }
 
-        let requested_end = arguments
-            .end_line
-            .unwrap_or_else(|| start_line.saturating_add(MAX_READ_LINES - 1));
+        let max_end = start_line.saturating_add(MAX_READ_LINES - 1);
+        let requested_end = arguments.end_line.unwrap_or(max_end).min(max_end);
 
         self.read_range(Path::new(&arguments.path), start_line, requested_end)
             .await
