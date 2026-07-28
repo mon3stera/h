@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, SearcherBuilder, Sink};
 use ignore::WalkBuilder;
@@ -6,27 +8,73 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult,
-    ToolCallStatus, TypedTool, presentation::truncate_preview,
+    Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
+    ToolCallResult, ToolCallStatus, TypedTool, presentation::truncate_preview, summary::Targets,
 };
+
+const DEFAULT_CONTEXT_LINES: usize = 0;
+const SUMMARY_VERSION: u32 = 1;
 
 pub struct GrepTool;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
+struct GrepSummary {
+    path: String,
+    pattern: String,
+    returned_lines: usize,
+}
+
+#[derive(Default)]
+struct GrepAggregator {
+    paths: Targets,
+    patterns: Targets,
+    returned_lines: usize,
+}
+
+impl Aggregator for GrepAggregator {
+    fn push(&mut self, summary: &Summary) -> anyhow::Result<()> {
+        let summary = summary.deserialize::<GrepSummary>(SUMMARY_VERSION)?;
+
+        self.paths.push(&summary.path);
+        self.patterns.push(&summary.pattern);
+        self.returned_lines = self.returned_lines.saturating_add(summary.returned_lines);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>, buf: &mut String) {
+        buf.push_str("\n- Grep paths: ");
+        self.paths.write_description(buf, "path");
+        buf.push_str("; patterns: ");
+        self.patterns.write_description(buf, "pattern");
+        let _ = write!(buf, "; returned_lines: {}", self.returned_lines);
+    }
+}
+
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct GrepToolArgs {
     /// file or directory
-    path: String,
+    pub(super) path: String,
     /// regex
-    pattern: String,
-    /// including N lines before
-    before: usize,
-    /// including N lines after
-    after: usize,
+    pub(super) pattern: String,
+    /// Include N lines before each match. Defaults to 0.
+    pub(super) before: Option<usize>,
+    /// Include N lines after each match. Defaults to 0.
+    pub(super) after: Option<usize>,
+}
+
+impl GrepToolArgs {
+    pub(super) fn before(&self) -> usize {
+        self.before.unwrap_or(DEFAULT_CONTEXT_LINES)
+    }
+
+    pub(super) fn after(&self) -> usize {
+        self.after.unwrap_or(DEFAULT_CONTEXT_LINES)
+    }
 }
 
 #[derive(Serialize)]
 pub struct GrepToolOutput {
-    results: String,
+    pub(super) results: String,
 }
 
 struct GrepSink {
@@ -86,8 +134,8 @@ impl TypedTool for GrepTool {
         let matcher = RegexMatcher::new(&arguments.pattern)?;
 
         let mut searcher = SearcherBuilder::new()
-            .before_context(arguments.before)
-            .after_context(arguments.after)
+            .before_context(arguments.before())
+            .after_context(arguments.after())
             .passthru(false)
             .build();
 
@@ -113,6 +161,28 @@ impl TypedTool for GrepTool {
         }
 
         Ok(GrepToolOutput { results })
+    }
+
+    fn summarize(&self, arguments: &Self::Arguments, output: &Self::Output) -> Option<Summary> {
+        let returned_lines = output
+            .results
+            .trim_matches('\n')
+            .lines()
+            .filter(|line| !line.is_empty() && *line != "--")
+            .count();
+
+        Some(Summary::new(
+            SUMMARY_VERSION,
+            serde_json::json!({
+                "path": arguments.path,
+                "pattern": arguments.pattern,
+                "returned_lines": returned_lines,
+            }),
+        ))
+    }
+
+    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
+        Some(Box::new(GrepAggregator::default()))
     }
 }
 

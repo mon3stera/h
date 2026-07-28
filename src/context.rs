@@ -1,6 +1,7 @@
 use std::{
     env::current_dir,
     io,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -20,6 +21,10 @@ use tokio::{
     io::AsyncReadExt,
 };
 use uuid::Uuid;
+
+use crate::tool::{Aggregator, Summary, ToolRegistry};
+
+pub const DEFAULT_TOOL_SUMMARY_TURN_INTERVAL: usize = 8;
 
 #[async_trait::async_trait]
 pub trait WorkspaceInfo: Send + Sync {
@@ -181,6 +186,8 @@ pub enum Message {
     ToolCallResult {
         call_id: String,
         output: String,
+        #[serde(default)]
+        summary: Option<Summary>,
     },
     ToolCall {
         call_id: String,
@@ -194,6 +201,22 @@ pub struct Context {
     id: String,
     buf: String,
     histories: Vec<Message>,
+    #[serde(default)]
+    tool_compaction: ToolCompaction,
+}
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct ToolCompaction {
+    frozen_runs: Vec<FrozenToolRun>,
+    compacted_until: usize,
+    completed_turns: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct FrozenToolRun {
+    start: usize,
+    end: usize,
+    content: String,
 }
 
 /// The bulk of an archived session: everything needed to replay it.
@@ -201,6 +224,45 @@ pub struct Context {
 struct PersistHistories {
     id: String,
     histories: Vec<Message>,
+    #[serde(default)]
+    tool_compaction: ToolCompaction,
+}
+
+struct PendingToolRun {
+    start: usize,
+    end: usize,
+    aggregators: Vec<(String, Box<dyn Aggregator>)>,
+}
+
+impl PendingToolRun {
+    fn new(start: usize, end: usize, name: &str, aggregator: Box<dyn Aggregator>) -> Self {
+        Self {
+            start,
+            end,
+            aggregators: vec![(name.to_owned(), aggregator)],
+        }
+    }
+
+    fn aggregator_mut(&mut self, name: &str) -> Option<&mut Box<dyn Aggregator>> {
+        self.aggregators
+            .iter_mut()
+            .find(|(known, _)| known == name)
+            .map(|(_, aggregator)| aggregator)
+    }
+
+    fn finish(self) -> FrozenToolRun {
+        let mut content = "Tool summary:".to_owned();
+
+        for (_, aggregator) in self.aggregators {
+            aggregator.finish(&mut content);
+        }
+
+        FrozenToolRun {
+            start: self.start,
+            end: self.end,
+            content,
+        }
+    }
 }
 
 /// The listing view of an archived session, stored in its own file so a session
@@ -280,6 +342,7 @@ impl Context {
             id: Uuid::new_v4().to_string(),
             buf: String::new(),
             histories: Vec::new(),
+            tool_compaction: ToolCompaction::default(),
         }
     }
 
@@ -314,6 +377,136 @@ impl Context {
 
     pub fn histories(&self) -> &[Message] {
         &self.histories
+    }
+
+    /// Provider-facing projection. Frozen tool runs become compact assistant
+    /// messages while the canonical histories remain untouched for replay.
+    pub fn provider_messages(&self) -> Vec<Message> {
+        let mut messages = Vec::with_capacity(self.histories.len());
+        let mut index = 0;
+
+        for run in &self.tool_compaction.frozen_runs {
+            debug_assert!(run.start >= index);
+            debug_assert!(run.end > run.start);
+            debug_assert!(run.end <= self.histories.len());
+
+            if run.start < index || run.end <= run.start || run.end > self.histories.len() {
+                continue;
+            }
+
+            messages.extend(self.histories[index..run.start].iter().cloned());
+            messages.push(Message::Assistant(run.content.clone()));
+            index = run.end;
+        }
+
+        messages.extend(self.histories[index..].iter().cloned());
+        messages
+    }
+
+    /// Records one completed Agent turn and periodically freezes old tool runs.
+    pub fn complete_turn(&mut self, interval: NonZeroUsize, tools: &ToolRegistry) {
+        self.tool_compaction.completed_turns =
+            self.tool_compaction.completed_turns.saturating_add(1);
+
+        if self.tool_compaction.completed_turns < interval.get() {
+            return;
+        }
+
+        self.tool_compaction.completed_turns = 0;
+        self.freeze_tool_runs(tools);
+    }
+
+    fn freeze_tool_runs(&mut self, tools: &ToolRegistry) {
+        let start = self
+            .tool_compaction
+            .compacted_until
+            .min(self.histories.len());
+        let mut run: Option<PendingToolRun> = None;
+        let mut index = start;
+
+        while index < self.histories.len() {
+            let pair = match (&self.histories[index], self.histories.get(index + 1)) {
+                (
+                    Message::ToolCall { call_id, name, .. },
+                    Some(Message::ToolCallResult {
+                        call_id: result_id,
+                        summary: Some(summary),
+                        ..
+                    }),
+                ) if call_id == result_id => Some((name.as_str(), summary)),
+                _ => None,
+            };
+
+            let Some((name, summary)) = pair else {
+                Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
+                index += 1;
+                continue;
+            };
+
+            let pushed = if let Some(active) = run.as_mut() {
+                if let Some(aggregator) = active.aggregator_mut(name) {
+                    aggregator.push(summary)
+                } else if let Some(mut aggregator) = tools.aggregator(name) {
+                    let pushed = aggregator.push(summary);
+
+                    if pushed.is_ok() {
+                        active.aggregators.push((name.to_owned(), aggregator));
+                    }
+
+                    pushed
+                } else {
+                    Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
+                    index += 2;
+                    continue;
+                }
+            } else if let Some(mut aggregator) = tools.aggregator(name) {
+                let pushed = aggregator.push(summary);
+
+                if pushed.is_ok() {
+                    run = Some(PendingToolRun::new(index, index + 2, name, aggregator));
+                }
+
+                pushed
+            } else {
+                index += 2;
+                continue;
+            };
+
+            match pushed {
+                Ok(()) => {
+                    if let Some(active) = run.as_mut() {
+                        active.end = index + 2;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "context.tool_summary.rejected",
+                        tool_name = name,
+                        history_index = index,
+                        error = error.to_string(),
+                    );
+                    Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
+                }
+            }
+
+            index += 2;
+        }
+
+        Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
+        self.tool_compaction.compacted_until = self.histories.len();
+
+        tracing::info!(
+            event = "context.tool_summary.frozen",
+            scan_start = start,
+            scan_end = self.tool_compaction.compacted_until,
+            frozen_run_count = self.tool_compaction.frozen_runs.len(),
+        );
+    }
+
+    fn finish_pending_run(run: &mut Option<PendingToolRun>, frozen_runs: &mut Vec<FrozenToolRun>) {
+        if let Some(run) = run.take() {
+            frozen_runs.push(run.finish());
+        }
     }
 
     /// The prompts the user sent, oldest first.
@@ -382,6 +575,7 @@ impl Context {
         PersistHistories {
             id: self.id.clone(),
             histories: self.histories.clone(),
+            tool_compaction: self.tool_compaction.clone(),
         }
     }
 
@@ -443,6 +637,7 @@ impl Context {
             id: deserialized.id,
             buf: String::new(),
             histories: deserialized.histories,
+            tool_compaction: deserialized.tool_compaction,
         })
     }
 }
@@ -530,6 +725,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::tool::{FetchTool, FileBufferStore, GrepTool, ReadFileTool, Summary, WriteFileTool};
+
+    fn exploratory_tools() -> ToolRegistry {
+        let buffers = FileBufferStore::default();
+        let mut tools = ToolRegistry::new();
+
+        tools
+            .register(ReadFileTool::new(buffers.clone()))
+            .register(GrepTool)
+            .register(FetchTool::new().unwrap())
+            .register(WriteFileTool::new(buffers));
+
+        tools
+    }
+
+    fn tool_call(id: &str, name: &str) -> Message {
+        Message::ToolCall {
+            call_id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: "{}".to_owned(),
+        }
+    }
+
+    fn tool_result(id: &str, summary: Summary) -> Message {
+        Message::ToolCallResult {
+            call_id: id.to_owned(),
+            output: "{}".to_owned(),
+            summary: Some(summary),
+        }
+    }
+
+    fn read_summary(path: &str, lines: usize) -> Summary {
+        Summary::new(1, json!({"path": path, "lines": lines}))
+    }
 
     #[test]
     fn archive_path_stays_inside_the_archive_directory() {
@@ -593,6 +822,7 @@ mod tests {
             id: id.to_owned(),
             buf: String::new(),
             histories: vec![Message::User(prompt.to_owned())],
+            tool_compaction: ToolCompaction::default(),
         }
     }
 
@@ -615,6 +845,164 @@ mod tests {
             "unexpected histories: {:?}",
             resumed.histories.len()
         );
+    }
+
+    #[test]
+    fn provider_projection_combines_tool_kinds_in_first_seen_order() {
+        let tools = exploratory_tools();
+        let mut context = Context::new();
+        *context.histories_mut() = vec![
+            Message::User("inspect the project".to_owned()),
+            tool_call("read-1", "read_file"),
+            tool_result("read-1", read_summary("a.rs", 10)),
+            tool_call("grep-1", "grep"),
+            tool_result(
+                "grep-1",
+                Summary::new(
+                    1,
+                    json!({
+                        "path": "src",
+                        "pattern": "parse",
+                        "returned_lines": 2,
+                    }),
+                ),
+            ),
+            tool_call("fetch-1", "fetch"),
+            tool_result(
+                "fetch-1",
+                Summary::new(
+                    1,
+                    json!({
+                        "url": "https://example.com/docs",
+                        "lines": 20,
+                    }),
+                ),
+            ),
+            tool_call("read-2", "read_file"),
+            tool_result("read-2", read_summary("b.rs", 5)),
+            Message::Assistant("done".to_owned()),
+        ];
+        let raw_len = context.histories().len();
+
+        context.complete_turn(NonZeroUsize::new(1).unwrap(), &tools);
+
+        assert_eq!(
+            context.histories().len(),
+            raw_len,
+            "raw replay stays intact"
+        );
+        assert!(matches!(
+            context.provider_messages().as_slice(),
+            [
+                Message::User(prompt),
+                Message::Assistant(summary),
+                Message::Assistant(answer),
+            ] if prompt == "inspect the project"
+                && summary == concat!(
+                    "Tool summary:\n",
+                    "- Read files: a.rs, b.rs; total_lines: 15\n",
+                    "- Grep paths: src; patterns: parse; returned_lines: 2\n",
+                    "- Fetched URLs: https://example.com/docs; total_lines: 20",
+                )
+                && answer == "done"
+        ));
+    }
+
+    #[test]
+    fn a_tool_without_an_aggregator_splits_frozen_runs() {
+        let tools = exploratory_tools();
+        let mut context = Context::new();
+        *context.histories_mut() = vec![
+            tool_call("read-1", "read_file"),
+            tool_result("read-1", read_summary("a.rs", 10)),
+            tool_call("write-1", "write_file"),
+            tool_result("write-1", Summary::new(1, json!({"path": "a.rs"}))),
+            tool_call("read-2", "read_file"),
+            tool_result("read-2", read_summary("b.rs", 5)),
+        ];
+
+        context.complete_turn(NonZeroUsize::new(1).unwrap(), &tools);
+
+        let messages = context.provider_messages();
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                Message::Assistant(first),
+                Message::ToolCall { name, .. },
+                Message::ToolCallResult { .. },
+                Message::Assistant(second),
+            ] if first == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+                && name == "write_file"
+                && second == "Tool summary:\n- Read files: b.rs; total_lines: 5"
+        ));
+    }
+
+    #[test]
+    fn an_incompatible_summary_stays_in_raw_history() {
+        let tools = exploratory_tools();
+        let mut context = Context::new();
+        *context.histories_mut() = vec![
+            tool_call("read-1", "read_file"),
+            tool_result("read-1", read_summary("a.rs", 10)),
+            tool_call("read-old", "read_file"),
+            tool_result(
+                "read-old",
+                Summary::new(2, json!({"path": "old.rs", "lines": 7})),
+            ),
+            tool_call("read-2", "read_file"),
+            tool_result("read-2", read_summary("b.rs", 5)),
+        ];
+
+        context.complete_turn(NonZeroUsize::new(1).unwrap(), &tools);
+
+        assert!(matches!(
+            context.provider_messages().as_slice(),
+            [
+                Message::Assistant(first),
+                Message::ToolCall { call_id, .. },
+                Message::ToolCallResult { .. },
+                Message::Assistant(second),
+            ] if first == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+                && call_id == "read-old"
+                && second == "Tool summary:\n- Read files: b.rs; total_lines: 5"
+        ));
+    }
+
+    #[tokio::test]
+    async fn frozen_runs_and_the_completed_turn_counter_survive_resume() {
+        let (archive, tools) = (TempArchive::new(), exploratory_tools());
+        let mut context = Context::new();
+        context.id = "session-1".to_owned();
+        *context.histories_mut() = vec![
+            tool_call("read-1", "read_file"),
+            tool_result("read-1", read_summary("a.rs", 10)),
+        ];
+
+        context.complete_turn(NonZeroUsize::new(2).unwrap(), &tools);
+        context.archive_in(&archive.path).await.unwrap();
+
+        let mut resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+        resumed.complete_turn(NonZeroUsize::new(2).unwrap(), &tools);
+
+        assert_eq!(resumed.histories().len(), 2);
+        assert!(matches!(
+            resumed.provider_messages().as_slice(),
+            [Message::Assistant(summary)]
+                if summary == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+        ));
+
+        resumed.archive_in(&archive.path).await.unwrap();
+        let resumed_again = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            resumed_again.provider_messages().as_slice(),
+            [Message::Assistant(summary)]
+                if summary == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+        ));
     }
 
     #[test]
@@ -683,6 +1071,7 @@ mod tests {
                 },
                 Message::User("second".to_owned()),
             ],
+            tool_compaction: ToolCompaction::default(),
         };
 
         assert_eq!(context.prompts(), ["first", "second"]);
@@ -697,6 +1086,7 @@ mod tests {
                 Message::System("global prompts".to_owned()),
                 Message::System("workspace info".to_owned()),
             ],
+            tool_compaction: ToolCompaction::default(),
         };
 
         assert!(!context.has_exchange());

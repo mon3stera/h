@@ -1,12 +1,13 @@
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
 use crate::{
     bridge::UiBridge,
     bus::EventBus,
-    context::{Context, Message, built_in_workspace_info},
+    context::{Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, built_in_workspace_info},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::{Provider, ProviderEventStream},
     tool::{
@@ -81,6 +82,7 @@ pub struct Agent<P> {
     tool: ToolRegistry,
     provider: P,
     turn: NextTurn,
+    tool_summary_turn_interval: NonZeroUsize,
 }
 
 impl<P> Agent<P>
@@ -95,7 +97,14 @@ where
             tool: ToolRegistry::new(),
             provider,
             turn: NextTurn::Continue,
+            tool_summary_turn_interval: NonZeroUsize::new(DEFAULT_TOOL_SUMMARY_TURN_INTERVAL)
+                .expect("the default tool summary interval is non-zero"),
         }
+    }
+
+    pub fn with_tool_summary_turn_interval(&mut self, interval: NonZeroUsize) -> &mut Self {
+        self.tool_summary_turn_interval = interval;
+        self
     }
 
     pub fn subscribe(&self) -> UnboundedReceiver<AgentEvent> {
@@ -231,6 +240,7 @@ where
                 self.context.histories_mut().push(Message::ToolCallResult {
                     call_id: call.id().as_str().to_owned(),
                     output,
+                    summary: result.summary().cloned(),
                 });
 
                 self.event_bus
@@ -245,6 +255,7 @@ where
                 self.context.histories_mut().push(Message::ToolCallResult {
                     call_id: result.id().as_str().to_owned(),
                     output: result.clone().into_provider_output(),
+                    summary: result.summary().cloned(),
                 });
             }
             ProviderSignal::Completed(reason) => {
@@ -257,6 +268,9 @@ where
 
                 if matches!(reason, CompletedReason::NeedCall) {
                     self.turn = NextTurn::Continue;
+                } else {
+                    self.context
+                        .complete_turn(self.tool_summary_turn_interval, &self.tool);
                 }
             }
             ProviderSignal::Unsupported => {
@@ -399,9 +413,9 @@ where
         let outputs = histories
             .iter()
             .filter_map(|message| match message {
-                Message::ToolCallResult { call_id, output } => {
-                    Some((call_id.as_str(), output.as_str()))
-                }
+                Message::ToolCallResult {
+                    call_id, output, ..
+                } => Some((call_id.as_str(), output.as_str())),
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
@@ -474,13 +488,14 @@ where
         request_index: usize,
         cancellation: &CancellationToken,
     ) -> anyhow::Result<Option<ProviderEventStream<P::StreamEvent>>> {
+        let messages = self.context.provider_messages();
         let mut attempt = 1;
 
         loop {
             let opened = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Ok(None),
-                opened = self.provider.stream(self.context.histories()) => opened,
+                opened = self.provider.stream(&messages) => opened,
             };
 
             match opened {
@@ -629,7 +644,7 @@ mod tests {
     use std::{
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context as TaskContext, Poll},
@@ -642,7 +657,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::tool::{ToolCall, ToolCallStatus, ToolDefinition, TypedTool};
+    use crate::tool::{
+        FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition, TypedTool,
+    };
 
     fn cancellation() -> CancellationToken {
         CancellationToken::new()
@@ -675,6 +692,39 @@ mod tests {
             _input: &[Message],
         ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
         {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    struct CapturingProvider {
+        input: Arc<Mutex<Vec<Message>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "capturing-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(ProviderSignal::Unsupported)
+        }
+
+        async fn stream(
+            &self,
+            input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            *self.input.lock().unwrap() = input.to_vec();
             Ok(Box::pin(stream::empty()))
         }
     }
@@ -806,7 +856,7 @@ mod tests {
         }
     }
 
-    #[derive(Deserialize, JsonSchema)]
+    #[derive(Clone, Deserialize, JsonSchema)]
     struct BlockingArgs {}
 
     #[derive(Serialize)]
@@ -896,6 +946,141 @@ mod tests {
             AgentViewEvent::TurnFinished { completed } => Some(completed),
             _ => None,
         })
+    }
+
+    fn agent_with_read_summary() -> Agent<TestProvider> {
+        let mut agent = Agent::new(TestProvider);
+        agent
+            .tool
+            .register(ReadFileTool::new(FileBufferStore::default()));
+        *agent.context.histories_mut() = vec![
+            Message::ToolCall {
+                call_id: "read-1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: json!({"path": "src/main.rs"}).to_string(),
+            },
+            Message::ToolCallResult {
+                call_id: "read-1".to_owned(),
+                output: json!({"content": "fn main() {}"}).to_string(),
+                summary: Some(Summary::new(
+                    1,
+                    json!({
+                        "path": "src/main.rs",
+                        "lines": 1,
+                    }),
+                )),
+            },
+        ];
+
+        agent
+    }
+
+    fn has_frozen_tool_summary(agent: &Agent<TestProvider>) -> bool {
+        matches!(
+            agent.context.provider_messages().as_slice(),
+            [Message::Assistant(summary)]
+                if summary == "Tool summary:\n- Read files: src/main.rs; total_lines: 1"
+        )
+    }
+
+    #[tokio::test]
+    async fn need_call_does_not_advance_the_tool_summary_interval() {
+        let mut agent = agent_with_read_summary();
+        agent.with_tool_summary_turn_interval(NonZeroUsize::new(1).unwrap());
+        let mut metrics = TurnMetrics::default();
+
+        agent
+            .handle_signal(
+                &ProviderSignal::Completed(CompletedReason::NeedCall),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!has_frozen_tool_summary(&agent));
+
+        agent
+            .handle_signal(
+                &ProviderSignal::Completed(CompletedReason::Final),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(has_frozen_tool_summary(&agent));
+    }
+
+    #[tokio::test]
+    async fn the_default_interval_freezes_on_the_eighth_final_turn() {
+        let mut agent = agent_with_read_summary();
+        let mut metrics = TurnMetrics::default();
+
+        for _ in 0..7 {
+            agent
+                .handle_signal(
+                    &ProviderSignal::Completed(CompletedReason::Final),
+                    &mut metrics,
+                    &cancellation(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(!has_frozen_tool_summary(&agent));
+
+        agent
+            .handle_signal(
+                &ProviderSignal::Completed(CompletedReason::Final),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(has_frozen_tool_summary(&agent));
+    }
+
+    #[tokio::test]
+    async fn provider_stream_receives_the_compacted_projection() {
+        let input = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(CapturingProvider {
+            input: input.clone(),
+        });
+        agent
+            .tool
+            .register(ReadFileTool::new(FileBufferStore::default()));
+        *agent.context.histories_mut() = vec![
+            Message::ToolCall {
+                call_id: "read-1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            Message::ToolCallResult {
+                call_id: "read-1".to_owned(),
+                output: "large output".to_owned(),
+                summary: Some(Summary::new(
+                    1,
+                    json!({
+                        "path": "src/main.rs",
+                        "lines": 200,
+                    }),
+                )),
+            },
+        ];
+        agent
+            .context
+            .complete_turn(NonZeroUsize::new(1).unwrap(), &agent.tool);
+
+        agent.open_stream(1, &cancellation()).await.unwrap();
+
+        assert!(matches!(
+            input.lock().unwrap().as_slice(),
+            [Message::Assistant(summary)]
+                if summary == "Tool summary:\n- Read files: src/main.rs; total_lines: 200"
+        ));
+        assert_eq!(agent.context.histories().len(), 2);
     }
 
     #[tokio::test]
@@ -1002,7 +1187,9 @@ mod tests {
             .filter(|message| matches!(message, Message::ToolCall { .. }))
             .count();
         let result = histories.iter().find_map(|message| match message {
-            Message::ToolCallResult { call_id, output } => Some((call_id, output)),
+            Message::ToolCallResult {
+                call_id, output, ..
+            } => Some((call_id, output)),
             _ => None,
         });
 
@@ -1394,6 +1581,7 @@ mod tests {
             Message::ToolCallResult {
                 call_id: "call-1".to_owned(),
                 output: json!({"stdout": "ok", "exit_code": 0}).to_string(),
+                summary: None,
             },
         ]);
         agent.with_internal_tools(UiBridge::new().0).unwrap();
@@ -1428,6 +1616,7 @@ mod tests {
             Message::ToolCallResult {
                 call_id: "call-1".to_owned(),
                 output: json!({"error": "command not found"}).to_string(),
+                summary: None,
             },
         ]);
         agent.with_internal_tools(UiBridge::new().0).unwrap();

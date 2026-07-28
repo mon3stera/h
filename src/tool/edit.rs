@@ -14,7 +14,7 @@ use super::{
 
 pub struct EditTool;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct EditToolArgs {
     /// path of a file
     pub(super) path: String,

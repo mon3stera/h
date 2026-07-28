@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use readabilityrs::{Readability, ReadabilityOptions};
 use reqwest::header::{HeaderMap, HeaderValue};
 use schemars::JsonSchema;
@@ -5,12 +7,43 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult,
-    ToolCallStatus, TypedTool,
+    Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
+    ToolCallResult, ToolCallStatus, TypedTool, summary::Targets,
 };
+
+const DEFAULT_RAW: bool = false;
+const SUMMARY_VERSION: u32 = 1;
 
 pub struct FetchTool {
     client: reqwest::Client,
+}
+
+#[derive(Deserialize)]
+struct FetchSummary {
+    url: String,
+    lines: usize,
+}
+
+#[derive(Default)]
+struct FetchAggregator {
+    urls: Targets,
+    lines: usize,
+}
+
+impl Aggregator for FetchAggregator {
+    fn push(&mut self, summary: &Summary) -> anyhow::Result<()> {
+        let summary = summary.deserialize::<FetchSummary>(SUMMARY_VERSION)?;
+
+        self.urls.push(&summary.url);
+        self.lines = self.lines.saturating_add(summary.lines);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>, buf: &mut String) {
+        buf.push_str("\n- Fetched URLs: ");
+        self.urls.write_description(buf, "url");
+        let _ = write!(buf, "; total_lines: {}", self.lines);
+    }
 }
 
 impl FetchTool {
@@ -61,7 +94,7 @@ impl TypedTool for FetchTool {
 
         let text = resp.text().await?;
 
-        if arguments.raw {
+        if arguments.raw() {
             return Ok(FetchToolOutput { result: text });
         }
 
@@ -78,19 +111,39 @@ impl TypedTool for FetchTool {
 
         Ok(FetchToolOutput { result })
     }
+
+    fn summarize(&self, arguments: &Self::Arguments, output: &Self::Output) -> Option<Summary> {
+        Some(Summary::new(
+            SUMMARY_VERSION,
+            serde_json::json!({
+                "url": arguments.url,
+                "lines": output.result.lines().count(),
+            }),
+        ))
+    }
+
+    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
+        Some(Box::new(FetchAggregator::default()))
+    }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct FetchToolArgs {
     /// URL of a page.
-    url: String,
-    /// Whether the page will be clean. If set to false, keep the page unchanged.
-    raw: bool,
+    pub(super) url: String,
+    /// Whether to keep the page unchanged. Defaults to false, which cleans the page and converts it to Markdown.
+    pub(super) raw: Option<bool>,
+}
+
+impl FetchToolArgs {
+    pub(super) fn raw(&self) -> bool {
+        self.raw.unwrap_or(DEFAULT_RAW)
+    }
 }
 
 #[derive(Serialize)]
 pub struct FetchToolOutput {
-    result: String,
+    pub(super) result: String,
 }
 
 pub struct FetchPresenter;

@@ -57,6 +57,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         config.model(),
         config.reasoning_effort(),
     ));
+    let tool_summary_turn_interval = config.tool_summary_turn_interval();
 
     tracing::info!(
         event = "config.loaded",
@@ -65,6 +66,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         model = config.model(),
         context_window = config.context_window(),
         auto_compact_token_limit = config.auto_compact_token_limit(),
+        tool_summary_turn_interval = tool_summary_turn_interval.get(),
     );
 
     // The provider owns its copied credential now; do not keep a second copy
@@ -74,6 +76,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
     let (bridge, ui_request_rx) = UiBridge::new();
 
     let mut agent = Agent::new(provider);
+    agent.with_tool_summary_turn_interval(tool_summary_turn_interval);
     let bus_rx = agent.subscribe_view();
     agent.with_internal_tools(bridge)?;
 

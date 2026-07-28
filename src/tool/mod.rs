@@ -13,6 +13,7 @@ mod grep;
 mod presentation;
 mod read;
 mod registry;
+mod summary;
 mod write;
 
 pub use ask::{AskPresenter, AskTool};
@@ -27,12 +28,17 @@ pub use presentation::{
 };
 pub use read::{ReadFilePresenter, ReadFileTool};
 pub use registry::ToolRegistry;
+pub use summary::{Aggregator, Summary};
 pub use write::{WriteFilePresenter, WriteFileTool};
 
 #[cfg(test)]
 pub use bash::{BashToolArgs, BashToolOutput};
 #[cfg(test)]
 pub use edit::EditToolArgs;
+#[cfg(test)]
+pub use fetch::FetchToolArgs;
+#[cfg(test)]
+pub use grep::GrepToolArgs;
 #[cfg(test)]
 pub use read::ReadFileToolArgs;
 #[cfg(test)]
@@ -69,7 +75,7 @@ pub struct ToolDefinition {
 
 #[async_trait::async_trait]
 pub trait TypedTool: Send + Sync + 'static {
-    type Arguments: DeserializeOwned + JsonSchema + Send + 'static;
+    type Arguments: Clone + DeserializeOwned + JsonSchema + Send + 'static;
     type Output: Serialize + Send + 'static;
 
     fn name(&self) -> &'static str;
@@ -87,6 +93,17 @@ pub trait TypedTool: Send + Sync + 'static {
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output>;
+
+    /// Extracts the small, structured record used when this call is compacted.
+    fn summarize(&self, _arguments: &Self::Arguments, _output: &Self::Output) -> Option<Summary> {
+        None
+    }
+
+    /// Creates fresh aggregation state. `None` makes this tool a hard boundary
+    /// between aggregatable runs.
+    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
+        None
+    }
 
     /// Stops external work started by the current call. Most async tools need
     /// no hook because dropping their call future is sufficient; tools that own
@@ -107,7 +124,9 @@ pub trait DynTool: Send + Sync {
 
     fn definition(&self) -> anyhow::Result<ToolDefinition>;
 
-    async fn call(&self, arguments: Value) -> anyhow::Result<Value>;
+    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput>;
+
+    fn aggregator(&self) -> Option<Box<dyn Aggregator>>;
 
     async fn cancel(&self, arguments: Value) -> anyhow::Result<()>;
 }
@@ -133,17 +152,30 @@ where
         TypedTool::definition(self)
     }
 
-    async fn call(&self, arguments: Value) -> anyhow::Result<Value> {
+    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput> {
         let arguments = serde_json::from_value::<T::Arguments>(arguments)?;
-        let output = TypedTool::call(self, arguments).await?;
+        let output = TypedTool::call(self, arguments.clone()).await?;
+        let summary = TypedTool::summarize(self, &arguments, &output);
 
-        Ok(serde_json::to_value(output)?)
+        Ok(ToolOutput {
+            value: serde_json::to_value(output)?,
+            summary,
+        })
+    }
+
+    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
+        TypedTool::aggregator(self)
     }
 
     async fn cancel(&self, arguments: Value) -> anyhow::Result<()> {
         let arguments = serde_json::from_value::<T::Arguments>(arguments)?;
         TypedTool::cancel(self, arguments).await
     }
+}
+
+pub struct ToolOutput {
+    value: Value,
+    summary: Option<Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -206,6 +238,7 @@ pub enum ToolCallOutcome {
 pub struct ToolCallResult {
     id: ToolCallId,
     outcome: ToolCallOutcome,
+    summary: Option<Summary>,
 }
 
 impl ToolCallResult {
@@ -213,6 +246,19 @@ impl ToolCallResult {
         Self {
             id: id.into(),
             outcome: ToolCallOutcome::Success(output),
+            summary: None,
+        }
+    }
+
+    pub fn success_with_summary(
+        id: impl Into<ToolCallId>,
+        output: Value,
+        summary: Option<Summary>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            outcome: ToolCallOutcome::Success(output),
+            summary,
         }
     }
 
@@ -222,6 +268,7 @@ impl ToolCallResult {
             outcome: ToolCallOutcome::Failure {
                 message: message.into(),
             },
+            summary: None,
         }
     }
 
@@ -231,6 +278,10 @@ impl ToolCallResult {
 
     pub fn outcome(&self) -> &ToolCallOutcome {
         &self.outcome
+    }
+
+    pub fn summary(&self) -> Option<&Summary> {
+        self.summary.as_ref()
     }
 
     pub fn into_provider_output(self) -> String {

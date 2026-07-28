@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Instant};
 
 use super::{
-    DefaultPresenter, DynTool, Presentation, Presenter, ToolCall, ToolCallResult, ToolDefinition,
-    TypedTool,
+    Aggregator, DefaultPresenter, DynTool, Presentation, Presenter, ToolCall, ToolCallResult,
+    ToolDefinition, TypedTool,
 };
 
 struct RegisteredTool {
@@ -79,6 +79,12 @@ impl ToolRegistry {
             .unwrap_or_else(|| DefaultPresenter.completed(call, result))
     }
 
+    pub fn aggregator(&self, name: &str) -> Option<Box<dyn Aggregator>> {
+        self.tools
+            .get(name)
+            .and_then(|registered| registered.tool.aggregator())
+    }
+
     pub async fn call(&self, call: &ToolCall) -> ToolCallResult {
         let started = Instant::now();
         let span = tracing::info_span!("tool.call", tool_name = call.name());
@@ -106,7 +112,11 @@ impl ToolRegistry {
                     outcome = "success",
                     duration_ms = started.elapsed().as_millis() as u64
                 );
-                ToolCallResult::success(call.id().clone(), output)
+                ToolCallResult::success_with_summary(
+                    call.id().clone(),
+                    output.value,
+                    output.summary,
+                )
             }
             Err(error) => {
                 tracing::warn!(

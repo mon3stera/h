@@ -459,6 +459,8 @@ fn bash_presenter_separates_blocking_output_streams() {
         serde_json::to_value(BashToolOutput::RanBlocking {
             stdout: "\u{1b}[32mok\u{1b}[0m\n".to_owned(),
             stderr: "warning\n".to_owned(),
+            exit_code: Some(0),
+            signal: None,
         })
         .unwrap(),
     );
@@ -470,6 +472,7 @@ fn bash_presenter_separates_blocking_output_streams() {
         &presentation.blocks[..],
         [
             DisplayBlock::Summary(summary),
+            DisplayBlock::KeyValue { entries },
             DisplayBlock::Summary(stdout_label),
             DisplayBlock::CodeBlock {
                 language: Some(language),
@@ -487,12 +490,50 @@ fn bash_presenter_separates_blocking_output_streams() {
                 start_line_number: 1,
             },
         ] if summary == "Command completed"
+            && entries.len() == 1
+            && entries[0].key == "exit_code"
+            && entries[0].value == "0"
             && stdout_label == "stdout"
             && language == "console"
             && stdout == "ok"
             && stderr_label == "stderr"
             && stderr_language == "console"
             && stderr == "warning"
+    ));
+}
+
+#[test]
+fn bash_presenter_surfaces_a_terminating_signal_without_output() {
+    let call = call(
+        "bash",
+        json!({
+            "action": "run_blocking",
+            "command": "kill -TERM $$",
+        }),
+    );
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        serde_json::to_value(BashToolOutput::RanBlocking {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            signal: Some(15),
+        })
+        .unwrap(),
+    );
+
+    let presentation = BashPresenter.completed(&call, &result);
+
+    assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
+    assert!(matches!(
+        &presentation.blocks[..],
+        [
+            DisplayBlock::Summary(summary),
+            DisplayBlock::KeyValue { entries },
+        ] if summary == "Command completed with no output"
+            && entries.len() == 1
+            && entries[0].key == "signal"
+            && entries[0].value == "15"
     ));
 }
 
@@ -619,6 +660,143 @@ fn bash_presenter_presents_waited_session_output() {
 }
 
 #[test]
+fn fetch_raw_defaults_to_cleaned_markdown() {
+    let omitted: FetchToolArgs = serde_json::from_value(json!({
+        "url": "https://example.com",
+    }))
+    .unwrap();
+    let null: FetchToolArgs = serde_json::from_value(json!({
+        "url": "https://example.com",
+        "raw": null,
+    }))
+    .unwrap();
+    let explicit: FetchToolArgs = serde_json::from_value(json!({
+        "url": "https://example.com",
+        "raw": true,
+    }))
+    .unwrap();
+
+    assert!(!omitted.raw());
+    assert!(!null.raw());
+    assert!(explicit.raw());
+}
+
+#[test]
+fn grep_context_defaults_to_zero() {
+    let omitted: GrepToolArgs = serde_json::from_value(json!({
+        "path": "src",
+        "pattern": "main",
+    }))
+    .unwrap();
+    let null: GrepToolArgs = serde_json::from_value(json!({
+        "path": "src",
+        "pattern": "main",
+        "before": null,
+        "after": null,
+    }))
+    .unwrap();
+    let explicit: GrepToolArgs = serde_json::from_value(json!({
+        "path": "src",
+        "pattern": "main",
+        "before": 2,
+        "after": 3,
+    }))
+    .unwrap();
+
+    assert_eq!(omitted.before(), 0);
+    assert_eq!(omitted.after(), 0);
+    assert_eq!(null.before(), 0);
+    assert_eq!(null.after(), 0);
+    assert_eq!(explicit.before(), 2);
+    assert_eq!(explicit.after(), 3);
+}
+
+#[test]
+fn optional_fetch_and_grep_fields_are_not_required_by_their_schemas() {
+    let fetch = serde_json::to_value(schemars::schema_for!(FetchToolArgs)).unwrap();
+    let grep = serde_json::to_value(schemars::schema_for!(GrepToolArgs)).unwrap();
+
+    assert_eq!(fetch["required"], json!(["url"]));
+    assert_eq!(grep["required"], json!(["path", "pattern"]));
+}
+
+#[test]
+fn exploratory_tools_produce_summaries_their_aggregators_can_consume() {
+    let read = ReadFileTool::new(FileBufferStore::default());
+    let read_summary = read
+        .summarize(
+            &ReadFileToolArgs {
+                path: "src/main.rs".to_owned(),
+                start_line: Some(2),
+                end_line: Some(4),
+            },
+            &super::read::ReadFileToolOutput {
+                content: "two\nthree\nfour".to_owned(),
+                start_line: 2,
+                end_line: Some(4),
+                total_lines: Some(10),
+                has_more: true,
+            },
+        )
+        .unwrap();
+    let mut read_aggregator = TypedTool::aggregator(&read).unwrap();
+    read_aggregator.push(&read_summary).unwrap();
+    let mut read_output = "Tool summary:".to_owned();
+    read_aggregator.finish(&mut read_output);
+
+    assert_eq!(
+        read_output,
+        "Tool summary:\n- Read files: src/main.rs; total_lines: 3"
+    );
+
+    let grep = GrepTool;
+    let grep_summary = grep
+        .summarize(
+            &GrepToolArgs {
+                path: "src".to_owned(),
+                pattern: "main".to_owned(),
+                before: None,
+                after: None,
+            },
+            &super::grep::GrepToolOutput {
+                results: "src/main.rs:1:fn main() {}\n--\nsrc/bin.rs:2:fn main() {}\n".to_owned(),
+            },
+        )
+        .unwrap();
+    let mut grep_aggregator = TypedTool::aggregator(&grep).unwrap();
+    grep_aggregator.push(&grep_summary).unwrap();
+    let mut grep_output = "Tool summary:".to_owned();
+    grep_aggregator.finish(&mut grep_output);
+
+    assert_eq!(
+        grep_output,
+        "Tool summary:\n- Grep paths: src; patterns: main; returned_lines: 2"
+    );
+
+    let fetch = FetchTool::new().unwrap();
+    let fetch_summary = fetch
+        .summarize(
+            &FetchToolArgs {
+                url: "https://example.com".to_owned(),
+                raw: None,
+            },
+            &super::fetch::FetchToolOutput {
+                result: "one\ntwo\nthree".to_owned(),
+            },
+        )
+        .unwrap();
+    let mut fetch_aggregator = TypedTool::aggregator(&fetch).unwrap();
+    fetch_aggregator.push(&fetch_summary).unwrap();
+    let mut fetch_output = "Tool summary:".to_owned();
+    fetch_aggregator.finish(&mut fetch_output);
+
+    assert_eq!(
+        fetch_output,
+        "Tool summary:\n- Fetched URLs: https://example.com; total_lines: 3"
+    );
+}
+
+#[test]
 fn write_file_mode_defaults_to_overwrite() {
     let arguments: WriteFileToolArgs = serde_json::from_value(json!({
         "path": "example.txt",
@@ -642,6 +820,7 @@ fn write_file_presenter_describes_append_mode() {
     let result = ToolCallResult {
         id: call.id.clone(),
         outcome: ToolCallOutcome::Success(json!({ "status": "Ok" })),
+        summary: None,
     };
     let presentation = WriteFilePresenter.completed(&call, &result);
 
@@ -704,6 +883,7 @@ fn completed_presents_successful_object_output() {
             "status": "ok",
             "token": "must-not-leak",
         })),
+        summary: None,
     };
     let presentation = DefaultPresenter.completed(&call, &result);
 
@@ -744,6 +924,7 @@ fn completed_presents_failure_with_truncated_message() {
         outcome: ToolCallOutcome::Failure {
             message: "错误".repeat(MAX_ERROR_CHARS),
         },
+        summary: None,
     };
     let presentation = DefaultPresenter.completed(&call, &result);
 
@@ -763,6 +944,7 @@ fn fetch_presenter_presents_successful_status() {
     let result = ToolCallResult {
         id: call.id.clone(),
         outcome: ToolCallOutcome::Success(json!({ "result": "Example" })),
+        summary: None,
     };
     let presentation = FetchPresenter.completed(&call, &result);
 
@@ -787,6 +969,7 @@ fn fetch_presenter_uses_failure_message_as_summary() {
         outcome: ToolCallOutcome::Failure {
             message: "404 Not Found".to_owned(),
         },
+        summary: None,
     };
     let presentation = FetchPresenter.completed(&call, &result);
 
@@ -839,6 +1022,7 @@ fn grep_presenter_presents_matches() {
     let result = ToolCallResult {
         id: call.id.clone(),
         outcome: ToolCallOutcome::Success(json!({ "results": results })),
+        summary: None,
     };
 
     let presentation = GrepPresenter.completed(&call, &result);
@@ -867,6 +1051,7 @@ fn grep_presenter_presents_no_matches() {
     let result = ToolCallResult {
         id: call.id.clone(),
         outcome: ToolCallOutcome::Success(json!({ "results": "\n" })),
+        summary: None,
     };
 
     let presentation = GrepPresenter.completed(&call, &result);
@@ -890,6 +1075,7 @@ fn grep_presenter_presents_failure() {
         outcome: ToolCallOutcome::Failure {
             message: "unclosed character class".to_owned(),
         },
+        summary: None,
     };
 
     let presentation = GrepPresenter.completed(&call, &result);
@@ -916,6 +1102,7 @@ fn read_file_presenter_presents_successful_output() {
             "total_lines": 10,
             "has_more": true,
         })),
+        summary: None,
     };
     let presentation = ReadFilePresenter.completed(&call, &result);
 
@@ -951,6 +1138,7 @@ fn read_file_presenter_presents_unknown_total() {
             "total_lines": null,
             "has_more": true,
         })),
+        summary: None,
     };
     let presentation = ReadFilePresenter.completed(&call, &result);
 
@@ -973,6 +1161,7 @@ fn read_file_presenter_omits_code_block_past_eof() {
             "total_lines": 3,
             "has_more": false,
         })),
+        summary: None,
     };
     let presentation = ReadFilePresenter.completed(&call, &result);
 
@@ -992,6 +1181,7 @@ fn read_file_presenter_presents_failure() {
         outcome: ToolCallOutcome::Failure {
             message: "not found".to_owned(),
         },
+        summary: None,
     };
     let presentation = ReadFilePresenter.completed(&call, &result);
 
@@ -1015,6 +1205,7 @@ fn truncates_long_multiline_unicode_output_safely() {
     let result = ToolCallResult {
         id: call.id.clone(),
         outcome: ToolCallOutcome::Success(Value::String(content)),
+        summary: None,
     };
     let presentation = DefaultPresenter.completed(&call, &result);
 
@@ -1053,6 +1244,7 @@ fn applied_result(
             }},
             "applied": true,
         })),
+        summary: None,
     }
 }
 
@@ -1208,6 +1400,7 @@ fn edit_presenter_reports_an_unapplied_edit_as_a_failure() {
             "status": {"NoCandidate": {"message": "There is no candidate"}},
             "applied": false,
         })),
+        summary: None,
     };
 
     let presentation = EditPresenter.completed(&call, &result);
@@ -1239,6 +1432,7 @@ fn edit_presenter_counts_the_candidates_of_an_ambiguous_edit() {
             ]}},
             "applied": false,
         })),
+        summary: None,
     };
 
     let presentation = EditPresenter.completed(&call, &result);
@@ -1260,6 +1454,7 @@ fn edit_presenter_names_a_missing_file() {
     let result = ToolCallResult {
         id: call.id.clone(),
         outcome: ToolCallOutcome::Success(json!({"status": "FileNotFound", "applied": false})),
+        summary: None,
     };
 
     let presentation = EditPresenter.completed(&call, &result);

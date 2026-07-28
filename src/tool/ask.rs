@@ -21,7 +21,7 @@ impl AskTool {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct AskToolArgs {
     /// question to put to the user
     question: String,
@@ -29,7 +29,7 @@ pub struct AskToolArgs {
     options: Vec<AskToolOption>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct AskToolOption {
     /// short text naming the option
     label: String,

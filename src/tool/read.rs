@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fmt::Write as _, path::Path};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,14 +9,16 @@ use tokio::{
 };
 
 use super::{
-    DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult,
-    ToolCallStatus, TypedTool,
+    Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
+    ToolCallResult, ToolCallStatus, TypedTool,
     file_buffer::{FileBufferStore, FileFingerprint, IndexedFile, is_cacheable},
+    summary::Targets,
 };
 
 pub(super) const MAX_READ_LINES: usize = 200;
+const SUMMARY_VERSION: u32 = 1;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct ReadFileToolArgs {
     /// File path.
     pub(super) path: String,
@@ -37,6 +39,34 @@ pub struct ReadFileToolOutput {
 
 pub struct ReadFileTool {
     buffers: FileBufferStore,
+}
+
+#[derive(Deserialize)]
+struct ReadSummary {
+    path: String,
+    lines: usize,
+}
+
+#[derive(Default)]
+struct ReadAggregator {
+    paths: Targets,
+    lines: usize,
+}
+
+impl Aggregator for ReadAggregator {
+    fn push(&mut self, summary: &Summary) -> anyhow::Result<()> {
+        let summary = summary.deserialize::<ReadSummary>(SUMMARY_VERSION)?;
+
+        self.paths.push(&summary.path);
+        self.lines = self.lines.saturating_add(summary.lines);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>, buf: &mut String) {
+        buf.push_str("\n- Read files: ");
+        self.paths.write_description(buf, "file");
+        let _ = write!(buf, "; total_lines: {}", self.lines);
+    }
 }
 
 impl ReadFileTool {
@@ -240,6 +270,27 @@ impl TypedTool for ReadFileTool {
 
         self.read_range(Path::new(&arguments.path), start_line, requested_end)
             .await
+    }
+
+    fn summarize(&self, arguments: &Self::Arguments, output: &Self::Output) -> Option<Summary> {
+        let lines = output.end_line.map_or(0, |end_line| {
+            end_line
+                .checked_sub(output.start_line)
+                .and_then(|distance| distance.checked_add(1))
+                .unwrap_or(0)
+        });
+
+        Some(Summary::new(
+            SUMMARY_VERSION,
+            serde_json::json!({
+                "path": arguments.path,
+                "lines": lines,
+            }),
+        ))
+    }
+
+    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
+        Some(Box::new(ReadAggregator::default()))
     }
 }
 

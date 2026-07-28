@@ -730,14 +730,14 @@ impl From<Message> for InputItem {
                 id: None,
                 status: Some(OutputStatus::Completed),
             })),
-            Message::ToolCallResult { call_id, output } => {
-                InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
-                    call_id: call_id,
-                    output: FunctionCallOutput::Text(output),
-                    id: None,
-                    status: Some(OutputStatus::Completed),
-                }))
-            }
+            Message::ToolCallResult {
+                call_id, output, ..
+            } => InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
+                call_id,
+                output: FunctionCallOutput::Text(output),
+                id: None,
+                status: Some(OutputStatus::Completed),
+            })),
         }
     }
 }
@@ -783,6 +783,7 @@ impl TryFrom<OutputItem> for Message {
                 Ok(Message::ToolCallResult {
                     call_id,
                     output: text,
+                    summary: None,
                 })
             }
             _ => anyhow::bail!("Unsupported Message"),

@@ -8,6 +8,8 @@ use anyhow::Context as _;
 use serde::Deserialize;
 use tokio::fs;
 
+use crate::context::DEFAULT_TOOL_SUMMARY_TURN_INTERVAL;
+
 const DEFAULT_PATH: &str = "~/.h/config.toml";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -45,6 +47,8 @@ pub struct Config {
     model: String,
     context_window: NonZeroUsize,
     auto_compact_token_limit: NonZeroUsize,
+    #[serde(default = "default_tool_summary_turn_interval")]
+    tool_summary_turn_interval: NonZeroUsize,
     providers: BTreeMap<String, ProviderConfig>,
 }
 
@@ -110,6 +114,10 @@ impl Config {
     pub fn auto_compact_token_limit(&self) -> usize {
         self.auto_compact_token_limit.get()
     }
+
+    pub fn tool_summary_turn_interval(&self) -> NonZeroUsize {
+        self.tool_summary_turn_interval
+    }
 }
 
 impl ProviderConfig {
@@ -154,6 +162,11 @@ fn require_text(field: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn default_tool_summary_turn_interval() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_TOOL_SUMMARY_TURN_INTERVAL)
+        .expect("the default tool summary interval is non-zero")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +201,10 @@ bearer_token = "secret"
         assert_eq!(config.model(), "gpt-5.6-sol");
         assert_eq!(config.context_window(), 200_000);
         assert_eq!(config.auto_compact_token_limit(), 160_000);
+        assert_eq!(
+            config.tool_summary_turn_interval().get(),
+            DEFAULT_TOOL_SUMMARY_TURN_INTERVAL
+        );
 
         let ProviderConfig::OpenAI(provider) = config.provider();
 
@@ -233,6 +250,28 @@ bearer_token = "secret"
         let error = parse_error(&source);
 
         assert!(error.contains("auto_compact_token_limit"));
+    }
+
+    #[test]
+    fn accepts_an_explicit_tool_summary_interval() {
+        let source = VALID.replace(
+            "auto_compact_token_limit = 160000",
+            "auto_compact_token_limit = 160000\ntool_summary_turn_interval = 5",
+        );
+        let config = Config::parse(&source).unwrap();
+
+        assert_eq!(config.tool_summary_turn_interval().get(), 5);
+    }
+
+    #[test]
+    fn rejects_zero_tool_summary_interval() {
+        let source = VALID.replace(
+            "auto_compact_token_limit = 160000",
+            "auto_compact_token_limit = 160000\ntool_summary_turn_interval = 0",
+        );
+        let error = parse_error(&source);
+
+        assert!(error.contains("tool_summary_turn_interval"));
     }
 
     #[test]

@@ -24,7 +24,7 @@ fn default_write_file_mode() -> WriteFileMode {
     WriteFileMode::Overwrite
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct WriteFileToolArgs {
     /// File path.
     pub(super) path: String,
