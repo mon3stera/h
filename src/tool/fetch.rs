@@ -8,7 +8,9 @@ use serde_json::Value;
 
 use super::{
     Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, TypedTool, summary::Targets,
+    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
+    output::{Limits, save_and_preview},
+    summary::Targets,
 };
 
 const DEFAULT_RAW: bool = false;
@@ -22,11 +24,14 @@ pub struct FetchTool {
 struct FetchSummary {
     url: String,
     lines: usize,
+    #[serde(default)]
+    output_path: Option<String>,
 }
 
 #[derive(Default)]
 struct FetchAggregator {
     urls: Targets,
+    outputs: Targets,
     lines: usize,
 }
 
@@ -35,6 +40,9 @@ impl Aggregator for FetchAggregator {
         let summary = summary.deserialize::<FetchSummary>(SUMMARY_VERSION)?;
 
         self.urls.push(&summary.url);
+        if let Some(path) = &summary.output_path {
+            self.outputs.push(path);
+        }
         self.lines = self.lines.saturating_add(summary.lines);
         Ok(())
     }
@@ -43,6 +51,10 @@ impl Aggregator for FetchAggregator {
         buf.push_str("\n- Fetched URLs: ");
         self.urls.write_description(buf, "url");
         let _ = write!(buf, "; total_lines: {}", self.lines);
+        if !self.outputs.is_empty() {
+            buf.push_str("; output_files: ");
+            self.outputs.write_values(buf);
+        }
     }
 }
 
@@ -76,7 +88,7 @@ impl TypedTool for FetchTool {
         "fetch, clean a web page and convert it to markdown"
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let resp = match self.client.get(&arguments.url).send().await {
             Ok(resp) => resp,
             Err(error) => anyhow::bail!("{error}"),
@@ -94,32 +106,36 @@ impl TypedTool for FetchTool {
 
         let text = resp.text().await?;
 
-        if arguments.raw() {
-            return Ok(FetchToolOutput { result: text });
-        }
+        let result = if arguments.raw() {
+            text
+        } else {
+            let readability = Readability::new(
+                &text,
+                Some(&arguments.url),
+                Some(ReadabilityOptions::builder().output_markdown(true).build()),
+            )?;
 
-        let readability = Readability::new(
-            &text,
-            Some(&arguments.url),
-            Some(ReadabilityOptions::builder().output_markdown(true).build()),
-        )?;
-
-        let result = match readability.parse() {
-            Some(article) => article.markdown_content.unwrap(),
-            None => format!("WARNING: failed to clean the page\nRaw: {text}"),
+            match readability.parse() {
+                Some(article) => article.markdown_content.unwrap(),
+                None => format!("WARNING: failed to clean the page\nRaw: {text}"),
+            }
         };
-
-        Ok(FetchToolOutput { result })
-    }
-
-    fn summarize(&self, arguments: &Self::Arguments, output: &Self::Output) -> Option<Summary> {
-        Some(Summary::new(
+        let lines = result.lines().count();
+        let preview = save_and_preview(&result, "fetch", Limits::DEFAULT).await?;
+        let output_path = preview.path.clone();
+        let output = FetchToolOutput {
+            result: preview.content,
+        };
+        let summary = Summary::new(
             SUMMARY_VERSION,
             serde_json::json!({
                 "url": arguments.url,
-                "lines": output.result.lines().count(),
+                "lines": lines,
+                "output_path": output_path,
             }),
-        ))
+        );
+
+        Ok(ToolOutput::new(output).with_summary(summary))
     }
 
     fn aggregator(&self) -> Option<Box<dyn Aggregator>> {

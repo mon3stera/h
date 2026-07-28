@@ -9,7 +9,10 @@ use serde_json::Value;
 
 use super::{
     Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, TypedTool, presentation::truncate_preview, summary::Targets,
+    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
+    output::{Limits, save_and_preview},
+    presentation::truncate_preview,
+    summary::Targets,
 };
 
 const DEFAULT_CONTEXT_LINES: usize = 0;
@@ -22,12 +25,15 @@ struct GrepSummary {
     path: String,
     pattern: String,
     returned_lines: usize,
+    #[serde(default)]
+    output_path: Option<String>,
 }
 
 #[derive(Default)]
 struct GrepAggregator {
     paths: Targets,
     patterns: Targets,
+    outputs: Targets,
     returned_lines: usize,
 }
 
@@ -37,6 +43,9 @@ impl Aggregator for GrepAggregator {
 
         self.paths.push(&summary.path);
         self.patterns.push(&summary.pattern);
+        if let Some(path) = &summary.output_path {
+            self.outputs.push(path);
+        }
         self.returned_lines = self.returned_lines.saturating_add(summary.returned_lines);
         Ok(())
     }
@@ -47,6 +56,10 @@ impl Aggregator for GrepAggregator {
         buf.push_str("; patterns: ");
         self.patterns.write_description(buf, "pattern");
         let _ = write!(buf, "; returned_lines: {}", self.returned_lines);
+        if !self.outputs.is_empty() {
+            buf.push_str("; output_files: ");
+            self.outputs.write_values(buf);
+        }
     }
 }
 
@@ -130,7 +143,7 @@ impl TypedTool for GrepTool {
         "grep a pattern in specific path (file or directory)"
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let matcher = RegexMatcher::new(&arguments.pattern)?;
 
         let mut searcher = SearcherBuilder::new()
@@ -160,25 +173,27 @@ impl TypedTool for GrepTool {
             }
         }
 
-        Ok(GrepToolOutput { results })
-    }
-
-    fn summarize(&self, arguments: &Self::Arguments, output: &Self::Output) -> Option<Summary> {
-        let returned_lines = output
-            .results
+        let returned_lines = results
             .trim_matches('\n')
             .lines()
             .filter(|line| !line.is_empty() && *line != "--")
             .count();
-
-        Some(Summary::new(
+        let preview = save_and_preview(&results, "grep", Limits::DEFAULT).await?;
+        let output_path = preview.path.clone();
+        let output = GrepToolOutput {
+            results: preview.content,
+        };
+        let summary = Summary::new(
             SUMMARY_VERSION,
             serde_json::json!({
                 "path": arguments.path,
                 "pattern": arguments.pattern,
                 "returned_lines": returned_lines,
+                "output_path": output_path,
             }),
-        ))
+        );
+
+        Ok(ToolOutput::new(output).with_summary(summary))
     }
 
     fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
@@ -235,10 +250,18 @@ impl Presenter for GrepPresenter {
                         vec![DisplayBlock::Summary("No matches".to_owned())],
                     )
                 } else {
-                    let returned_lines = results
-                        .lines()
-                        .filter(|line| !line.is_empty() && *line != "--")
-                        .count();
+                    let returned_lines = result
+                        .summary()
+                        .and_then(|summary| {
+                            summary.deserialize::<GrepSummary>(SUMMARY_VERSION).ok()
+                        })
+                        .map(|summary| summary.returned_lines)
+                        .unwrap_or_else(|| {
+                            results
+                                .lines()
+                                .filter(|line| !line.is_empty() && *line != "--")
+                                .count()
+                        });
                     let (content, truncated_lines) = truncate_preview(results);
 
                     (

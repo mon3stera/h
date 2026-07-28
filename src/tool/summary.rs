@@ -50,6 +50,10 @@ pub(super) struct Targets {
 }
 
 impl Targets {
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
     pub fn push(&mut self, value: &str) {
         if !self.values.iter().any(|known| known == value) {
             self.values.push(value.to_owned());
@@ -64,5 +68,9 @@ impl Targets {
 
         let suffix = if self.values.len() == 1 { "" } else { "s" };
         let _ = write!(buf, "{} {singular}{suffix}", self.values.len());
+    }
+
+    pub fn write_values(&self, buf: &mut String) {
+        let _ = write!(buf, "{}", self.values.join(", "));
     }
 }

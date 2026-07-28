@@ -10,7 +10,7 @@ use tokio::{
 
 use super::{
     DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult,
-    ToolCallStatus, TypedTool, file_buffer::FileBufferStore,
+    ToolCallStatus, ToolOutput, TypedTool, file_buffer::FileBufferStore,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -63,7 +63,7 @@ impl TypedTool for WriteFileTool {
         "write content to a file by overwriting it or appending to its end"
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let path = PathBuf::from(&arguments.path);
 
         match arguments.mode {
@@ -81,9 +81,9 @@ impl TypedTool for WriteFileTool {
 
         self.buffers.invalidate(&path).await;
 
-        Ok(WriteFileToolOutput {
+        Ok(ToolOutput::new(WriteFileToolOutput {
             status: "Ok".to_owned(),
-        })
+        }))
     }
 }
 

@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
 use serde_json::json;
-use tokio::fs;
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 use super::*;
 
@@ -21,7 +25,7 @@ fn temporary_file(name: &str) -> PathBuf {
 async fn read_file_defaults_to_a_bounded_first_page() {
     let path = temporary_file("bounded-read");
     let content = (1..=MAX_READ_LINES + 50)
-        .map(|line| format!("line {line}"))
+        .map(|_| "x")
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&path, content).await.unwrap();
@@ -33,18 +37,20 @@ async fn read_file_defaults_to_a_bounded_first_page() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
 
     assert_eq!(output.start_line, 1);
     assert_eq!(output.end_line, Some(MAX_READ_LINES));
     assert_eq!(output.total_lines, None);
     assert!(output.has_more);
     assert_eq!(output.content.lines().count(), MAX_READ_LINES);
-    assert!(output.content.starts_with("line 1\n"));
-    assert!(output.content.ends_with(&format!("line {MAX_READ_LINES}")));
+    assert_eq!(output.next_start_line, Some(MAX_READ_LINES + 1));
+    assert_eq!(output.next_offset, Some(0));
 
     fs::remove_file(path).await.unwrap();
 }
@@ -61,10 +67,12 @@ async fn read_file_uses_one_based_inclusive_ranges() {
             path: path.to_string_lossy().into_owned(),
             start_line: Some(2),
             end_line: Some(4),
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
 
     assert_eq!(output.content, "two\n\nfour");
     assert_eq!(output.start_line, 2);
@@ -94,6 +102,7 @@ async fn read_file_validates_ranges_before_reading() {
                 path: missing.clone(),
                 start_line,
                 end_line,
+                offset: None,
             },
         )
         .await
@@ -106,7 +115,7 @@ async fn read_file_validates_ranges_before_reading() {
 async fn read_file_clamps_explicit_ranges_to_the_page_limit() {
     let path = temporary_file("clamped-read");
     let content = (1..=MAX_READ_LINES + 100)
-        .map(|line| format!("line {line}"))
+        .map(|_| "x")
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&path, content).await.unwrap();
@@ -118,20 +127,16 @@ async fn read_file_clamps_explicit_ranges_to_the_page_limit() {
             path: path.to_string_lossy().into_owned(),
             start_line: Some(2),
             end_line: Some(MAX_READ_LINES + 100),
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
 
     assert_eq!(output.start_line, 2);
     assert_eq!(output.end_line, Some(MAX_READ_LINES + 1));
     assert_eq!(output.content.lines().count(), MAX_READ_LINES);
-    assert!(output.content.starts_with("line 2\n"));
-    assert!(
-        output
-            .content
-            .ends_with(&format!("line {}", MAX_READ_LINES + 1))
-    );
     assert!(output.has_more);
 
     fs::remove_file(path).await.unwrap();
@@ -141,7 +146,107 @@ async fn read_file_clamps_explicit_ranges_to_the_page_limit() {
 fn read_file_description_explains_the_clamp() {
     let tool = ReadFileTool::new(FileBufferStore::default());
 
-    assert!(TypedTool::description(&tool).contains("clamped to 500"));
+    assert!(TypedTool::description(&tool).contains("500 lines and 2048 characters"));
+}
+
+#[tokio::test]
+async fn read_file_continues_a_long_unicode_line_by_byte_offset() {
+    let path = temporary_file("character-page");
+    let content = "界".repeat(MAX_READ_CHARS + 10);
+    fs::write(&path, &content).await.unwrap();
+    let tool = ReadFileTool::new(FileBufferStore::default());
+
+    let first = TypedTool::call(
+        &tool,
+        ReadFileToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            start_line: Some(1),
+            end_line: Some(1),
+            offset: None,
+        },
+    )
+    .await
+    .unwrap()
+    .into_value();
+    assert_eq!(first.content.chars().count(), MAX_READ_CHARS);
+    assert_eq!(first.next_start_line, Some(1));
+    assert_eq!(first.next_offset, Some(MAX_READ_CHARS * "界".len()));
+    assert_eq!(first.truncated_bytes, 10 * "界".len());
+
+    let second = TypedTool::call(
+        &tool,
+        ReadFileToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            start_line: first.next_start_line,
+            end_line: Some(1),
+            offset: first.next_offset,
+        },
+    )
+    .await
+    .unwrap()
+    .into_value();
+    assert_eq!(second.content, "界".repeat(10));
+    assert!(!second.has_more);
+
+    fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn read_file_continues_after_a_multiline_character_page() {
+    let path = temporary_file("multiline-character-page");
+    let (first_line, second_line, third_line) = ("a".repeat(1_000), "界".repeat(1_500), "tail");
+    let content = format!("{first_line}\n{second_line}\n{third_line}");
+    fs::write(&path, content).await.unwrap();
+    let tool = ReadFileTool::new(FileBufferStore::default());
+
+    let first = TypedTool::call(
+        &tool,
+        ReadFileToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            start_line: Some(1),
+            end_line: Some(3),
+            offset: None,
+        },
+    )
+    .await
+    .unwrap()
+    .into_value();
+    let continued_chars = MAX_READ_CHARS - first_line.len() - 1;
+    let continued_bytes = continued_chars * "界".len();
+    let remaining_second_line = second_line.chars().count() - continued_chars;
+    let remaining_bytes = remaining_second_line * "界".len() + 1 + third_line.len();
+
+    assert_eq!(first.content.chars().count(), MAX_READ_CHARS);
+    assert_eq!(first.end_line, Some(2));
+    assert_eq!(first.next_start_line, Some(2));
+    assert_eq!(first.next_offset, Some(continued_bytes));
+    assert_eq!(first.truncated_lines, 2);
+    assert_eq!(first.truncated_bytes, remaining_bytes);
+
+    let second = TypedTool::call(
+        &tool,
+        ReadFileToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            start_line: first.next_start_line,
+            end_line: Some(3),
+            offset: first.next_offset,
+        },
+    )
+    .await
+    .unwrap()
+    .into_value();
+
+    assert_eq!(
+        second.content,
+        format!("{}\n{third_line}", "界".repeat(remaining_second_line))
+    );
+    assert_eq!(second.start_line, 2);
+    assert_eq!(second.end_line, Some(3));
+    assert!(!second.has_more);
+    assert_eq!(second.next_start_line, None);
+    assert_eq!(second.next_offset, None);
+
+    fs::remove_file(path).await.unwrap();
 }
 
 #[tokio::test]
@@ -156,10 +261,12 @@ async fn read_file_handles_empty_and_past_eof_ranges() {
             path: path.to_string_lossy().into_owned(),
             start_line: Some(10),
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
 
     assert!(output.content.is_empty());
     assert_eq!(output.start_line, 10);
@@ -187,10 +294,12 @@ async fn file_indexes_extend_lazily_and_refresh_external_changes() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(first.total_lines, None);
 
     let index = buffers.files.read().await.values().next().cloned().unwrap();
@@ -206,10 +315,12 @@ async fn file_indexes_extend_lazily_and_refresh_external_changes() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(refreshed.content, "new content");
     assert_eq!(refreshed.total_lines, Some(1));
 
@@ -229,10 +340,12 @@ async fn read_file_reaches_eof_and_remembers_exact_total() {
             path: path.to_string_lossy().into_owned(),
             start_line: Some(2),
             end_line: Some(3),
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(output.content, "two\nthree");
     assert_eq!(output.total_lines, Some(3));
     assert!(!output.has_more);
@@ -255,10 +368,12 @@ async fn read_file_normalizes_crlf_and_preserves_blank_lines() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(output.content, "one\n\nthree");
     assert_eq!(output.total_lines, Some(3));
 
@@ -277,6 +392,7 @@ async fn read_file_rejects_invalid_utf8_in_scanned_lines() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
@@ -298,10 +414,12 @@ async fn proc_files_bypass_the_reusable_index() {
             path: "/proc/uptime".to_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let second = TypedTool::call(
         &reader,
@@ -309,10 +427,12 @@ async fn proc_files_bypass_the_reusable_index() {
             path: "/proc/uptime".to_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
 
     assert_ne!(first.content, second.content);
     assert!(buffers.files.read().await.is_empty());
@@ -332,10 +452,12 @@ async fn write_file_invalidates_the_shared_read_buffer() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(before.content, "old");
     assert_eq!(buffers.files.read().await.len(), 1);
 
@@ -348,7 +470,8 @@ async fn write_file_invalidates_the_shared_read_buffer() {
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert!(buffers.files.read().await.is_empty());
 
     let after = TypedTool::call(
@@ -357,10 +480,12 @@ async fn write_file_invalidates_the_shared_read_buffer() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(after.content, "new");
 
     fs::remove_file(path).await.unwrap();
@@ -380,10 +505,12 @@ async fn write_file_appends_and_invalidates_the_shared_read_buffer() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(buffers.files.read().await.len(), 1);
 
     TypedTool::call(
@@ -404,10 +531,12 @@ async fn write_file_appends_and_invalidates_the_shared_read_buffer() {
             path: path.to_string_lossy().into_owned(),
             start_line: None,
             end_line: None,
+            offset: None,
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
     assert_eq!(output.content, "first\nsecond");
 
     fs::remove_file(path).await.unwrap();
@@ -422,7 +551,10 @@ fn bash_arguments_deserialize_by_action() {
     .unwrap();
     assert!(matches!(
         run_blocking,
-        BashToolArgs::RunBlocking { command } if command == "cargo test"
+        BashToolArgs::RunBlocking {
+            command,
+            brief: None,
+        } if command == "cargo test"
     ));
 
     let run_background: BashToolArgs = serde_json::from_value(json!({
@@ -674,6 +806,7 @@ fn bash_presenter_presents_waited_session_output() {
         call.id.clone(),
         serde_json::to_value(BashToolOutput::Output {
             output: "\u{1b}[32mdone\u{1b}[0m\r\n".to_owned(),
+            path: None,
         })
         .unwrap(),
     );
@@ -748,6 +881,109 @@ fn grep_context_defaults_to_zero() {
     assert_eq!(explicit.after(), 3);
 }
 
+#[tokio::test]
+async fn grep_saves_full_results_and_summarizes_before_truncation() {
+    let path = temporary_file("grep-output");
+    let content = (1..=300)
+        .map(|line| format!("needle {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, content).await.unwrap();
+    let tool = GrepTool;
+
+    let output = TypedTool::call(
+        &tool,
+        GrepToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            pattern: "needle".to_owned(),
+            before: None,
+            after: None,
+        },
+    )
+    .await
+    .unwrap();
+    let output_path = output
+        .value()
+        .results
+        .lines()
+        .find_map(|line| line.strip_prefix("Full output: "))
+        .unwrap();
+    let full_output = fs::read_to_string(output_path).await.unwrap();
+
+    assert!(full_output.contains(":1:needle 1\n"));
+    assert!(full_output.contains(":300:needle 300"));
+    assert!(output.value().results.contains(":1:needle 1\n"));
+    assert!(output.value().results.contains(":300:needle 300"));
+    assert!(output.value().results.contains("bytes omitted"));
+
+    let mut aggregator = TypedTool::aggregator(&tool).unwrap();
+    aggregator.push(output.summary().unwrap()).unwrap();
+    let mut summary = "Tool summary:".to_owned();
+    aggregator.finish(&mut summary);
+    assert!(summary.contains("returned_lines: 300"));
+    assert!(summary.contains(output_path));
+
+    fs::remove_file(output_path).await.unwrap();
+    fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn fetch_saves_full_raw_output_when_the_preview_is_truncated() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = (1..=300)
+        .map(|line| format!("fetch line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let response_body = body.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 4_096];
+        let _ = stream.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let tool = FetchTool::new().unwrap();
+    let output = TypedTool::call(
+        &tool,
+        FetchToolArgs {
+            url: format!("http://{address}"),
+            raw: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+
+    let output_path = output
+        .value()
+        .result
+        .lines()
+        .find_map(|line| line.strip_prefix("Full output: "))
+        .unwrap();
+    let full_output = fs::read_to_string(output_path).await.unwrap();
+
+    assert_eq!(full_output, body);
+    assert!(output.value().result.contains("fetch line 1\n"));
+    assert!(output.value().result.contains("fetch line 300"));
+    assert!(output.value().result.contains("bytes omitted"));
+
+    let mut aggregator = TypedTool::aggregator(&tool).unwrap();
+    aggregator.push(output.summary().unwrap()).unwrap();
+    let mut summary = "Tool summary:".to_owned();
+    aggregator.finish(&mut summary);
+    assert!(summary.contains("total_lines: 300"));
+    assert!(summary.contains(output_path));
+
+    fs::remove_file(output_path).await.unwrap();
+}
+
 #[test]
 fn optional_fetch_and_grep_fields_are_not_required_by_their_schemas() {
     let fetch = serde_json::to_value(schemars::schema_for!(FetchToolArgs)).unwrap();
@@ -758,24 +994,15 @@ fn optional_fetch_and_grep_fields_are_not_required_by_their_schemas() {
 }
 
 #[test]
-fn exploratory_tools_produce_summaries_their_aggregators_can_consume() {
+fn exploratory_tool_aggregators_consume_versioned_summaries() {
     let read = ReadFileTool::new(FileBufferStore::default());
-    let read_summary = read
-        .summarize(
-            &ReadFileToolArgs {
-                path: "src/main.rs".to_owned(),
-                start_line: Some(2),
-                end_line: Some(4),
-            },
-            &super::read::ReadFileToolOutput {
-                content: "two\nthree\nfour".to_owned(),
-                start_line: 2,
-                end_line: Some(4),
-                total_lines: Some(10),
-                has_more: true,
-            },
-        )
-        .unwrap();
+    let read_summary = Summary::new(
+        1,
+        json!({
+            "path": "src/main.rs",
+            "lines": 3,
+        }),
+    );
     let mut read_aggregator = TypedTool::aggregator(&read).unwrap();
     read_aggregator.push(&read_summary).unwrap();
     let mut read_output = "Tool summary:".to_owned();
@@ -787,19 +1014,14 @@ fn exploratory_tools_produce_summaries_their_aggregators_can_consume() {
     );
 
     let grep = GrepTool;
-    let grep_summary = grep
-        .summarize(
-            &GrepToolArgs {
-                path: "src".to_owned(),
-                pattern: "main".to_owned(),
-                before: None,
-                after: None,
-            },
-            &super::grep::GrepToolOutput {
-                results: "src/main.rs:1:fn main() {}\n--\nsrc/bin.rs:2:fn main() {}\n".to_owned(),
-            },
-        )
-        .unwrap();
+    let grep_summary = Summary::new(
+        1,
+        json!({
+            "path": "src",
+            "pattern": "main",
+            "returned_lines": 2,
+        }),
+    );
     let mut grep_aggregator = TypedTool::aggregator(&grep).unwrap();
     grep_aggregator.push(&grep_summary).unwrap();
     let mut grep_output = "Tool summary:".to_owned();
@@ -811,17 +1033,13 @@ fn exploratory_tools_produce_summaries_their_aggregators_can_consume() {
     );
 
     let fetch = FetchTool::new().unwrap();
-    let fetch_summary = fetch
-        .summarize(
-            &FetchToolArgs {
-                url: "https://example.com".to_owned(),
-                raw: None,
-            },
-            &super::fetch::FetchToolOutput {
-                result: "one\ntwo\nthree".to_owned(),
-            },
-        )
-        .unwrap();
+    let fetch_summary = Summary::new(
+        1,
+        json!({
+            "url": "https://example.com",
+            "lines": 3,
+        }),
+    );
     let mut fetch_aggregator = TypedTool::aggregator(&fetch).unwrap();
     fetch_aggregator.push(&fetch_summary).unwrap();
     let mut fetch_output = "Tool summary:".to_owned();
@@ -1559,7 +1777,10 @@ async fn edit_tool_output_feeds_its_presenter_end_to_end() {
             "target": "TEN\nELEVEN\n",
         }),
     );
-    let result = ToolCallResult::success(call.id.clone(), serde_json::to_value(&output).unwrap());
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        serde_json::to_value(output.value()).unwrap(),
+    );
     let presentation = EditPresenter.completed(&call, &result);
 
     assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
@@ -1628,7 +1849,7 @@ async fn edit_refuses_an_ambiguous_source_and_leaves_the_file_alone() {
     .await
     .unwrap();
 
-    let serialized = serde_json::to_value(&output).unwrap();
+    let serialized = serde_json::to_value(output.value()).unwrap();
 
     assert_eq!(serialized["applied"], json!(false));
     assert_eq!(
@@ -1665,7 +1886,7 @@ async fn edit_replaces_only_the_range_that_matched() {
     .unwrap();
 
     assert_eq!(
-        serde_json::to_value(&output).unwrap()["applied"],
+        serde_json::to_value(output.value()).unwrap()["applied"],
         json!(true)
     );
     assert_eq!(
@@ -1693,7 +1914,7 @@ async fn edit_refuses_an_empty_source_rather_than_shredding_the_file() {
     .await
     .unwrap();
 
-    let serialized = serde_json::to_value(&output).unwrap();
+    let serialized = serde_json::to_value(output.value()).unwrap();
 
     assert_eq!(serialized["applied"], json!(false));
     assert_eq!(

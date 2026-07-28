@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
-/// How many times opening a provider stream is attempted before giving up.
+/// How many times a provider request is attempted before giving up.
 const STREAM_MAX_ATTEMPTS: u32 = 4;
 
 const STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(150);
@@ -67,6 +67,16 @@ struct TurnMetrics {
     tool_call_count: usize,
     unsupported_signal_count: usize,
     completion_reason: &'static str,
+}
+
+enum RequestAttempt {
+    Completed,
+    Interrupted,
+    Retry {
+        error: anyhow::Error,
+        error_class: &'static str,
+        had_output: bool,
+    },
 }
 
 pub enum NextTurn {
@@ -472,75 +482,75 @@ where
         );
     }
 
-    /// Opens a provider stream, retrying a failed open with an exponential
-    /// backoff.
-    ///
-    /// Retrying is safe only here: nothing has reached the context or the view
-    /// yet, so a fresh attempt starts from the same state. An error part-way
-    /// through a stream is left alone — deltas have already been broadcast and
-    /// folded into the context, so re-requesting would duplicate them.
-    ///
-    /// Every error is retried. The provider hands back `anyhow::Error`, which
-    /// keeps a refused request (bad key, malformed input) indistinguishable from
-    /// a dropped connection; retrying the former wastes about a second.
     async fn open_stream(
         &self,
-        request_index: usize,
         cancellation: &CancellationToken,
     ) -> anyhow::Result<Option<ProviderEventStream<P::StreamEvent>>> {
         let messages = self.context.provider_messages();
-        let mut attempt = 1;
+
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(None),
+            opened = self.provider.stream(&messages) => opened.map(Some),
+        }
+    }
+
+    async fn attempt_request(
+        &mut self,
+        metrics: &mut TurnMetrics,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<RequestAttempt> {
+        let mut stream = match self.open_stream(cancellation).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return Ok(RequestAttempt::Interrupted),
+            Err(error) => {
+                return Ok(RequestAttempt::Retry {
+                    error,
+                    error_class: "provider_stream_open_error",
+                    had_output: false,
+                });
+            }
+        };
+        let mut had_output = false;
 
         loop {
-            let opened = tokio::select! {
+            let event = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(None),
-                opened = self.provider.stream(&messages) => opened,
+                _ = cancellation.cancelled() => return Ok(RequestAttempt::Interrupted),
+                event = stream.next() => event,
             };
 
-            match opened {
-                Ok(stream) => {
-                    if attempt > 1 {
-                        tracing::info!(
-                            event = "agent.provider_stream.recovered",
-                            request_index,
-                            attempt
-                        );
+            match event {
+                Some(Ok(event)) => {
+                    if cancellation.is_cancelled() {
+                        return Ok(RequestAttempt::Interrupted);
                     }
 
-                    return Ok(Some(stream));
-                }
-                Err(e) if attempt < STREAM_MAX_ATTEMPTS => {
-                    let delay = stream_retry_delay(attempt);
+                    let signal = self.provider.handle(event).await?;
+                    let completed = matches!(&signal, ProviderSignal::Completed(_));
+                    had_output |= !matches!(&signal, ProviderSignal::Unsupported);
 
-                    tracing::warn!(
-                        event = "agent.provider_stream.retrying",
-                        request_index,
-                        attempt,
-                        max_attempts = STREAM_MAX_ATTEMPTS,
-                        delay_ms = delay.as_millis() as u64,
-                        error_class = "provider_stream_open_error",
-                        error = e.to_string(),
-                    );
+                    let agent_event: AgentEvent = signal.clone().into();
+                    self.event_bus.broadcast(agent_event);
+                    self.handle_signal(&signal, metrics, cancellation).await?;
 
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => return Ok(None),
-                        _ = tokio::time::sleep(delay) => {}
+                    if completed {
+                        return Ok(RequestAttempt::Completed);
                     }
-
-                    attempt += 1;
                 }
-                Err(e) => {
-                    tracing::error!(
-                        event = "agent.provider_stream.exhausted",
-                        request_index,
-                        attempt,
-                        error_class = "provider_stream_open_error",
-                        error = e.to_string(),
-                    );
-
-                    return Err(e);
+                Some(Err(error)) => {
+                    return Ok(RequestAttempt::Retry {
+                        error,
+                        error_class: "provider_stream_error",
+                        had_output,
+                    });
+                }
+                None => {
+                    return Ok(RequestAttempt::Retry {
+                        error: anyhow::anyhow!("provider stream ended before response.completed"),
+                        error_class: "provider_stream_eof",
+                        had_output,
+                    });
                 }
             }
         }
@@ -572,67 +582,72 @@ where
             message_count = self.context.histories().len()
         );
 
-        let mut stream = match self.open_stream(request_index, cancellation).await {
-            Ok(Some(stream)) => stream,
-            Ok(None) => {
-                self.finish_interrupted(metrics);
-                return Ok(());
-            }
-            Err(e) => {
-                self.view_bus.broadcast(AgentViewEvent::Err(e.to_string()));
-                return Err(e);
-            }
-        };
+        let mut attempt = 1;
 
         loop {
-            // This is the main cancellation point: choosing the cancellation
-            // branch drops the provider stream and therefore its in-flight
-            // request according to the Provider contract.
-            let event = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    self.finish_interrupted(metrics);
-                    return Ok(());
-                }
-                event = stream.next() => event,
-            };
-
-            match event {
-                Some(Ok(event)) => {
-                    if cancellation.is_cancelled() {
-                        self.finish_interrupted(metrics);
-                        return Ok(());
-                    }
-
-                    let signal = self.provider.handle(event).await?;
-
-                    let agent_event: AgentEvent = signal.clone().into();
-                    self.event_bus.broadcast(agent_event);
-                    self.handle_signal(&signal, metrics, cancellation).await?;
-                }
-                Some(e) => {
-                    tracing::warn!(
-                        event = "agent.provider_request.failed",
-                        request_index,
-                        error_class = "provider_stream_error",
-                        duration_ms = request_started.elapsed().as_millis() as u64
-                    );
-
-                    match e {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.view_bus.broadcast(AgentViewEvent::Err(e.to_string()));
-                            break Err(e);
-                        }
-                    }
-                }
-                None => {
+            match self.attempt_request(metrics, cancellation).await? {
+                RequestAttempt::Completed => {
                     tracing::info!(
                         event = "agent.provider_request.completed",
                         request_index,
+                        attempt,
                         duration_ms = request_started.elapsed().as_millis() as u64
                     );
-                    break Ok(());
+
+                    return Ok(());
+                }
+                RequestAttempt::Interrupted => {
+                    self.finish_interrupted(metrics);
+                    return Ok(());
+                }
+                RequestAttempt::Retry {
+                    error,
+                    error_class,
+                    had_output,
+                } => {
+                    // Preserve partial text and tool results before the next
+                    // attempt builds a fresh provider-facing message list.
+                    self.merge_text_delta();
+                    if had_output {
+                        self.view_bus.broadcast(AgentViewEvent::Completed);
+                    }
+
+                    if attempt == STREAM_MAX_ATTEMPTS {
+                        tracing::error!(
+                            event = "agent.provider_request.exhausted",
+                            request_index,
+                            attempt,
+                            error_class,
+                            error = error.to_string(),
+                            duration_ms = request_started.elapsed().as_millis() as u64
+                        );
+                        self.view_bus
+                            .broadcast(AgentViewEvent::Err(error.to_string()));
+
+                        return Err(error);
+                    }
+
+                    let delay = stream_retry_delay(attempt);
+                    tracing::warn!(
+                        event = "agent.provider_request.retrying",
+                        request_index,
+                        attempt,
+                        max_attempts = STREAM_MAX_ATTEMPTS,
+                        delay_ms = delay.as_millis() as u64,
+                        error_class,
+                        error = error.to_string(),
+                    );
+
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            self.finish_interrupted(metrics);
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+
+                    attempt += 1;
                 }
             }
         }
@@ -658,7 +673,8 @@ mod tests {
 
     use super::*;
     use crate::tool::{
-        FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition, TypedTool,
+        FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition,
+        ToolOutput, TypedTool,
     };
 
     fn cancellation() -> CancellationToken {
@@ -880,7 +896,10 @@ mod tests {
             "wait forever for cancellation tests"
         }
 
-        async fn call(&self, _arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+        async fn call(
+            &self,
+            _arguments: Self::Arguments,
+        ) -> anyhow::Result<ToolOutput<Self::Output>> {
             self.started.notify_one();
             std::future::pending().await
         }
@@ -894,9 +913,9 @@ mod tests {
     /// Reports a scripted completion reason per provider request, so a turn that
     /// spans several rounds can be driven without a provider.
     ///
-    /// Once the script runs out it reports nothing, which ends the turn. A
-    /// provider that answered `NeedCall` forever would keep [`Agent::run_turn`]
-    /// opening fresh requests and never return.
+    /// Once the script runs out it reports nothing, which exercises the
+    /// premature-EOF path. A provider that answered `NeedCall` forever would
+    /// keep [`Agent::run_turn`] opening fresh requests and never return.
     struct ScriptedProvider {
         reasons: std::collections::VecDeque<CompletedReason>,
     }
@@ -1073,7 +1092,7 @@ mod tests {
             .context
             .complete_turn(NonZeroUsize::new(1).unwrap(), &agent.tool);
 
-        agent.open_stream(1, &cancellation()).await.unwrap();
+        agent.open_stream(&cancellation()).await.unwrap();
 
         assert!(matches!(
             input.lock().unwrap().as_slice(),
@@ -1304,18 +1323,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_turn_that_never_reached_a_final_answer_reports_that() {
         let mut agent = Agent::new(ScriptedProvider::new([CompletedReason::NeedCall]));
         let mut events = agent.subscribe_view();
 
-        // The second request reports nothing, which is how this ends rather than
-        // asking for another tool round forever.
-        agent
+        let error = agent
             .continue_turn("ask something", cancellation())
             .await
-            .unwrap();
+            .unwrap_err();
 
+        assert!(
+            error
+                .to_string()
+                .contains("provider stream ended before response.completed")
+        );
         assert_eq!(turn_finished(&mut events), Some(false));
     }
 
@@ -1335,16 +1357,25 @@ mod tests {
         ));
     }
 
-    /// Fails `stream` a set number of times before succeeding, counting every
-    /// attempt so the backoff can be asserted on.
+    #[derive(Clone, Copy)]
+    enum FailurePoint {
+        Open,
+        Stream,
+        Eof,
+    }
+
+    /// Fails a provider request at one point a set number of times before
+    /// completing, counting every attempt so the backoff can be asserted on.
     struct FlakyProvider {
+        point: FailurePoint,
         failures_left: AtomicUsize,
         attempts: AtomicUsize,
     }
 
     impl FlakyProvider {
-        fn new(failures: usize) -> Self {
+        fn new(point: FailurePoint, failures: usize) -> Self {
             Self {
+                point,
                 failures_left: AtomicUsize::new(failures),
                 attempts: AtomicUsize::new(0),
             }
@@ -1357,7 +1388,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for FlakyProvider {
-        type StreamEvent = ();
+        type StreamEvent = ProviderSignal;
 
         fn model(&self) -> &str {
             "flaky-model"
@@ -1371,8 +1402,8 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(ProviderSignal::Unsupported)
+        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(event)
         }
 
         async fn stream(
@@ -1382,17 +1413,74 @@ mod tests {
         {
             self.attempts.fetch_add(1, Ordering::SeqCst);
 
-            if self
+            let should_fail = self
                 .failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
-                .is_ok()
-            {
-                anyhow::bail!("connection reset by peer");
+                .is_ok();
+
+            if should_fail {
+                return match self.point {
+                    FailurePoint::Open => anyhow::bail!("connection reset by peer"),
+                    FailurePoint::Stream => Ok(Box::pin(stream::once(async {
+                        Err(anyhow::anyhow!("stream reset by peer"))
+                    }))),
+                    FailurePoint::Eof => Ok(Box::pin(stream::empty())),
+                };
             }
 
-            Ok(Box::pin(stream::empty()))
+            Ok(Box::pin(stream::once(async {
+                Ok(ProviderSignal::Completed(CompletedReason::Final))
+            })))
+        }
+    }
+
+    struct PartialRetryProvider {
+        point: FailurePoint,
+        attempts: AtomicUsize,
+        inputs: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PartialRetryProvider {
+        type StreamEvent = ProviderSignal;
+
+        fn model(&self) -> &str {
+            "partial-retry-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(event)
+        }
+
+        async fn stream(
+            &self,
+            input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            self.inputs.lock().unwrap().push(input.to_vec());
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let events = if attempt == 0 {
+                let mut events = vec![Ok(ProviderSignal::TextDelta("partial answer".to_owned()))];
+
+                if matches!(self.point, FailurePoint::Stream) {
+                    events.push(Err(anyhow::anyhow!("stream reset by peer")));
+                }
+
+                events
+            } else {
+                vec![Ok(ProviderSignal::Completed(CompletedReason::Final))]
+            };
+
+            Ok(Box::pin(stream::iter(events)))
         }
     }
 
@@ -1405,10 +1493,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_transient_failure_is_retried_until_the_stream_opens() {
-        let agent = Agent::new(FlakyProvider::new(2));
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Open, 2));
         let started = tokio::time::Instant::now();
 
-        assert!(agent.open_stream(1, &cancellation()).await.is_ok());
+        agent
+            .continue_turn("retry opening", cancellation())
+            .await
+            .unwrap();
         assert_eq!(agent.provider.attempts(), 3, "two failures, then a success");
         assert_eq!(
             started.elapsed(),
@@ -1419,10 +1510,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stream_that_never_opens_gives_up_after_the_last_attempt() {
-        let agent = Agent::new(FlakyProvider::new(usize::MAX));
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Open, usize::MAX));
         let started = tokio::time::Instant::now();
 
-        assert!(agent.open_stream(1, &cancellation()).await.is_err());
+        assert!(
+            agent
+                .continue_turn("keep retrying", cancellation())
+                .await
+                .is_err()
+        );
         assert_eq!(agent.provider.attempts(), STREAM_MAX_ATTEMPTS as usize);
         assert_eq!(
             started.elapsed(),
@@ -1433,21 +1529,75 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stream_that_opens_first_try_does_not_wait() {
-        let agent = Agent::new(FlakyProvider::new(0));
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Open, 0));
         let started = tokio::time::Instant::now();
 
-        assert!(agent.open_stream(1, &cancellation()).await.is_ok());
+        agent
+            .continue_turn("open once", cancellation())
+            .await
+            .unwrap();
         assert_eq!(agent.provider.attempts(), 1);
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_error_is_retried() {
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Stream, 1));
+        let started = tokio::time::Instant::now();
+
+        agent
+            .continue_turn("retry an event error", cancellation())
+            .await
+            .unwrap();
+
+        assert_eq!(agent.provider.attempts(), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_premature_eof_is_retried() {
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Eof, 1));
+        let started = tokio::time::Instant::now();
+
+        agent
+            .continue_turn("retry an eof", cancellation())
+            .await
+            .unwrap();
+
+        assert_eq!(agent.provider.attempts(), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_continue_from_partial_text() {
+        for point in [FailurePoint::Stream, FailurePoint::Eof] {
+            let inputs = Arc::new(Mutex::new(Vec::new()));
+            let mut agent = Agent::new(PartialRetryProvider {
+                point,
+                attempts: AtomicUsize::new(0),
+                inputs: inputs.clone(),
+            });
+
+            agent
+                .continue_turn("start answering", cancellation())
+                .await
+                .unwrap();
+
+            let inputs = inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 2);
+            assert!(inputs[1].iter().any(|message| {
+                matches!(message, Message::Assistant(text) if text == "partial answer")
+            }));
+        }
+    }
+
     #[tokio::test]
     async fn a_cancelled_stream_open_never_contacts_the_provider() {
-        let agent = Agent::new(FlakyProvider::new(0));
+        let agent = Agent::new(FlakyProvider::new(FailurePoint::Open, 0));
         let cancellation = cancellation();
 
         cancellation.cancel();
-        let stream = agent.open_stream(1, &cancellation).await.unwrap();
+        let stream = agent.open_stream(&cancellation).await.unwrap();
 
         assert!(stream.is_none());
         assert_eq!(agent.provider.attempts(), 0);

@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(sanitized["additionalProperties"], false);
         assert_eq!(
             sanitized["required"],
-            json!(["action", "command", "input", "session_id"])
+            json!(["action", "brief", "command", "input", "session_id"])
         );
         assert_eq!(
             sanitized["properties"]["action"],
@@ -1135,6 +1135,10 @@ mod tests {
                     "terminate"
                 ]
             })
+        );
+        assert_eq!(
+            sanitized["properties"]["brief"]["type"],
+            json!(["boolean", "null"])
         );
         assert_eq!(
             sanitized["properties"]["command"]["type"],

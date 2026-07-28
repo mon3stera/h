@@ -8,7 +8,8 @@ use crate::{
 };
 
 use super::{
-    Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult, ToolCallStatus, TypedTool,
+    Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult, ToolCallStatus, ToolOutput,
+    TypedTool,
 };
 
 pub struct AskTool {
@@ -62,7 +63,7 @@ impl TypedTool for AskTool {
          not for questions you can resolve yourself."
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         if arguments.options.is_empty() {
             anyhow::bail!("ask requires at least one option");
         }
@@ -79,7 +80,7 @@ impl TypedTool for AskTool {
                 .collect(),
         };
 
-        Ok(match self.bridge.ask(question).await? {
+        let output = match self.bridge.ask(question).await? {
             AskAnswer::Option { index, label } => AskToolOutput {
                 answer: label,
                 free_text: false,
@@ -90,7 +91,9 @@ impl TypedTool for AskTool {
                 free_text: true,
                 option_index: None,
             },
-        })
+        };
+
+        Ok(ToolOutput::new(output))
     }
 }
 

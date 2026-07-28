@@ -9,7 +9,7 @@ use tokio::fs;
 
 use super::{
     DiffLine, DiffLineKind, DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, TypedTool,
+    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
 };
 
 pub struct EditTool;
@@ -86,14 +86,14 @@ impl TypedTool for EditTool {
         "Edit a file"
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let mut content = match fs::read_to_string(&arguments.path).await {
             Ok(content) => content,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(EditToolOutput {
+                return Ok(ToolOutput::new(EditToolOutput {
                     status: EditStatus::FileNotFound,
                     applied: false,
-                });
+                }));
             }
             Err(error) => anyhow::bail!("{error}"),
         };
@@ -101,12 +101,12 @@ impl TypedTool for EditTool {
         // An empty source matches between every character; replacing it would
         // shred the file rather than edit it.
         if arguments.source.is_empty() {
-            return Ok(EditToolOutput {
+            return Ok(ToolOutput::new(EditToolOutput {
                 status: EditStatus::InvalidRange {
                     message: "source must not be empty".to_owned(),
                 },
                 applied: false,
-            });
+            }));
         }
 
         let exact = exact_matches(&content, &arguments.source);
@@ -115,12 +115,12 @@ impl TypedTool for EditTool {
         // meant. Report where they all are so the next attempt can widen its
         // source until it is unique, rather than guessing.
         if exact.len() > 1 {
-            return Ok(EditToolOutput {
+            return Ok(ToolOutput::new(EditToolOutput {
                 status: EditStatus::MultipleExactMatches {
                     candidates: exact.iter().map(ExactMatch::to_candidate).collect(),
                 },
                 applied: false,
-            });
+            }));
         }
 
         if let Some(hit) = exact.first() {
@@ -136,14 +136,14 @@ impl TypedTool for EditTool {
 
             fs::write(arguments.path, content).await?;
 
-            return Ok(EditToolOutput {
+            return Ok(ToolOutput::new(EditToolOutput {
                 status: EditStatus::Ok {
                     start_line: hit.start_line,
                     context_before,
                     context_after,
                 },
                 applied: true,
-            });
+            }));
         }
 
         let content_lines = content.lines().collect::<Vec<_>>();
@@ -152,12 +152,12 @@ impl TypedTool for EditTool {
         let mut matches = Vec::new();
 
         if content_line_num < source_line_num {
-            return Ok(EditToolOutput {
+            return Ok(ToolOutput::new(EditToolOutput {
                 status: EditStatus::InvalidRange {
                     message: "File content length is less than source's".to_owned(),
                 },
                 applied: false,
-            });
+            }));
         }
 
         for window_size in [
@@ -186,19 +186,19 @@ impl TypedTool for EditTool {
         }
 
         if !matches.is_empty() {
-            return Ok(EditToolOutput {
+            return Ok(ToolOutput::new(EditToolOutput {
                 status: EditStatus::SimilarMatches { matches },
                 applied: false,
-            });
+            }));
         }
 
-        Ok(EditToolOutput {
+        Ok(ToolOutput::new(EditToolOutput {
             status: EditStatus::NoCandidate {
                 message: "There is no candidate that is exact to or similar to the source"
                     .to_owned(),
             },
             applied: false,
-        })
+        }))
     }
 }
 

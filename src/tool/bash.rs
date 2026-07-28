@@ -34,57 +34,16 @@ use uuid::Uuid;
 
 use super::{
     DisplayBlock, KeyValueEntry, Presentation, Presenter, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, TypedTool,
+    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
+    output::{Limits, save, save_and_preview},
     presentation::{
         MAX_ERROR_CHARS, MAX_FIELD_CHARS, truncate_chars, truncate_preview, value_to_display_block,
     },
 };
 
-const MAX_INLINE_OUTPUT_BYTES: usize = 512;
 const TMUX_HISTORY_LIMIT: &str = "100000";
 const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TMUX_TERMINATE_TIMEOUT: Duration = Duration::from_secs(1);
-
-fn preview_end(content: &str) -> usize {
-    (0..=MAX_INLINE_OUTPUT_BYTES.min(content.len()))
-        .rev()
-        .find(|index| content.is_char_boundary(*index))
-        .unwrap_or(0)
-}
-
-async fn write_temp(content: impl AsRef<str>) -> anyhow::Result<String> {
-    let path = PathBuf::from(format!("/tmp/h_{}", Uuid::new_v4()));
-    fs::write(&path, content.as_ref()).await?;
-    Ok(path.display().to_string())
-}
-
-async fn write_temp_and_mention(content: impl AsRef<str>) -> anyhow::Result<String> {
-    let content = content.as_ref();
-
-    if content.len() < MAX_INLINE_OUTPUT_BYTES {
-        return Ok(content.to_owned());
-    }
-
-    let path = write_temp(content).await?;
-    let preview = &content[..preview_end(content)];
-
-    Ok(format!(
-        "{preview}... [Truncated] (Find full contents in {path})"
-    ))
-}
-
-fn truncate_session_output(output: String, history_file: &Path, suffix: &str) -> String {
-    if output.len() < MAX_INLINE_OUTPUT_BYTES {
-        return output;
-    }
-
-    let preview = &output[..preview_end(&output)];
-
-    format!(
-        "{preview} [Truncated] (Read {} {suffix})",
-        history_file.display()
-    )
-}
 
 #[derive(Debug, Clone)]
 struct MemoryLog {
@@ -173,11 +132,6 @@ impl BashSession {
         }
 
         let output = self.archive_log().await?;
-        let output = truncate_session_output(
-            output,
-            &self.memory.history_file,
-            "to find all inputs and outputs of the session",
-        );
 
         Ok(ViewResult::Ok { output })
     }
@@ -200,11 +154,6 @@ impl BashSession {
         self.is_busy = false;
 
         let output = self.archive_log().await?;
-        let output = truncate_session_output(
-            output,
-            &self.memory.history_file,
-            "to find all inputs and outputs",
-        );
 
         Ok(WaitResult::Ok { output })
     }
@@ -321,10 +270,9 @@ impl PtyBashTool {
             Some(session) => session,
             None => return Ok(BashToolOutput::SessionNotExist),
         };
-
         match session.view().await? {
             ViewResult::NoBusyCommand => Ok(BashToolOutput::NoBusyCommand),
-            ViewResult::Ok { output } => Ok(BashToolOutput::Output { output }),
+            ViewResult::Ok { output } => Ok(BashToolOutput::Output { output, path: None }),
         }
     }
 
@@ -333,10 +281,9 @@ impl PtyBashTool {
             Some(session) => session,
             None => return Ok(BashToolOutput::SessionNotExist),
         };
-
         match session.wait().await? {
             WaitResult::NoBusyCommand => Ok(BashToolOutput::NoBusyCommand),
-            WaitResult::Ok { output } => Ok(BashToolOutput::Output { output }),
+            WaitResult::Ok { output } => Ok(BashToolOutput::Output { output, path: None }),
         }
     }
 
@@ -796,13 +743,7 @@ impl TmuxBashTool {
         }
 
         let output = Self::read_new(&mut session).await?;
-        let output = truncate_session_output(
-            output,
-            &session.history_file,
-            "to find all inputs and outputs of the session",
-        );
-
-        Ok(BashToolOutput::Output { output })
+        Ok(BashToolOutput::Output { output, path: None })
     }
 
     async fn wait(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
@@ -818,15 +759,9 @@ impl TmuxBashTool {
         self.wait_for_completion(&session).await?;
 
         let output = Self::read_new(&mut session).await?;
-        let output = truncate_session_output(
-            output,
-            &session.history_file,
-            "to find all inputs and outputs",
-        );
-
         session.active = false;
         session.marker = None;
-        Ok(BashToolOutput::Output { output })
+        Ok(BashToolOutput::Output { output, path: None })
     }
 
     async fn terminate(&self, session_id: String) -> anyhow::Result<BashToolOutput> {
@@ -1035,29 +970,44 @@ impl BashTool {
     }
 }
 
-async fn run_blocking(command: String) -> anyhow::Result<BashToolOutput> {
+async fn run_blocking(command: String, brief: bool) -> anyhow::Result<BashToolOutput> {
     if command.split_whitespace().next().is_none() {
         anyhow::bail!("Empty command");
     }
 
     let mut process = Command::new("bash");
-    process.arg("-c").arg(command).kill_on_drop(true);
+    process.arg("-c").arg(&command).kill_on_drop(true);
 
     let output = process.output().await?;
     let exit_code = output.status.code();
     let signal = output.status.signal();
     let (stdout, stderr) = (
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let (stdout, stderr) = (
-        write_temp_and_mention(stdout).await?,
-        write_temp_and_mention(stderr).await?,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
     );
 
+    if brief && output.status.success() {
+        let (stdout_path, stderr_path) =
+            tokio::try_join!(save(&stdout, "bash-stdout"), save(&stderr, "bash-stderr"),)?;
+        let command = truncate_chars(&command, MAX_FIELD_CHARS);
+
+        return Ok(BashToolOutput::Succeeded {
+            summary: format!("Command {command:?} succeeded with exit code 0."),
+            exit_code: 0,
+            stdout_path,
+            stderr_path,
+        });
+    }
+
+    let (stdout_limits, stderr_limits) = Limits::split(&stdout, &stderr);
+    let (stdout, stderr) = tokio::try_join!(
+        save_and_preview(&stdout, "bash-stdout", stdout_limits),
+        save_and_preview(&stderr, "bash-stderr", stderr_limits),
+    )?;
+
     Ok(BashToolOutput::RanBlocking {
-        stdout,
-        stderr,
+        stdout: stdout.content,
+        stderr: stderr.content,
         exit_code,
         signal,
     })
@@ -1070,6 +1020,8 @@ pub enum BashToolArgs {
     RunBlocking {
         /// The shell command to execute.
         command: String,
+        /// Return only a short summary when the command exits successfully. Failed commands always include their output. Defaults to false.
+        brief: Option<bool>,
     },
     /// Spawn a command in the background without waiting for completion.
     RunBackground {
@@ -1117,14 +1069,19 @@ impl TypedTool for BashTool {
     }
 
     fn description(&self) -> &'static str {
-        "Execute bash commands and manage background terminal sessions."
+        "Execute bash commands and manage background terminal sessions; run_blocking can set brief=true to suppress successful output while preserving it in temporary files"
     }
 
-    async fn call(&self, args: Self::Arguments) -> anyhow::Result<Self::Output> {
-        match args {
-            BashToolArgs::RunBlocking { command } => run_blocking(command).await,
+    async fn call(&self, args: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
+        let output = match args {
+            BashToolArgs::RunBlocking { command, brief } => {
+                run_blocking(command, brief.unwrap_or(false)).await
+            }
             args => self.call_backend(args).await,
-        }
+        }?;
+        let output = output.limit().await?;
+
+        Ok(ToolOutput::new(output))
     }
 
     async fn cancel(&self, args: Self::Arguments) -> anyhow::Result<()> {
@@ -1144,6 +1101,14 @@ pub enum BashToolOutput {
         path: String,
     },
     Sent,
+    Succeeded {
+        summary: String,
+        exit_code: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stdout_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stderr_path: Option<String>,
+    },
     RanBlocking {
         stdout: String,
         stderr: String,
@@ -1157,11 +1122,27 @@ pub enum BashToolOutput {
     },
     Output {
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     NoBusyCommand,
     Terminated,
     SessionBusy,
     SessionNotExist,
+}
+
+impl BashToolOutput {
+    async fn limit(self) -> anyhow::Result<Self> {
+        let Self::Output { output, .. } = self else {
+            return Ok(self);
+        };
+        let preview = save_and_preview(&output, "bash-session", Limits::DEFAULT).await?;
+
+        Ok(Self::Output {
+            output: preview.content,
+            path: preview.path,
+        })
+    }
 }
 
 pub struct BashPresenter;
@@ -1344,6 +1325,39 @@ impl BashPresenter {
                 ToolCallStatus::Succeeded,
                 vec![DisplayBlock::Summary("Input sent".to_owned())],
             ),
+            BashToolOutput::Succeeded {
+                summary,
+                exit_code,
+                stdout_path,
+                stderr_path,
+            } => {
+                let mut entries = vec![KeyValueEntry {
+                    key: "exit_code".to_owned(),
+                    value: exit_code.to_string(),
+                }];
+
+                if let Some(path) = stdout_path {
+                    entries.push(KeyValueEntry {
+                        key: "stdout_path".to_owned(),
+                        value: path,
+                    });
+                }
+                if let Some(path) = stderr_path {
+                    entries.push(KeyValueEntry {
+                        key: "stderr_path".to_owned(),
+                        value: path,
+                    });
+                }
+
+                Self::presentation(
+                    call,
+                    ToolCallStatus::Succeeded,
+                    vec![
+                        DisplayBlock::Summary(summary),
+                        DisplayBlock::KeyValue { entries },
+                    ],
+                )
+            }
             BashToolOutput::RanBlocking {
                 stdout,
                 stderr,
@@ -1367,7 +1381,7 @@ impl BashPresenter {
                     },
                 ],
             ),
-            BashToolOutput::Output { output } => Self::presentation(
+            BashToolOutput::Output { output, .. } => Self::presentation(
                 call,
                 ToolCallStatus::Succeeded,
                 Self::session_output_blocks(call, &output),
@@ -1417,7 +1431,7 @@ mod tests {
 
     fn output(output: BashToolOutput) -> String {
         match output {
-            BashToolOutput::Output { output } => output,
+            BashToolOutput::Output { output, .. } => output,
             output => panic!("expected session output, got {output:?}"),
         }
     }
@@ -1440,19 +1454,79 @@ mod tests {
         .expect("the tmux command should finish");
     }
 
-    #[test]
-    fn output_preview_ends_on_a_unicode_boundary() {
-        let output = "界".repeat(200);
-        let end = preview_end(&output);
+    #[tokio::test]
+    async fn brief_success_keeps_output_in_files() {
+        let result = run_blocking("printf stdout; printf stderr >&2".to_owned(), true)
+            .await
+            .unwrap();
+        let BashToolOutput::Succeeded {
+            summary,
+            stdout_path: Some(stdout_path),
+            stderr_path: Some(stderr_path),
+            ..
+        } = result
+        else {
+            panic!("expected a brief success result");
+        };
 
-        assert!(end <= MAX_INLINE_OUTPUT_BYTES);
-        assert!(output.is_char_boundary(end));
-        assert_eq!(end, 510);
+        assert_eq!(
+            summary,
+            "Command \"printf stdout; printf stderr >&2\" succeeded with exit code 0."
+        );
+        assert_eq!(fs::read_to_string(&stdout_path).await.unwrap(), "stdout");
+        assert_eq!(fs::read_to_string(&stderr_path).await.unwrap(), "stderr");
+
+        fs::remove_file(stdout_path).await.unwrap();
+        fs::remove_file(stderr_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn brief_does_not_hide_failed_output() {
+        let result = run_blocking("printf failure; exit 7".to_owned(), true)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            BashToolOutput::RanBlocking {
+                ref stdout,
+                exit_code: Some(7),
+                ..
+            } if stdout == "failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_brief_success_saves_full_output_when_the_preview_is_truncated() {
+        let command = "i=0; while [ \"$i\" -lt 3000 ]; do printf x; i=$((i + 1)); done";
+        let result = run_blocking(command.to_owned(), false).await.unwrap();
+        let BashToolOutput::RanBlocking {
+            stdout,
+            stderr,
+            exit_code: Some(0),
+            signal: None,
+        } = result
+        else {
+            panic!("expected a successful blocking result");
+        };
+        let output_path = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("Full output: "))
+            .unwrap();
+
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("bytes omitted"));
+        assert_eq!(
+            fs::read_to_string(output_path).await.unwrap(),
+            "x".repeat(3_000)
+        );
+
+        fs::remove_file(output_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn blocking_reports_a_nonzero_exit_code() {
-        let result = run_blocking("exit 7".to_owned()).await.unwrap();
+        let result = run_blocking("exit 7".to_owned(), false).await.unwrap();
 
         assert!(matches!(
             result,
@@ -1478,7 +1552,9 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_reports_the_terminating_signal() {
-        let result = run_blocking("kill -TERM $$".to_owned()).await.unwrap();
+        let result = run_blocking("kill -TERM $$".to_owned(), false)
+            .await
+            .unwrap();
 
         assert!(matches!(
             result,
@@ -1633,11 +1709,13 @@ mod tests {
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .into_value(),
         );
         let waited = TypedTool::call(&tool, BashToolArgs::Wait { session_id })
             .await
-            .unwrap();
+            .unwrap()
+            .into_value();
 
         assert_eq!(output(waited), "dispatched");
     }

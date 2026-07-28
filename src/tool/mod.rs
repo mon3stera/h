@@ -10,6 +10,7 @@ mod edit;
 mod fetch;
 mod file_buffer;
 mod grep;
+mod output;
 mod presentation;
 mod read;
 mod registry;
@@ -75,7 +76,7 @@ pub struct ToolDefinition {
 
 #[async_trait::async_trait]
 pub trait TypedTool: Send + Sync + 'static {
-    type Arguments: Clone + DeserializeOwned + JsonSchema + Send + 'static;
+    type Arguments: DeserializeOwned + JsonSchema + Send + 'static;
     type Output: Serialize + Send + 'static;
 
     fn name(&self) -> &'static str;
@@ -92,12 +93,7 @@ pub trait TypedTool: Send + Sync + 'static {
         spec.erase()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output>;
-
-    /// Extracts the small, structured record used when this call is compacted.
-    fn summarize(&self, _arguments: &Self::Arguments, _output: &Self::Output) -> Option<Summary> {
-        None
-    }
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>>;
 
     /// Creates fresh aggregation state. `None` makes this tool a hard boundary
     /// between aggregatable runs.
@@ -124,7 +120,7 @@ pub trait DynTool: Send + Sync {
 
     fn definition(&self) -> anyhow::Result<ToolDefinition>;
 
-    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput>;
+    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput<Value>>;
 
     fn aggregator(&self) -> Option<Box<dyn Aggregator>>;
 
@@ -152,13 +148,13 @@ where
         TypedTool::definition(self)
     }
 
-    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput> {
+    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput<Value>> {
         let arguments = serde_json::from_value::<T::Arguments>(arguments)?;
-        let output = TypedTool::call(self, arguments.clone()).await?;
-        let summary = TypedTool::summarize(self, &arguments, &output);
+        let output = TypedTool::call(self, arguments).await?;
+        let (value, summary) = output.into_parts();
 
         Ok(ToolOutput {
-            value: serde_json::to_value(output)?,
+            value: serde_json::to_value(value)?,
             summary,
         })
     }
@@ -173,9 +169,40 @@ where
     }
 }
 
-pub struct ToolOutput {
-    value: Value,
+#[derive(Debug)]
+pub struct ToolOutput<T> {
+    value: T,
     summary: Option<Summary>,
+}
+
+impl<T> ToolOutput<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            summary: None,
+        }
+    }
+
+    pub fn with_summary(mut self, summary: Summary) -> Self {
+        self.summary = Some(summary);
+        self
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn summary(&self) -> Option<&Summary> {
+        self.summary.as_ref()
+    }
+
+    pub fn into_value(self) -> T {
+        self.value
+    }
+
+    fn into_parts(self) -> (T, Option<Summary>) {
+        (self.value, self.summary)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -299,7 +326,7 @@ impl ToolCallResult {
 #[cfg(test)]
 use presentation::{MAX_ERROR_CHARS, REDACTED, humanize_tool_name};
 #[cfg(test)]
-use read::MAX_READ_LINES;
+use read::{MAX_READ_CHARS, MAX_READ_LINES};
 
 #[cfg(test)]
 mod tests;

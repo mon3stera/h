@@ -10,12 +10,13 @@ use tokio::{
 
 use super::{
     Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, TypedTool,
+    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
     file_buffer::{FileBufferStore, FileFingerprint, IndexedFile, is_cacheable},
     summary::Targets,
 };
 
 pub(super) const MAX_READ_LINES: usize = 500;
+pub(super) const MAX_READ_CHARS: usize = 2_048;
 const SUMMARY_VERSION: u32 = 1;
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -26,6 +27,8 @@ pub struct ReadFileToolArgs {
     pub(super) start_line: Option<usize>,
     /// Last line to read. Line numbers are 1-based and inclusive. If omitted, reads up to 500 lines. Ranges longer than 500 lines are clamped to 500.
     pub(super) end_line: Option<usize>,
+    /// Zero-based byte offset within start_line. Defaults to 0. Use next_start_line and next_offset from the previous result to continue.
+    pub(super) offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,6 +38,11 @@ pub struct ReadFileToolOutput {
     pub(super) end_line: Option<usize>,
     pub(super) total_lines: Option<usize>,
     pub(super) has_more: bool,
+    pub(super) offset: usize,
+    pub(super) next_start_line: Option<usize>,
+    pub(super) next_offset: Option<usize>,
+    pub(super) truncated_lines: usize,
+    pub(super) truncated_bytes: usize,
 }
 
 pub struct ReadFileTool {
@@ -79,6 +87,7 @@ impl ReadFileTool {
         path: &Path,
         start_line: usize,
         requested_end: usize,
+        offset: usize,
     ) -> anyhow::Result<ReadFileToolOutput> {
         let canonical_path = fs::canonicalize(path).await?;
         let metadata = fs::metadata(&canonical_path).await?;
@@ -91,6 +100,7 @@ impl ReadFileTool {
                 &mut index,
                 start_line,
                 requested_end,
+                offset,
             )
             .await;
         }
@@ -109,6 +119,7 @@ impl ReadFileTool {
             &mut index,
             start_line,
             requested_end,
+            offset,
         )
         .await
     }
@@ -119,6 +130,7 @@ async fn read_indexed_range(
     index: &mut IndexedFile,
     start_line: usize,
     requested_end: usize,
+    offset: usize,
 ) -> anyhow::Result<ReadFileToolOutput> {
     let lookahead_line = requested_end.saturating_add(1);
     let mut reader = BufReader::new(file);
@@ -133,23 +145,81 @@ async fn read_indexed_range(
             end_line: None,
             total_lines,
             has_more: false,
+            offset: 0,
+            next_start_line: None,
+            next_offset: None,
+            truncated_lines: 0,
+            truncated_bytes: 0,
         });
     }
 
     let actual_end = requested_end.min(available_lines);
-    let content = read_lines_from_offsets(&mut reader, index, start_line, actual_end).await?;
-    let has_more = match total_lines {
+    let source = read_lines_from_offsets(&mut reader, index, start_line, actual_end).await?;
+    let first_line_bytes = source.find('\n').unwrap_or(source.len());
+    anyhow::ensure!(
+        offset <= first_line_bytes,
+        "offset exceeds the length of start_line"
+    );
+    anyhow::ensure!(
+        source.is_char_boundary(offset),
+        "offset must be on a UTF-8 character boundary"
+    );
+
+    let page_end = offset + char_prefix_len(&source[offset..], MAX_READ_CHARS);
+    let content = source[offset..page_end].to_owned();
+    let more_lines = match total_lines {
         Some(total_lines) => actual_end < total_lines,
         None => index.line_starts.len() > actual_end,
     };
+    let (next_start_line, next_offset) = if page_end < source.len() {
+        let prefix = &source[..page_end];
+        let next_start_line = start_line + prefix.bytes().filter(|byte| *byte == b'\n').count();
+        let next_offset = page_end
+            - prefix
+                .rfind('\n')
+                .map_or(0, |newline| newline.saturating_add(1));
+
+        (Some(next_start_line), Some(next_offset))
+    } else if more_lines {
+        (Some(actual_end.saturating_add(1)), Some(0))
+    } else {
+        (None, None)
+    };
+    let end_line = if content.is_empty() {
+        None
+    } else {
+        let newlines = content.bytes().filter(|byte| *byte == b'\n').count();
+        let lines = newlines + usize::from(!content.ends_with('\n'));
+
+        Some(start_line.saturating_add(lines.saturating_sub(1)))
+    };
+    let truncated_lines = next_start_line.map_or(0, |next_line| {
+        if next_line > actual_end {
+            0
+        } else {
+            actual_end - next_line + 1
+        }
+    });
 
     Ok(ReadFileToolOutput {
         content,
         start_line,
-        end_line: Some(actual_end),
+        end_line,
         total_lines,
-        has_more,
+        has_more: next_start_line.is_some(),
+        offset,
+        next_start_line,
+        next_offset,
+        truncated_lines,
+        truncated_bytes: source.len().saturating_sub(page_end),
     })
+}
+
+fn char_prefix_len(content: &str, max_chars: usize) -> usize {
+    content
+        .char_indices()
+        .nth(max_chars)
+        .map_or(content.len(), |(index, _)| index)
 }
 
 async fn extend_line_index(
@@ -242,10 +312,10 @@ impl TypedTool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "read a 1-based inclusive range from a file; ranges longer than 500 lines are clamped to 500, and total_lines is null until EOF is reached"
+        "read a file page with at most 500 lines and 2048 characters; line ranges are 1-based and inclusive, offset is a zero-based byte position within start_line, and next_start_line/next_offset continue truncated output"
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<Self::Output> {
+    async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let start_line = arguments.start_line.unwrap_or(1);
         anyhow::ensure!(start_line > 0, "start_line must be at least 1");
 
@@ -258,26 +328,30 @@ impl TypedTool for ReadFileTool {
 
         let max_end = start_line.saturating_add(MAX_READ_LINES - 1);
         let requested_end = arguments.end_line.unwrap_or(max_end).min(max_end);
-
-        self.read_range(Path::new(&arguments.path), start_line, requested_end)
-            .await
-    }
-
-    fn summarize(&self, arguments: &Self::Arguments, output: &Self::Output) -> Option<Summary> {
+        let offset = arguments.offset.unwrap_or(0);
+        let output = self
+            .read_range(
+                Path::new(&arguments.path),
+                start_line,
+                requested_end,
+                offset,
+            )
+            .await?;
         let lines = output.end_line.map_or(0, |end_line| {
             end_line
                 .checked_sub(output.start_line)
                 .and_then(|distance| distance.checked_add(1))
                 .unwrap_or(0)
         });
-
-        Some(Summary::new(
+        let summary = Summary::new(
             SUMMARY_VERSION,
             serde_json::json!({
                 "path": arguments.path,
                 "lines": lines,
             }),
-        ))
+        );
+
+        Ok(ToolOutput::new(output).with_summary(summary))
     }
 
     fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
@@ -318,8 +392,31 @@ impl Presenter for ReadFilePresenter {
                     .get("has_more")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let offset = output
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .unwrap_or(0);
+                let next_start_line = output
+                    .get("next_start_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                let next_offset = output
+                    .get("next_offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|offset| usize::try_from(offset).ok());
+                let truncated_lines = output
+                    .get("truncated_lines")
+                    .and_then(Value::as_u64)
+                    .and_then(|lines| usize::try_from(lines).ok())
+                    .unwrap_or(0);
+                let truncated_bytes = output
+                    .get("truncated_bytes")
+                    .and_then(Value::as_u64)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .unwrap_or(0);
 
-                let summary = match (end_line, total_lines) {
+                let mut summary = match (end_line, total_lines) {
                     (Some(end_line), Some(total_lines)) => {
                         format!("Read lines {start_line}–{end_line} of {total_lines}")
                     }
@@ -334,6 +431,19 @@ impl Presenter for ReadFilePresenter {
                     }
                     (None, None) => format!("No lines returned at or after {start_line}"),
                 };
+                if let (Some(next_start_line), Some(next_offset)) = (next_start_line, next_offset) {
+                    if truncated_lines == 0 && truncated_bytes == 0 {
+                        let _ = write!(
+                            summary,
+                            "; line limit reached; continue at line {next_start_line}, offset {next_offset}"
+                        );
+                    } else {
+                        let _ = write!(
+                            summary,
+                            "; {truncated_lines} lines and {truncated_bytes} bytes remain in the selected range; continue at line {next_start_line}, offset {next_offset}"
+                        );
+                    }
+                }
 
                 let mut blocks = vec![DisplayBlock::Summary(summary)];
                 if end_line.is_some() {
@@ -341,7 +451,7 @@ impl Presenter for ReadFilePresenter {
                         language: Some("raw".to_owned()),
                         content: content.to_owned(),
                         truncated_lines: 10,
-                        show_line_numbers: true,
+                        show_line_numbers: offset == 0,
                         start_line_number: start_line,
                     });
                 }
