@@ -3,10 +3,9 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::{
-    tool::{DiffLine, DiffLineKind, DisplayBlock, Presentation, ToolCallStatus},
-    tui::text::wrap,
-};
+use h_core::tool::{DiffLine, DiffLineKind, DisplayBlock, Presentation, ToolCallStatus};
+
+use crate::text::wrap;
 
 /// Diff row washes, dark enough that the default foreground stays legible on top
 /// of them. A saturated fill reads as a block of colour rather than as code.
@@ -50,7 +49,7 @@ fn title(presentation: &Presentation, width: usize) -> Vec<Line<'static>> {
 
     let inner = width.saturating_sub(TITLE_INDENT.len()).max(1);
 
-    wrap(&crate::tui::rainbow_spans(&text, Style::default()), inner)
+    wrap(&crate::rainbow_spans(&text, Style::default()), inner)
         .into_iter()
         .enumerate()
         .map(|(offset, line)| {
@@ -243,7 +242,7 @@ fn table_lines(headers: &[String], rows: &[Vec<String>]) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tool::{KeyValueEntry, ToolCallId};
+    use h_core::tool::{KeyValueEntry, ToolCallId};
 
     use super::*;
 

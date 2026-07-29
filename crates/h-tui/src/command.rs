@@ -7,7 +7,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::command::Command;
+use h_core::command::Command;
 
 fn label_width() -> usize {
     Command::ALL

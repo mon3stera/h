@@ -5,10 +5,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    tui::{
-        highlight, rainbow_spans,
-        text::{verbatim, wrap},
-    },
+    highlight, rainbow_spans,
+    text::{verbatim, wrap},
     ui::markdown::{Inline, MarkdownBlock, TableAlignment},
 };
 

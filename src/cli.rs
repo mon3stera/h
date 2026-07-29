@@ -1,10 +1,7 @@
 use chrono::Utc;
 use clap::Parser;
-
-use crate::{
-    context::list_sessions,
-    tui::resume::{ResumeEntry, pick_session},
-};
+use h_core::context::list_sessions;
+use h_tui::resume::{ResumeEntry, pick_session};
 
 /// An agentic coding CLI.
 #[derive(Parser, Debug, Clone)]

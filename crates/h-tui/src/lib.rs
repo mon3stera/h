@@ -25,6 +25,7 @@ pub mod resume;
 pub mod text;
 pub mod tool;
 pub mod transcript;
+pub mod ui;
 
 const SATURATION: f32 = 0.5;
 const BRIGHTNESS: f32 = 0.9;

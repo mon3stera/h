@@ -1,15 +1,15 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
 use crate::{
-    bridge::UiBridge,
     bus::EventBus,
     command::Command,
     context::{Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, built_in_workspace_info},
-    event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
+    event::{AgentCommand, AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
+    interaction::Bridge,
     provider::{Provider, ProviderEventStream},
     skill::Registry as SkillRegistry,
     tool::{
@@ -19,7 +19,7 @@ use crate::{
 };
 use futures::StreamExt;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver, error::TryRecvError};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -255,7 +255,7 @@ where
     /// Registers the built-in tools. `bridge` is handed to the tools that need
     /// an answer from the user; note that [`Self::handle_signal`] awaits each
     /// tool call in turn, so at most one such request is outstanding at a time.
-    pub fn with_internal_tools(&mut self, bridge: UiBridge) -> anyhow::Result<&mut Self> {
+    pub fn with_internal_tools(&mut self, bridge: Bridge) -> anyhow::Result<&mut Self> {
         let file_buffers = FileBufferStore::default();
 
         self.tool
@@ -310,6 +310,94 @@ where
         self.refresh_token_count(None);
 
         Ok(())
+    }
+
+    /// Runs the long-lived command loop for an interactive frontend.
+    ///
+    /// Prompts and session commands retain their order. Cancellation targets
+    /// the active turn immediately, while every other command waits for the
+    /// current turn boundary.
+    pub async fn run(&mut self, mut commands: Receiver<AgentCommand>) {
+        let (mut queued, mut accepting) = (VecDeque::new(), true);
+
+        loop {
+            let command = loop {
+                if !accepting {
+                    break None;
+                }
+
+                if let Some(command) = queued.pop_front() {
+                    break Some(command);
+                }
+
+                match commands.recv().await {
+                    Some(AgentCommand::Cancel) => {}
+                    Some(command) => break Some(command),
+                    None => {
+                        accepting = false;
+                        break None;
+                    }
+                }
+            };
+            let Some(command) = command else {
+                break;
+            };
+
+            match command {
+                AgentCommand::Prompt(prompt) => {
+                    let cancellation = CancellationToken::new();
+                    let result = {
+                        let turn = self.continue_turn(prompt, cancellation.clone());
+                        tokio::pin!(turn);
+
+                        loop {
+                            tokio::select! {
+                                result = &mut turn => break result,
+                                command = commands.recv(), if accepting => match command {
+                                    Some(AgentCommand::Cancel) => cancellation.cancel(),
+                                    Some(command) => queued.push_back(command),
+                                    None => {
+                                        accepting = false;
+                                        queued.clear();
+                                        cancellation.cancel();
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    if let Err(error) = result {
+                        tracing::error!(
+                            event = "agent.worker.failed",
+                            operation = "continue_turn",
+                            error_class = "agent_turn_error",
+                            error = error.to_string(),
+                        );
+                    }
+                }
+                AgentCommand::Run(command) => {
+                    let _ = self.run_command(command).await;
+                }
+                AgentCommand::Cancel => {}
+            }
+
+            // If the turn and a queued cancellation become ready together, the
+            // turn has already ended. Do not carry it into the next prompt.
+            loop {
+                match commands.try_recv() {
+                    Ok(AgentCommand::Cancel) => {}
+                    Ok(command) => queued.push_back(command),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        accepting = false;
+                        queued.clear();
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::info!(event = "agent.worker.closed");
     }
 
     fn estimate_request_tokens(&self, messages: &[Message]) -> Option<usize> {
@@ -1629,6 +1717,173 @@ mod tests {
         })
     }
 
+    async fn receive_turn_finished(events: &mut UnboundedReceiver<AgentViewEvent>) -> bool {
+        loop {
+            match events.recv().await {
+                Some(AgentViewEvent::TurnFinished { completed }) => return completed,
+                Some(_) => {}
+                None => panic!("the view event stream closed before the turn finished"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn command_loop_executes_a_prompt_to_completion() {
+        let mut agent = Agent::new(SignalProvider::new(
+            [vec![
+                ProviderSignal::TextDelta("hello".to_owned()),
+                completed(CompletedReason::Final),
+            ]],
+            text_bytes,
+        ));
+        let mut events = agent.subscribe_view();
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+
+        let run = agent.run(receiver);
+        let drive = async move {
+            commands
+                .send(AgentCommand::Prompt("say hello".to_owned()))
+                .await
+                .unwrap();
+
+            assert!(receive_turn_finished(&mut events).await);
+            drop(commands);
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, drive);
+        })
+        .await
+        .expect("the command loop should finish after its sender closes");
+
+        assert!(matches!(
+            agent.context.histories(),
+            [Message::User(prompt), Message::Assistant(answer)]
+                if prompt == "say hello" && answer == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_loop_preserves_queued_prompt_order() {
+        let mut agent = Agent::new(SignalProvider::new(
+            [
+                vec![
+                    ProviderSignal::TextDelta("first answer".to_owned()),
+                    completed(CompletedReason::Final),
+                ],
+                vec![
+                    ProviderSignal::TextDelta("second answer".to_owned()),
+                    completed(CompletedReason::Final),
+                ],
+            ],
+            text_bytes,
+        ));
+        let mut events = agent.subscribe_view();
+        let (commands, receiver) = tokio::sync::mpsc::channel(2);
+
+        let run = agent.run(receiver);
+        let drive = async move {
+            commands
+                .send(AgentCommand::Prompt("first prompt".to_owned()))
+                .await
+                .unwrap();
+            commands
+                .send(AgentCommand::Prompt("second prompt".to_owned()))
+                .await
+                .unwrap();
+
+            assert!(receive_turn_finished(&mut events).await);
+            assert!(receive_turn_finished(&mut events).await);
+            drop(commands);
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, drive);
+        })
+        .await
+        .expect("queued prompts should both finish");
+
+        assert!(matches!(
+            agent.context.histories(),
+            [
+                Message::User(first_prompt),
+                Message::Assistant(first_answer),
+                Message::User(second_prompt),
+                Message::Assistant(second_answer),
+            ] if first_prompt == "first prompt"
+                && first_answer == "first answer"
+                && second_prompt == "second prompt"
+                && second_answer == "second answer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_loop_cancels_the_active_turn() {
+        let (polled, dropped) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let mut agent = Agent::new(PendingStreamProvider {
+            polled: polled.clone(),
+            dropped: dropped.clone(),
+        });
+        let mut events = agent.subscribe_view();
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+
+        let run = agent.run(receiver);
+        let drive = async move {
+            commands
+                .send(AgentCommand::Prompt("wait forever".to_owned()))
+                .await
+                .unwrap();
+            polled.notified().await;
+
+            commands.send(AgentCommand::Cancel).await.unwrap();
+
+            assert!(!receive_turn_finished(&mut events).await);
+            drop(commands);
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, drive);
+        })
+        .await
+        .expect("cancellation should stop the active turn");
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(agent.prompts(), ["wait forever"]);
+    }
+
+    #[tokio::test]
+    async fn closing_the_command_channel_cancels_the_active_turn() {
+        let (polled, dropped) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let mut agent = Agent::new(PendingStreamProvider {
+            polled: polled.clone(),
+            dropped: dropped.clone(),
+        });
+        let mut events = agent.subscribe_view();
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+
+        let run = agent.run(receiver);
+        let drive = async move {
+            commands
+                .send(AgentCommand::Prompt("wait forever".to_owned()))
+                .await
+                .unwrap();
+            polled.notified().await;
+
+            drop(commands);
+
+            assert!(!receive_turn_finished(&mut events).await);
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, drive);
+        })
+        .await
+        .expect("closing the command channel should stop the worker");
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(agent.prompts(), ["wait forever"]);
+    }
+
     fn seed_read_summary<P: Provider>(agent: &mut Agent<P>) {
         agent
             .tool
@@ -2736,7 +2991,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_tool_call_leaves_no_empty_assistant_turn() {
         let mut agent = Agent::new(TestProvider);
-        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        agent.with_internal_tools(Bridge::new().0).unwrap();
         let mut metrics = TurnMetrics::default();
 
         // An unregistered tool fails in the registry rather than running
@@ -2782,7 +3037,7 @@ mod tests {
 
     #[test]
     fn rebroadcast_replays_prompts_and_responses_in_order() {
-        let mut agent = agent_with_histories(vec![
+        let agent = agent_with_histories(vec![
             Message::System("workspace info".to_owned()),
             Message::User("first question".to_owned()),
             Message::Assistant("first answer".to_owned()),
@@ -2819,7 +3074,7 @@ mod tests {
 
     #[test]
     fn rebroadcast_hides_system_messages() {
-        let mut agent = agent_with_histories(vec![
+        let agent = agent_with_histories(vec![
             Message::System("global prompts".to_owned()),
             Message::System("workspace info".to_owned()),
         ]);
@@ -2844,7 +3099,7 @@ mod tests {
                 summary: None,
             },
         ]);
-        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        agent.with_internal_tools(Bridge::new().0).unwrap();
         let mut receiver = agent.subscribe_view();
 
         agent.rebroadcast_all_view();
@@ -2879,7 +3134,7 @@ mod tests {
                 summary: None,
             },
         ]);
-        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        agent.with_internal_tools(Bridge::new().0).unwrap();
         let mut receiver = agent.subscribe_view();
 
         agent.rebroadcast_all_view();
@@ -2907,7 +3162,7 @@ mod tests {
             name: "bash".to_owned(),
             arguments: json!({"action": "run_blocking", "command": "cargo test"}).to_string(),
         }]);
-        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        agent.with_internal_tools(Bridge::new().0).unwrap();
         let mut receiver = agent.subscribe_view();
 
         agent.rebroadcast_all_view();
@@ -2938,7 +3193,7 @@ mod tests {
     #[test]
     fn internal_bash_tool_uses_bash_presenter() {
         let mut agent = Agent::new(TestProvider);
-        agent.with_internal_tools(UiBridge::new().0).unwrap();
+        agent.with_internal_tools(Bridge::new().0).unwrap();
         let call = ToolCall::new(
             "call-1",
             "bash",

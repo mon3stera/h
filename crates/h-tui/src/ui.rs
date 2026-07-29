@@ -5,26 +5,14 @@
 //! decides how those are grouped. Keeping it apart from `tui` is what lets both
 //! be tested without a terminal.
 
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::Arc,
-    time::Duration,
+use std::time::Duration;
+
+use h_core::{
+    event::AgentViewEvent,
+    tool::{DisplayBlock, Presentation, ToolCallId, ToolCallStatus},
 };
 
-use tokio::{
-    sync::{
-        Mutex,
-        mpsc::{Receiver, Sender, UnboundedReceiver},
-    },
-    time::{MissedTickBehavior, interval},
-};
-
-use crate::{
-    event::{AgentViewEvent, UiRequest},
-    tool::{DiffLine, DiffLineKind, DisplayBlock, Presentation, ToolCallId, ToolCallStatus},
-    ui::markdown::{MarkdownBlock, parse_markdown},
-};
+use crate::ui::markdown::{MarkdownBlock, parse_markdown};
 
 pub mod markdown;
 
@@ -345,10 +333,7 @@ pub fn group_units(units: &[RenderUnit]) -> Vec<RenderGroup<'_>> {
 #[cfg(test)]
 mod view_event_tests {
     use super::*;
-    use crate::{
-        bridge::UiBridge,
-        tool::{ToolCallId, ToolCallStatus},
-    };
+    use h_core::tool::{ToolCallId, ToolCallStatus};
 
     fn explored(name: &str, target: &str) -> RenderUnit {
         tool_unit(name, target, ToolCallStatus::Succeeded)

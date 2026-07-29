@@ -24,16 +24,18 @@ use tokio::sync::{
     oneshot,
 };
 
-use crate::{
+use h_core::{
     command::Command,
-    event::{AgentCommand, AgentViewEvent, AskAnswer, UiRequest},
-    tui::{
-        choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
-        command::{CommandEvent, CommandMenu},
-        format_tokens,
-        input::Input,
-        transcript::Transcript,
-    },
+    event::{AgentCommand, AgentViewEvent},
+    interaction::{AskAnswer, Request},
+};
+
+use crate::{
+    choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
+    command::{CommandEvent, CommandMenu},
+    format_tokens,
+    input::Input,
+    transcript::Transcript,
     ui::{RenderUnit, ViewState, reduce_view_event},
 };
 
@@ -69,7 +71,7 @@ pub async fn run(
     commands: Sender<AgentCommand>,
     mut events: UnboundedReceiver<AgentViewEvent>,
     // Questions the agent is waiting on, each carrying the channel to answer on.
-    mut requests: Receiver<UiRequest>,
+    mut requests: Receiver<Request>,
     // What a resumed session already asked, so recall reaches back into it.
     history: Vec<String>,
     context_window: usize,
@@ -119,7 +121,7 @@ async fn drive(
     terminal: &mut DefaultTerminal,
     commands: Sender<AgentCommand>,
     events: &mut UnboundedReceiver<AgentViewEvent>,
-    requests: &mut Receiver<UiRequest>,
+    requests: &mut Receiver<Request>,
     history: Vec<String>,
     context_window: usize,
 ) -> anyhow::Result<()> {
@@ -251,8 +253,8 @@ impl App {
 
     /// Puts a question on screen, offering the agent's options plus a row for an
     /// answer it did not think of.
-    fn begin_ask(&mut self, request: UiRequest) {
-        let UiRequest::Ask { question, reply } = request;
+    fn begin_ask(&mut self, request: Request) {
+        let Request::Ask { question, reply } = request;
 
         let mut items = question
             .options
@@ -996,13 +998,13 @@ mod tests {
         );
     }
 
-    use crate::event::{AskOption, AskQuestion};
+    use h_core::interaction::{AskOption, AskQuestion};
 
-    fn ask(options: &[(&str, Option<&str>)]) -> (UiRequest, oneshot::Receiver<AskAnswer>) {
+    fn ask(options: &[(&str, Option<&str>)]) -> (Request, oneshot::Receiver<AskAnswer>) {
         let (reply, answer) = oneshot::channel();
 
         (
-            UiRequest::Ask {
+            Request::Ask {
                 question: AskQuestion {
                     question: "which way?".to_owned(),
                     options: options

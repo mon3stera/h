@@ -1,0 +1,39 @@
+[package]
+name = "h-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-openai = { version = "0.41.1", features = ["_api", "model", "responses", "image", "byot"] }
+async-trait = "0.1.91"
+chrono = { version = "0.4.45", features = ["serde"] }
+dashmap = "6.2.1"
+expectrl = { version = "0.9.0", features = ["async"] }
+futures = "0.3.33"
+gix = "0.86.0"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.31"
+parking_lot = "0.12.5"
+portable-pty = "0.9.0"
+readabilityrs = "0.1.3"
+reqwest = { version = "0.12.4", features = ["json"] }
+schemars = "1.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+shellexpand = "3.1.2"
+similar = "3.1.1"
+strip-ansi-escapes = "0.2.1"
+strsim = "0.11.1"
+tiktoken-rs = "0.12.0"
+tokio = { version = "1.53.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+uuid = { version = "1.24.0", features = ["v4", "v7", "fast-rng"] }
+
+[dev-dependencies]
+# `start_paused` runs the backoff tests on virtual time instead of sleeping.
+tokio = { version = "1.53.0", features = ["test-util"] }

@@ -2,10 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    bridge::UiBridge,
-    event::{AskAnswer, AskOption, AskQuestion},
-};
+use crate::interaction::{AskAnswer, AskOption, AskQuestion, Bridge};
 
 use super::{
     Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult, ToolCallStatus, ToolOutput,
@@ -13,11 +10,11 @@ use super::{
 };
 
 pub struct AskTool {
-    bridge: UiBridge,
+    bridge: Bridge,
 }
 
 impl AskTool {
-    pub fn new(bridge: UiBridge) -> Self {
+    pub fn new(bridge: Bridge) -> Self {
         Self { bridge }
     }
 }

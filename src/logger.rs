@@ -3,7 +3,8 @@ use std::path::Path;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-const DEFAULT_FILTER: &str = "warn,h=info,async_openai=off,hyper=off,hyper_util=off";
+const DEFAULT_FILTER: &str =
+    "warn,h=info,h_core=info,h_tui=info,async_openai=off,hyper=off,hyper_util=off";
 
 fn env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
@@ -37,6 +38,8 @@ mod tests {
     #[test]
     fn default_filter_is_app_focused() {
         assert!(DEFAULT_FILTER.contains("h=info"));
+        assert!(DEFAULT_FILTER.contains("h_core=info"));
+        assert!(DEFAULT_FILTER.contains("h_tui=info"));
         assert!(DEFAULT_FILTER.contains("async_openai=off"));
         assert!(DEFAULT_FILTER.contains("hyper=off"));
         assert!(!DEFAULT_FILTER.contains("h=debug"));

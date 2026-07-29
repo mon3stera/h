@@ -1,24 +1,55 @@
 use tokio::sync::{mpsc, oneshot};
 
-use crate::event::{AskAnswer, AskQuestion, UiRequest};
-
 /// Requests queue here while the user works through them, so a burst never
-/// blocks the agent before the UI has drained it.
+/// blocks the caller before the interaction handler has drained it.
 const REQUEST_CAPACITY: usize = 8;
 
-/// The agent-side half of the UI round trip.
+/// A question that requires an answer from outside the agent.
+#[derive(Debug, Clone)]
+pub struct AskQuestion {
+    pub question: String,
+    pub options: Vec<AskOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AskOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// The reply to an [`AskQuestion`]. `Option` carries the index into its options;
+/// `FreeText` is what was written when none of them fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskAnswer {
+    Option { index: usize, label: String },
+    FreeText(String),
+}
+
+/// A request that an external interaction handler must resolve.
+///
+/// This is point-to-point because each request owns one reply channel. The
+/// responder keeps the answer attached to the operation that requested it.
+#[derive(Debug)]
+pub enum Request {
+    Ask {
+        question: AskQuestion,
+        reply: oneshot::Sender<AskAnswer>,
+    },
+}
+
+/// The caller-side half of an external interaction round trip.
 ///
 /// Unlike [`EventBus`](crate::bus::EventBus), which broadcasts clonable events
 /// one way, this carries a reply channel per request and is point-to-point.
-/// Hand a clone to anything that needs an answer from the user; hand the
-/// receiver to the UI.
+/// Hand a clone to anything that needs an external answer and the receiver to
+/// whichever frontend or host integration provides it.
 #[derive(Clone)]
-pub struct UiBridge {
-    tx: mpsc::Sender<UiRequest>,
+pub struct Bridge {
+    tx: mpsc::Sender<Request>,
 }
 
-impl UiBridge {
-    pub fn new() -> (Self, mpsc::Receiver<UiRequest>) {
+impl Bridge {
+    pub fn new() -> (Self, mpsc::Receiver<Request>) {
         let (tx, rx) = mpsc::channel(REQUEST_CAPACITY);
         (Self { tx }, rx)
     }
@@ -32,21 +63,21 @@ impl UiBridge {
 
         if self
             .tx
-            .send(UiRequest::Ask { question, reply })
+            .send(Request::Ask { question, reply })
             .await
             .is_err()
         {
             tracing::warn!(
-                event = "ui_bridge.request.failed",
+                event = "interaction.request.failed",
                 operation = "send",
-                error_class = "ui_unavailable"
+                error_class = "handler_unavailable"
             );
-            anyhow::bail!("the user interface is no longer running, so it cannot be asked");
+            anyhow::bail!("no interaction handler is available to answer the question");
         }
 
         answer.await.map_err(|_| {
             tracing::warn!(
-                event = "ui_bridge.request.failed",
+                event = "interaction.request.failed",
                 operation = "await_reply",
                 error_class = "reply_dropped"
             );
@@ -57,8 +88,7 @@ impl UiBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::UiBridge;
-    use crate::event::{AskAnswer, AskQuestion, UiRequest};
+    use super::{AskAnswer, AskQuestion, Bridge, Request};
 
     fn question() -> AskQuestion {
         AskQuestion {
@@ -69,10 +99,10 @@ mod tests {
 
     #[tokio::test]
     async fn ask_resolves_with_the_answer_the_ui_sends_back() {
-        let (bridge, mut rx) = UiBridge::new();
+        let (bridge, mut rx) = Bridge::new();
 
         let responder = tokio::spawn(async move {
-            let UiRequest::Ask { reply, .. } = rx.recv().await.unwrap();
+            let Request::Ask { reply, .. } = rx.recv().await.unwrap();
             reply.send(AskAnswer::FreeText("something else".to_owned()))
         });
 
@@ -84,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_fails_when_the_ui_is_gone() {
-        let (bridge, rx) = UiBridge::new();
+        let (bridge, rx) = Bridge::new();
         drop(rx);
 
         assert!(bridge.ask(question()).await.is_err());
@@ -92,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_fails_when_the_question_is_dropped_unanswered() {
-        let (bridge, mut rx) = UiBridge::new();
+        let (bridge, mut rx) = Bridge::new();
 
         tokio::spawn(async move {
             drop(rx.recv().await.unwrap());

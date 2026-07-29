@@ -4,7 +4,7 @@ use ratatui::{
 };
 
 use crate::{
-    tui::{banner, format_tokens, markdown, text, tool},
+    banner, format_tokens, markdown, text, tool,
     ui::markdown::parse_markdown,
     ui::{RenderGroup, RenderUnit, ViewState, explore_presentation, group_units},
 };
@@ -157,7 +157,7 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
 fn prompt(content: &str, width: usize) -> Vec<Line<'static>> {
     // Colour the original single-line representation first, then split it, so
     // wrapping does not change the established hue sequence.
-    let mut marker = crate::tui::rainbow(&format!("{PROMPT_MARKER}{content}")).spans;
+    let mut marker = crate::rainbow(&format!("{PROMPT_MARKER}{content}")).spans;
     let mut colored = marker.split_off(PROMPT_MARKER.chars().count()).into_iter();
     let inner = width.saturating_sub(PROMPT_INDENT.len()).max(1);
 
