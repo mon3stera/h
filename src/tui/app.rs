@@ -25,9 +25,11 @@ use tokio::sync::{
 };
 
 use crate::{
+    command::Command,
     event::{AgentCommand, AgentViewEvent, AskAnswer, UiRequest},
     tui::{
         choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
+        command::{CommandEvent, CommandMenu},
         format_tokens,
         input::Input,
         transcript::Transcript,
@@ -181,6 +183,11 @@ struct App {
     state: ViewState,
     transcript: Transcript,
     input: Input,
+    command_menu: CommandMenu,
+    /// A submitted slash command awaiting its completion boundary. Keeping the
+    /// input disabled prevents prompts and commands from being queued behind a
+    /// context mutation whose result they cannot yet observe.
+    pending_command: Option<Command>,
     /// Set while the agent is blocked on an answer. The prompt box steps aside
     /// for it, because nothing else can move until the question is settled.
     asking: Option<Asking>,
@@ -211,6 +218,19 @@ impl App {
                             .units
                             .push(RenderUnit::Done(started.elapsed(), self.state.turn_tokens));
                     }
+                }
+            }
+            AgentViewEvent::SessionStarted => {
+                self.started = None;
+                self.asking = None;
+                self.pending_command = None;
+                self.input.reset();
+                self.command_menu.reset();
+                self.transcript.pin();
+            }
+            AgentViewEvent::CommandFinished(command) => {
+                if self.pending_command == Some(*command) {
+                    self.pending_command = None;
                 }
             }
             _ => {}
@@ -281,7 +301,7 @@ impl App {
             return Flow::Quit;
         }
 
-        if key.code == KeyCode::Esc {
+        if self.asking.is_some() && key.code == KeyCode::Esc {
             // Keep an outstanding ask alive until TurnFinished so cancellation
             // wins over its reply channel closing; the agent can then record
             // the canonical interrupted ToolResult.
@@ -302,6 +322,43 @@ impl App {
             return Flow::Continue;
         }
 
+        if self.pending_command.is_some() {
+            if key.code == KeyCode::Esc {
+                self.cancel(commands).await;
+            }
+
+            return Flow::Continue;
+        }
+
+        self.command_menu.update(&self.input.text());
+
+        match self.command_menu.handle_key(key) {
+            CommandEvent::Ignored => {}
+            CommandEvent::Consumed => return Flow::Continue,
+            CommandEvent::Complete(command) => {
+                self.input.replace(command.label());
+                self.command_menu.update(command.label());
+
+                return Flow::Continue;
+            }
+            CommandEvent::Submit(command) => {
+                self.input.replace(command.label());
+
+                if let Some(prompt) = self.input.take() {
+                    self.command_menu.update("");
+                    self.submit(prompt, commands).await;
+                }
+
+                return Flow::Continue;
+            }
+        }
+
+        if key.code == KeyCode::Esc {
+            self.cancel(commands).await;
+
+            return Flow::Continue;
+        }
+
         let page = self.viewport as isize;
 
         match key.code {
@@ -318,6 +375,8 @@ impl App {
                 if let Some(prompt) = self.input.handle_key(key) {
                     self.submit(prompt, commands).await;
                 }
+
+                self.command_menu.update(&self.input.text());
             }
         }
 
@@ -325,6 +384,29 @@ impl App {
     }
 
     async fn submit(&mut self, prompt: String, commands: &Sender<AgentCommand>) {
+        if self.pending_command.is_some() {
+            tracing::warn!(event = "ui.submission_blocked", reason = "command_pending",);
+
+            return;
+        }
+
+        if let Some(command) = Command::parse(&prompt) {
+            tracing::info!(event = "ui.command_submitted", command = command.label());
+
+            match commands.send(AgentCommand::Run(command)).await {
+                Ok(()) => self.pending_command = Some(command),
+                Err(_) => {
+                    tracing::warn!(
+                        event = "ui.command_send.failed",
+                        operation = "command_channel_send",
+                        error_class = "command_channel_closed"
+                    );
+                }
+            }
+
+            return;
+        }
+
         // Echo it locally: nothing on the event bus carries the user's own turn
         // back to the view.
         self.state.units.push(RenderUnit::Prompt(prompt.clone()));
@@ -371,7 +453,8 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let indicator_height = u16::from(self.state.turn_in_progress);
+        let indicator_height = u16::from(self.state.turn_in_progress)
+            .saturating_add(u16::from(self.pending_command.is_some()));
         let [transcript, indicator, bottom] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(indicator_height),
@@ -383,11 +466,16 @@ impl App {
         self.render_transcript(frame, transcript);
 
         if indicator_height > 0 {
-            frame.render_widget(Paragraph::new(self.spinner_line()), indicator);
+            frame.render_widget(Paragraph::new(self.indicator_lines()), indicator);
         }
 
-        let [composer, status] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(bottom);
+        let (composer_height, command_height) = self.composer_heights(frame.area().width);
+        let [composer, command_menu, status] = Layout::vertical([
+            Constraint::Length(composer_height),
+            Constraint::Length(command_height),
+            Constraint::Length(STATUS_HEIGHT),
+        ])
+        .areas(bottom);
 
         // The question takes the prompt box's place: answering it is the only
         // thing that moves the session forward.
@@ -396,16 +484,35 @@ impl App {
             None => self.input.render(frame, composer),
         }
 
+        if command_height > 0 {
+            self.command_menu.render(frame, command_menu);
+        }
+
         frame.render_widget(Paragraph::new(self.context_line()), status);
     }
 
     fn bottom_height(&self, width: u16) -> u16 {
-        let composer = match &self.asking {
-            Some(asking) => asking.height(),
-            None => self.input.height(width),
-        };
+        let (composer, commands) = self.composer_heights(width);
 
-        composer.saturating_add(STATUS_HEIGHT)
+        composer
+            .saturating_add(commands)
+            .saturating_add(STATUS_HEIGHT)
+    }
+
+    fn composer_heights(&self, width: u16) -> (u16, u16) {
+        let (composer, commands) = (
+            match &self.asking {
+                Some(asking) => asking.height(),
+                None => self.input.height(width),
+            },
+            if self.asking.is_none() {
+                self.command_menu.len().try_into().unwrap_or(u16::MAX)
+            } else {
+                0
+            },
+        );
+
+        (composer, commands)
     }
 
     fn render_transcript(&mut self, frame: &mut Frame, area: Rect) {
@@ -438,6 +545,36 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled("  Esc to cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    }
+
+    fn indicator_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(2);
+
+        if self.state.turn_in_progress {
+            lines.push(self.spinner_line());
+        }
+
+        if let Some(command) = self.pending_command {
+            lines.push(self.command_line(command));
+        }
+
+        lines
+    }
+
+    fn command_line(&self, command: Command) -> Line<'static> {
+        let (glyph, label) = (
+            SPINNER[self.spinner].0,
+            match command {
+                Command::Clear => "starting session...",
+                Command::Compact => "compacting...",
+            },
+        );
+
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(Color::Yellow)),
+            Span::styled(label, Style::default().fg(Color::Yellow)),
+            Span::styled("  input disabled", Style::default().fg(Color::DarkGray)),
         ])
     }
 
@@ -570,6 +707,178 @@ mod tests {
             matches!(app.state.units.as_slice(), [RenderUnit::Prompt(text)] if text == "hello"),
             "the view has to echo the user's own turn"
         );
+    }
+
+    #[tokio::test]
+    async fn a_slash_shows_commands_and_descriptions() {
+        let (mut app, mut terminal) = app_with_size(48, 10);
+        let (committer, _rx) = mpsc::channel(1);
+
+        app.handle_key(press(KeyCode::Char('/'), KeyModifiers::NONE), &committer)
+            .await;
+
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("❯ /clear    start a new session")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("/compact  compact this session")),
+            "{rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_prefixes_filter_the_menu() {
+        let (mut app, mut terminal) = app_with_size(48, 10);
+        let (committer, _rx) = mpsc::channel(1);
+
+        for character in "/co".chars() {
+            app.handle_key(
+                press(KeyCode::Char(character), KeyModifiers::NONE),
+                &committer,
+            )
+            .await;
+        }
+
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(rows.iter().any(|row| row.contains("/compact")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("/clear")), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn command_selection_is_sent_without_becoming_a_prompt() {
+        let (mut app, _) = app_with_size(48, 10);
+        let (committer, mut received) = mpsc::channel(1);
+
+        app.handle_key(press(KeyCode::Char('/'), KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(
+            received.recv().await,
+            Some(AgentCommand::Run(Command::Compact))
+        );
+        assert!(app.state.units.is_empty());
+        assert_eq!(app.input.text(), "");
+    }
+
+    #[tokio::test]
+    async fn compact_shows_progress_and_blocks_submissions_until_finished() {
+        let (mut app, mut terminal) = app_with_size(48, 10);
+        let (committer, mut received) = mpsc::channel(2);
+
+        app.handle_key(press(KeyCode::Char('/'), KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(
+            received.recv().await,
+            Some(AgentCommand::Run(Command::Compact))
+        );
+
+        let rows = drawn(&mut app, &mut terminal);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("compacting...") && row.contains("input disabled")),
+            "{rows:?}"
+        );
+
+        app.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::ALT), &committer)
+            .await;
+
+        assert_eq!(app.input.text(), "");
+        assert!(
+            received.try_recv().is_err(),
+            "no prompt or command may queue behind compaction"
+        );
+
+        app.handle_agent_event(AgentViewEvent::CommandFinished(Command::Compact));
+        app.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(app.input.text(), "x");
+        assert!(
+            drawn(&mut app, &mut terminal)
+                .iter()
+                .all(|row| !row.contains("compacting..."))
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_blocks_new_input_until_the_session_boundary_finishes() {
+        let (mut app, _) = app_with_size(48, 10);
+        let (committer, mut received) = mpsc::channel(1);
+
+        app.handle_key(press(KeyCode::Char('/'), KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(
+            received.recv().await,
+            Some(AgentCommand::Run(Command::Clear))
+        );
+
+        app.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE), &committer)
+            .await;
+        assert_eq!(app.input.text(), "");
+
+        app.handle_agent_event(AgentViewEvent::CommandFinished(Command::Clear));
+        app.handle_key(press(KeyCode::Char('x'), KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(app.input.text(), "x");
+    }
+
+    #[tokio::test]
+    async fn tab_completes_the_selected_command() {
+        let (mut app, _) = app_with_size(48, 10);
+        let (committer, mut received) = mpsc::channel(1);
+
+        for character in "/co".chars() {
+            app.handle_key(
+                press(KeyCode::Char(character), KeyModifiers::NONE),
+                &committer,
+            )
+            .await;
+        }
+        app.handle_key(press(KeyCode::Tab, KeyModifiers::NONE), &committer)
+            .await;
+
+        assert_eq!(app.input.text(), "/compact");
+        assert!(
+            received.try_recv().is_err(),
+            "completion must not execute it"
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_dismisses_the_command_menu_before_cancelling() {
+        let (mut app, mut terminal) = app_with_size(48, 10);
+        let (committer, mut received) = mpsc::channel(1);
+
+        app.handle_key(press(KeyCode::Char('/'), KeyModifiers::NONE), &committer)
+            .await;
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE), &committer)
+            .await;
+
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(!rows.iter().any(|row| row.contains("/clear")), "{rows:?}");
+        assert!(received.try_recv().is_err(), "Esc only dismissed the menu");
     }
 
     #[tokio::test]

@@ -1,10 +1,14 @@
 use tokio::sync::oneshot;
 
-use crate::tool::{Presentation, ToolCall, ToolCallResult};
+use crate::{
+    command::Command,
+    tool::{Presentation, ToolCall, ToolCallResult},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCommand {
     Prompt(String),
+    Run(Command),
     Cancel,
 }
 
@@ -12,14 +16,6 @@ pub enum AgentCommand {
 pub enum CompletedReason {
     Final,
     NeedCall,
-}
-
-/// Provider-reported usage for one completed request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input: usize,
-    pub output: usize,
-    pub total: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -44,12 +40,21 @@ pub enum AgentViewEvent {
     TextDelta(String),
     Tool(Presentation),
     TurnStart,
-    /// `context` is the locally tokenized provider-facing history, while
-    /// `turn` accumulates provider-reported usage for the current user turn.
+    /// Both values are local estimates. `context` is the next request size,
+    /// while `turn` accumulates estimated request and response tokens.
     TokenUsage {
         context: Option<usize>,
         turn: Option<usize>,
     },
+    /// The previous context was archived and replaced by a fresh session.
+    SessionStarted,
+    /// A slash command finished, whether successfully or with an error already
+    /// reported through [`Self::Err`].
+    CommandFinished(Command),
+    /// Tool call/result pairs were replaced by deterministic tool summaries.
+    ToolResultsCompacted,
+    /// Context compaction completed and replaced the previous context window.
+    ContextCompacted,
     /// `completed` is true when the turn ended because the model finished
     /// speaking, rather than because it failed part way through.
     TurnFinished {
@@ -99,10 +104,7 @@ pub enum ProviderSignal {
     TextDelta(String),
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolCallResult),
-    Completed {
-        reason: CompletedReason,
-        usage: Option<TokenUsage>,
-    },
+    Completed { reason: CompletedReason },
     Unsupported,
 }
 

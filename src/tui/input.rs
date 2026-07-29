@@ -118,7 +118,7 @@ impl Input {
         row == end.screen_cursor().row
     }
 
-    fn take(&mut self) -> Option<String> {
+    pub(crate) fn take(&mut self) -> Option<String> {
         let prompt = self.area.lines().join("\n");
 
         if prompt.trim().is_empty() {
@@ -197,9 +197,20 @@ impl Input {
         self.wrapped.set(None);
     }
 
-    /// What the box holds. An observation point for tests; the loop reads it
-    /// only through [`Self::handle_key`].
-    #[cfg(test)]
+    /// Replaces the current input without filing it in prompt history.
+    pub(crate) fn replace(&mut self, text: &str) {
+        self.show(text);
+    }
+
+    /// Clears the draft and recall entries for a newly started session.
+    pub(crate) fn reset(&mut self) {
+        self.show("");
+        self.history.clear();
+        self.recalled = None;
+        self.draft.clear();
+    }
+
+    /// What the box currently holds.
     pub fn text(&self) -> String {
         self.area.lines().join("\n")
     }

@@ -10,6 +10,10 @@ use crate::{
 #[derive(Parser, Debug, Clone)]
 #[command(name = "h", version, about)]
 pub struct Args {
+    /// Run one prompt without opening the terminal interface.
+    #[arg(short, long, value_name = "TEXT", conflicts_with = "resume")]
+    pub prompt: Option<String>,
+
     /// Resume a previous session. Omit the id to pick one interactively.
     #[arg(short, long, value_name = "SESSION_ID", num_args = 0..=1)]
     pub resume: Option<Option<String>>,
@@ -88,6 +92,22 @@ mod tests {
     #[test]
     fn absent_flag_starts_a_new_session() {
         assert_eq!(parse(&["h"]).resume, None);
+    }
+
+    #[test]
+    fn prompt_flag_selects_headless_input() {
+        let prompt = Some("你可以用什么工具".to_owned());
+
+        assert_eq!(parse(&["h", "-p", "你可以用什么工具"]).prompt, prompt);
+        assert_eq!(
+            parse(&["h", "--prompt", "你可以用什么工具"]).prompt,
+            Some("你可以用什么工具".to_owned())
+        );
+    }
+
+    #[test]
+    fn prompt_and_resume_are_mutually_exclusive() {
+        assert!(Args::try_parse_from(["h", "-p", "hello", "-r", "01JQ2X"]).is_err());
     }
 
     #[test]

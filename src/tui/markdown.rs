@@ -180,7 +180,7 @@ fn render_list(
             |start| format!("{}. ", start.saturating_add(index as u64)),
         );
 
-        for (offset, line) in render(blocks, inner).into_iter().enumerate() {
+        for (offset, line) in render_list_item(blocks, inner).into_iter().enumerate() {
             // The marker sits on the item's first line; the rest lines up under
             // the text rather than under the marker.
             let lead = if offset == 0 {
@@ -194,6 +194,20 @@ fn render_list(
 
             lines.push(Line::from(spans));
         }
+    }
+
+    lines
+}
+
+fn render_list_item(blocks: &[MarkdownBlock], width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 && !matches!(block, MarkdownBlock::List { .. }) {
+            lines.push(Line::default());
+        }
+
+        lines.extend(render_block(block, width));
     }
 
     lines
@@ -530,6 +544,23 @@ mod tests {
             render_text("- alpha beta gamma", 12),
             ["• alpha beta", "  gamma"],
             "the wrapped remainder lines up past the marker"
+        );
+    }
+
+    #[test]
+    fn a_nested_list_starts_directly_below_its_parent_item() {
+        let source = "- 苹果\n- 香蕉\n  - 普通香蕉\n  - 小香蕉\n    - 更深一层\n- 橙子";
+
+        assert_eq!(
+            render_text(source, 30),
+            [
+                "• 苹果",
+                "• 香蕉",
+                "  • 普通香蕉",
+                "  • 小香蕉",
+                "    • 更深一层",
+                "• 橙子",
+            ]
         );
     }
 

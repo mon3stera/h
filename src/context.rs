@@ -22,7 +22,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::tool::{Aggregator, Summary, ToolRegistry};
+use crate::{
+    provider::Compaction,
+    tool::{Aggregator, Summary, ToolRegistry},
+};
 
 pub const DEFAULT_TOOL_SUMMARY_TURN_INTERVAL: usize = 8;
 
@@ -183,6 +186,7 @@ pub enum Message {
     System(String),
     User(String),
     Assistant(String),
+    Compaction(Compaction),
     ToolCallResult {
         call_id: String,
         output: String,
@@ -394,7 +398,8 @@ impl Context {
     }
 
     /// Provider-facing projection. Frozen tool runs become compact assistant
-    /// messages while the canonical histories remain untouched for replay.
+    /// messages, and the latest provider compaction replaces everything before
+    /// it except the leading system prefix.
     pub fn provider_messages(&self) -> Vec<Message> {
         let mut messages = Vec::with_capacity(self.histories.len());
         let mut index = 0;
@@ -414,7 +419,57 @@ impl Context {
         }
 
         messages.extend(self.histories[index..].iter().cloned());
+
+        let Some(boundary) = messages
+            .iter()
+            .rposition(|message| matches!(message, Message::Compaction(_)))
+        else {
+            return messages;
+        };
+        let system_end = messages
+            .iter()
+            .take_while(|message| matches!(message, Message::System(_)))
+            .count();
+        let mut projected = Vec::with_capacity(system_end + messages.len() - boundary);
+
+        projected.extend(messages[..system_end].iter().cloned());
+        projected.extend(messages[boundary..].iter().cloned());
+        projected
+    }
+
+    /// Includes the assistant text currently arriving from the provider so
+    /// token estimates can advance before the response reaches a boundary.
+    pub fn provider_messages_with_buf(&self) -> Vec<Message> {
+        let mut messages = self.provider_messages();
+
+        if !self.buf.trim().is_empty() {
+            messages.push(Message::Assistant(self.buf.clone()));
+        }
+
         messages
+    }
+
+    /// Builds the standalone compact request without the leading system
+    /// prefix. Normal provider requests add that prefix back afterwards.
+    pub fn compaction_input(&self) -> Vec<Message> {
+        let messages = self.provider_messages();
+        let system_end = messages
+            .iter()
+            .take_while(|message| matches!(message, Message::System(_)))
+            .count();
+
+        messages[system_end..].to_vec()
+    }
+
+    /// Records the provider's compacted window as the new projection boundary
+    /// while retaining canonical histories for replay and archival.
+    pub fn apply_compaction(&mut self, compaction: Compaction) {
+        self.histories.push(Message::Compaction(compaction));
+        self.token_count = None;
+        self.tool_compaction = ToolCompaction {
+            compacted_until: self.histories.len(),
+            ..ToolCompaction::default()
+        };
     }
 
     /// Records one completed Agent turn and periodically freezes old tool runs.
@@ -430,11 +485,18 @@ impl Context {
         self.freeze_tool_runs(tools);
     }
 
-    fn freeze_tool_runs(&mut self, tools: &ToolRegistry) {
+    /// Immediately freezes every tool run that can be summarized.
+    pub fn summarize_tools(&mut self, tools: &ToolRegistry) -> bool {
+        self.tool_compaction.completed_turns = 0;
+        self.freeze_tool_runs(tools)
+    }
+
+    fn freeze_tool_runs(&mut self, tools: &ToolRegistry) -> bool {
         let start = self
             .tool_compaction
             .compacted_until
             .min(self.histories.len());
+        let frozen_before = self.tool_compaction.frozen_runs.len();
         let mut run: Option<PendingToolRun> = None;
         let mut index = start;
 
@@ -515,6 +577,8 @@ impl Context {
             scan_end = self.tool_compaction.compacted_until,
             frozen_run_count = self.tool_compaction.frozen_runs.len(),
         );
+
+        self.tool_compaction.frozen_runs.len() > frozen_before
     }
 
     fn finish_pending_run(run: &mut Option<PendingToolRun>, frozen_runs: &mut Vec<FrozenToolRun>) {
@@ -540,6 +604,22 @@ impl Context {
         self.histories
             .iter()
             .any(|message| !matches!(message, Message::System(_)))
+    }
+
+    /// Keeps the session instructions while dropping the old conversation and
+    /// assigning a new archive identity.
+    pub fn start_session(&mut self) {
+        let system = self
+            .histories
+            .iter()
+            .filter(|message| matches!(message, Message::System(_)))
+            .cloned()
+            .collect();
+
+        *self = Self {
+            histories: system,
+            ..Self::new()
+        };
     }
 
     pub fn histories_mut(&mut self) -> &mut Vec<Message> {
@@ -738,7 +818,7 @@ fn extra_prompt_paths() -> Vec<PathBuf> {
 mod tests {
     use std::{fs as std_fs, path::Path, process::Command};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::tool::{FetchTool, FileBufferStore, GrepTool, ReadFileTool, Summary, WriteFileTool};
@@ -774,6 +854,18 @@ mod tests {
 
     fn read_summary(path: &str, lines: usize) -> Summary {
         Summary::new(1, json!({"path": path, "lines": lines}))
+    }
+
+    fn compaction(id: &str) -> Compaction {
+        Compaction::new(
+            serde_json::to_vec(&json!([{
+                "type": "compaction",
+                "id": id,
+                "encrypted_content": "opaque",
+            }]))
+            .unwrap(),
+            None,
+        )
     }
 
     #[test]
@@ -875,6 +967,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted.token_count, None);
+    }
+
+    #[tokio::test]
+    async fn provider_compactions_survive_archive_and_resume() {
+        let archive = TempArchive::new();
+        let mut context = context_with_prompt("session-1", "inspect the project");
+        context.apply_compaction(compaction("cmp-1"));
+
+        context.archive_in(&archive.path).await.unwrap();
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            resumed.provider_messages().as_slice(),
+            [Message::Compaction(compaction)]
+                if serde_json::from_slice::<Value>(compaction.state()).unwrap()[0]["id"] == "cmp-1"
+        ));
+    }
+
+    #[test]
+    fn provider_projection_uses_the_latest_compaction_boundary() {
+        let mut context = Context::new();
+        *context.histories_mut() = vec![
+            Message::System("instructions".to_owned()),
+            Message::User("old prompt".to_owned()),
+            Message::Compaction(compaction("cmp-1")),
+            Message::Assistant("after first compaction".to_owned()),
+            Message::Compaction(compaction("cmp-2")),
+            Message::User("new prompt".to_owned()),
+        ];
+
+        assert!(matches!(
+            context.provider_messages().as_slice(),
+            [
+                Message::System(system),
+                Message::Compaction(compaction),
+                Message::User(prompt),
+            ] if system == "instructions"
+                && serde_json::from_slice::<Value>(compaction.state()).unwrap()[0]["id"] == "cmp-2"
+                && prompt == "new prompt"
+        ));
+    }
+
+    #[test]
+    fn compact_input_removes_only_the_leading_system_prefix() {
+        let mut context = Context::new();
+        *context.histories_mut() = vec![
+            Message::System("global prompts".to_owned()),
+            Message::System("workspace info".to_owned()),
+            Message::User("inspect the project".to_owned()),
+            Message::System("later system data".to_owned()),
+        ];
+
+        assert!(matches!(
+            context.compaction_input().as_slice(),
+            [Message::User(prompt), Message::System(later)]
+                if prompt == "inspect the project" && later == "later system data"
+        ));
     }
 
     #[test]
@@ -1132,6 +1283,37 @@ mod tests {
             .insert(0, Message::System("global prompts".to_owned()));
 
         assert!(context.has_exchange());
+    }
+
+    #[test]
+    fn starting_a_session_keeps_only_system_messages() {
+        let mut context = Context {
+            id: "old-session".to_owned(),
+            buf: "partial response".to_owned(),
+            histories: vec![
+                Message::System("global prompts".to_owned()),
+                Message::User("old question".to_owned()),
+                Message::Assistant("old answer".to_owned()),
+                Message::System("workspace info".to_owned()),
+            ],
+            token_count: Some(2_400),
+            tool_compaction: ToolCompaction {
+                completed_turns: 3,
+                ..ToolCompaction::default()
+            },
+        };
+
+        context.start_session();
+
+        assert_ne!(context.id, "old-session");
+        assert!(context.buf.is_empty());
+        assert_eq!(context.token_count, None);
+        assert_eq!(context.tool_compaction.completed_turns, 0);
+        assert!(matches!(
+            context.histories.as_slice(),
+            [Message::System(global), Message::System(workspace)]
+                if global == "global prompts" && workspace == "workspace info"
+        ));
     }
 
     #[tokio::test]

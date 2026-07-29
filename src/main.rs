@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, io::Write};
 
 use clap::Parser;
 use tokio::sync::mpsc::{self, Receiver, error::TryRecvError};
@@ -19,9 +19,11 @@ mod agent;
 mod bridge;
 mod bus;
 mod cli;
+mod command;
 mod config;
 mod context;
 mod event;
+mod headless;
 mod logger;
 mod provider;
 mod tool;
@@ -34,6 +36,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(event = "app.starting");
 
     let args = cli::Args::parse();
+
+    if let Some(prompt) = args.prompt {
+        return run_prompt(prompt).await;
+    }
 
     match cli::resolve_session(&args).await? {
         cli::Session::New => main_loop(None).await,
@@ -48,53 +54,9 @@ async fn main() -> anyhow::Result<()> {
 /// Runs one session to completion. `id` names an archived session to pick up
 /// where it left off; `None` starts a fresh one.
 async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load().await?;
-    let ProviderConfig::OpenAI(openai) = config.provider();
-
-    let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
-        openai.base_url(),
-        openai.bearer_token(),
-        config.model(),
-        config.reasoning_effort(),
-    ));
-    let (context_window, tool_summary_turn_interval) =
-        (config.context_window(), config.tool_summary_turn_interval());
-
-    tracing::info!(
-        event = "config.loaded",
-        provider_id = config.provider_id(),
-        provider_name = openai.name(),
-        model = config.model(),
-        context_window,
-        auto_compact_token_limit = config.auto_compact_token_limit(),
-        tool_summary_turn_interval = tool_summary_turn_interval.get(),
-    );
-
-    // The provider owns its copied credential now; do not keep a second copy
-    // in the parsed configuration for the lifetime of the session.
-    drop(config);
-
     let (bridge, ui_request_rx) = UiBridge::new();
-
-    let mut agent = Agent::new(provider);
-    agent.with_tool_summary_turn_interval(tool_summary_turn_interval);
+    let (mut agent, context_window) = build_agent(id.as_deref(), bridge).await?;
     let bus_rx = agent.subscribe_view();
-    agent.with_internal_tools(bridge)?;
-
-    match &id {
-        // A resumed context already carries the system messages the original
-        // session was built with, so injecting them again would duplicate them.
-        Some(id) => {
-            agent.resume(id).await?;
-        }
-        None => {
-            agent
-                .with_global_prompts()
-                .await?
-                .with_workspace_info()
-                .await?;
-        }
-    }
 
     agent.initialize()?;
 
@@ -109,7 +71,7 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
 
     let (commands, command_rx) = mpsc::channel::<AgentCommand>(8);
 
-    tracing::info!(event = "app.ready");
+    tracing::info!(event = "app.ready", mode = "interactive");
 
     let worker = tokio::spawn(run_agent(agent, command_rx));
 
@@ -126,9 +88,95 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_prompt(prompt: String) -> anyhow::Result<()> {
+    let (bridge, ui_request_rx) = UiBridge::new();
+    drop(ui_request_rx);
+
+    let (mut agent, _) = build_agent(None, bridge).await?;
+    agent.initialize()?;
+
+    tracing::info!(event = "app.ready", mode = "headless");
+
+    let result = headless::run(&mut agent, prompt).await;
+    let archived = agent.archive().await;
+    let response = result?;
+
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(response.as_bytes())?;
+    if !response.is_empty() && !response.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
+    stdout.flush()?;
+
+    archived?;
+
+    tracing::info!(event = "app.archived");
+    Ok(())
+}
+
+/// Builds a session up to, but not including, provider initialization. Callers
+/// can subscribe to the event stream they need before initialization emits its
+/// first events.
+async fn build_agent(
+    id: Option<&str>,
+    bridge: UiBridge,
+) -> anyhow::Result<(Agent<OpenAIProvider>, usize)> {
+    let config = Config::load().await?;
+    let ProviderConfig::OpenAI(openai) = config.provider();
+
+    let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
+        openai.base_url(),
+        openai.bearer_token(),
+        config.model(),
+        config.reasoning_effort(),
+    ));
+    let (context_window, auto_compact_token_limit, tool_summary_turn_interval) = (
+        config.context_window(),
+        config.auto_compact_token_limit(),
+        config.tool_summary_turn_interval(),
+    );
+
+    tracing::info!(
+        event = "config.loaded",
+        provider_id = config.provider_id(),
+        provider_name = openai.name(),
+        model = config.model(),
+        context_window,
+        auto_compact_token_limit,
+        tool_summary_turn_interval = tool_summary_turn_interval.get(),
+    );
+
+    // The provider owns its copied credential now; do not keep a second copy
+    // in the parsed configuration for the lifetime of the session.
+    drop(config);
+
+    let mut agent = Agent::new(provider);
+    agent
+        .with_auto_compact_token_limit(auto_compact_token_limit)
+        .with_tool_summary_turn_interval(tool_summary_turn_interval);
+    agent.with_internal_tools(bridge)?;
+
+    match id {
+        // A resumed context already carries the system messages the original
+        // session was built with, so injecting them again would duplicate them.
+        Some(id) => {
+            agent.resume(id).await?;
+        }
+        None => {
+            agent
+                .with_global_prompts()
+                .await?
+                .with_workspace_info()
+                .await?;
+        }
+    }
+
+    Ok((agent, context_window))
+}
+
 /// Owns the mutable agent while still listening for UI control commands during
-/// a turn. Prompts may queue, but `Cancel` always targets the turn currently
-/// being polled.
+/// a turn. Prompts and slash commands retain their order, while `Cancel` always
+/// targets the turn currently being polled.
 async fn run_agent<P>(
     mut agent: Agent<P>,
     mut commands: Receiver<AgentCommand>,
@@ -139,56 +187,64 @@ where
     let (mut queued, mut accepting) = (VecDeque::new(), true);
 
     loop {
-        let prompt = loop {
+        let command = loop {
             if !accepting {
                 break None;
             }
 
-            if let Some(prompt) = queued.pop_front() {
-                break Some(prompt);
+            if let Some(command) = queued.pop_front() {
+                break Some(command);
             }
 
             match commands.recv().await {
-                Some(AgentCommand::Prompt(prompt)) => break Some(prompt),
                 Some(AgentCommand::Cancel) => {}
+                Some(command) => break Some(command),
                 None => {
                     accepting = false;
                     break None;
                 }
             }
         };
-        let Some(prompt) = prompt else {
+        let Some(command) = command else {
             break;
         };
 
-        let cancellation = CancellationToken::new();
-        let result = {
-            let turn = agent.continue_turn(prompt, cancellation.clone());
-            tokio::pin!(turn);
+        match command {
+            AgentCommand::Prompt(prompt) => {
+                let cancellation = CancellationToken::new();
+                let result = {
+                    let turn = agent.continue_turn(prompt, cancellation.clone());
+                    tokio::pin!(turn);
 
-            loop {
-                tokio::select! {
-                    result = &mut turn => break result,
-                    command = commands.recv(), if accepting => match command {
-                        Some(AgentCommand::Prompt(prompt)) => queued.push_back(prompt),
-                        Some(AgentCommand::Cancel) => cancellation.cancel(),
-                        None => {
-                            accepting = false;
-                            queued.clear();
-                            cancellation.cancel();
+                    loop {
+                        tokio::select! {
+                            result = &mut turn => break result,
+                            command = commands.recv(), if accepting => match command {
+                                Some(AgentCommand::Cancel) => cancellation.cancel(),
+                                Some(command) => queued.push_back(command),
+                                None => {
+                                    accepting = false;
+                                    queued.clear();
+                                    cancellation.cancel();
+                                }
+                            }
                         }
                     }
+                };
+
+                if let Err(e) = result {
+                    tracing::error!(
+                        event = "agent.worker.failed",
+                        operation = "continue_turn",
+                        error_class = "agent_turn_error",
+                        error = e.to_string(),
+                    );
                 }
             }
-        };
-
-        if let Err(e) = result {
-            tracing::error!(
-                event = "agent.worker.failed",
-                operation = "continue_turn",
-                error_class = "agent_turn_error",
-                error = e.to_string(),
-            );
+            AgentCommand::Run(command) => {
+                let _ = agent.run_command(command).await;
+            }
+            AgentCommand::Cancel => {}
         }
 
         // If the turn and a queued Esc become ready together, the turn has
@@ -196,8 +252,8 @@ where
         // next queued prompt.
         loop {
             match commands.try_recv() {
-                Ok(AgentCommand::Prompt(prompt)) => queued.push_back(prompt),
                 Ok(AgentCommand::Cancel) => {}
+                Ok(command) => queued.push_back(command),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     accepting = false;

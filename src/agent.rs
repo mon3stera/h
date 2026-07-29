@@ -7,8 +7,9 @@ use std::{
 use crate::{
     bridge::UiBridge,
     bus::EventBus,
+    command::Command,
     context::{Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, built_in_workspace_info},
-    event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal, TokenUsage},
+    event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::{Provider, ProviderEventStream},
     tool::{
         AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolCall,
@@ -67,22 +68,114 @@ struct TurnMetrics {
     tool_call_count: usize,
     unsupported_signal_count: usize,
     completion_reason: &'static str,
+    settled_tokens: Option<usize>,
+    request_tokens: Option<RequestTokens>,
     total_tokens: Option<usize>,
+}
+
+struct RequestTokens {
+    input: Option<usize>,
+    output: Option<usize>,
+    messages: Vec<Message>,
+    buf: String,
 }
 
 impl TurnMetrics {
     fn new() -> Self {
         Self {
+            settled_tokens: Some(0),
             total_tokens: Some(0),
             ..Self::default()
         }
     }
 
-    fn add_usage(&mut self, usage: Option<TokenUsage>) {
-        self.total_tokens = match (self.total_tokens, usage) {
-            (Some(total), Some(usage)) => Some(total.saturating_add(usage.total)),
+    fn start_request(&mut self, input: Option<usize>) {
+        debug_assert!(self.request_tokens.is_none());
+        self.request_tokens = Some(RequestTokens {
+            input,
+            output: Some(0),
+            messages: Vec::new(),
+            buf: String::new(),
+        });
+        self.refresh_total();
+    }
+
+    fn append_output(&mut self, text: &str) {
+        if let Some(request) = self.request_tokens.as_mut() {
+            request.buf.push_str(text);
+        }
+    }
+
+    fn push_output(&mut self, message: Message) {
+        let Some(request) = self.request_tokens.as_mut() else {
+            return;
+        };
+
+        request.finish_buf();
+        request.messages.push(message);
+    }
+
+    fn output(&self) -> Option<Vec<Message>> {
+        self.request_tokens.as_ref().map(RequestTokens::output)
+    }
+
+    fn set_output_tokens(&mut self, output: Option<usize>) {
+        if let Some(request) = self.request_tokens.as_mut() {
+            request.output = output;
+            self.refresh_total();
+        }
+    }
+
+    fn finish_request(&mut self) {
+        let total = self.total_tokens;
+
+        if self.request_tokens.take().is_none() {
+            return;
+        }
+
+        self.settled_tokens = total;
+        self.total_tokens = self.settled_tokens;
+    }
+
+    fn add_tokens(&mut self, tokens: Option<usize>) {
+        self.settled_tokens = match (self.settled_tokens, tokens) {
+            (Some(total), Some(tokens)) => Some(total.saturating_add(tokens)),
             _ => None,
         };
+        self.refresh_total();
+    }
+
+    fn refresh_total(&mut self) {
+        self.total_tokens = match (&self.request_tokens, self.settled_tokens) {
+            (Some(request), Some(settled)) => match (request.input, request.output) {
+                (Some(input), Some(output)) => {
+                    Some(settled.saturating_add(input).saturating_add(output))
+                }
+                _ => None,
+            },
+            (Some(_), None) => None,
+            (None, settled) => settled,
+        };
+    }
+}
+
+impl RequestTokens {
+    fn finish_buf(&mut self) {
+        let text = std::mem::take(&mut self.buf);
+
+        if !text.trim().is_empty() {
+            self.messages.push(Message::Assistant(text));
+        }
+    }
+
+    fn output(&self) -> Vec<Message> {
+        let mut messages = self.messages.clone();
+
+        if !self.buf.trim().is_empty() {
+            messages.push(Message::Assistant(self.buf.clone()));
+        }
+
+        messages
     }
 }
 
@@ -94,6 +187,12 @@ enum RequestAttempt {
         error_class: &'static str,
         had_output: bool,
     },
+}
+
+enum CompactOutcome {
+    Applied { total_tokens: Option<usize> },
+    Empty,
+    Unsupported,
 }
 
 pub enum NextTurn {
@@ -109,6 +208,8 @@ pub struct Agent<P> {
     tool: ToolRegistry,
     provider: P,
     turn: NextTurn,
+    auto_compact_token_limit: usize,
+    compact_available: bool,
     tool_summary_turn_interval: NonZeroUsize,
 }
 
@@ -124,9 +225,17 @@ where
             tool: ToolRegistry::new(),
             provider,
             turn: NextTurn::Continue,
+            auto_compact_token_limit: usize::MAX,
+            compact_available: true,
             tool_summary_turn_interval: NonZeroUsize::new(DEFAULT_TOOL_SUMMARY_TURN_INTERVAL)
                 .expect("the default tool summary interval is non-zero"),
         }
+    }
+
+    pub fn with_auto_compact_token_limit(&mut self, limit: usize) -> &mut Self {
+        assert!(limit > 0, "the auto compact token limit must be non-zero");
+        self.auto_compact_token_limit = limit;
+        self
     }
 
     pub fn with_tool_summary_turn_interval(&mut self, interval: NonZeroUsize) -> &mut Self {
@@ -192,13 +301,34 @@ where
         Ok(())
     }
 
-    fn refresh_token_count(&mut self, turn: Option<usize>) {
-        let messages = self.context.provider_messages();
-        let count = match self.provider.count_tokens(&messages) {
+    fn estimate_request_tokens(&self, messages: &[Message]) -> Option<usize> {
+        match self.provider.estimate_request_tokens(messages) {
             Ok(count) => count,
             Err(error) => {
                 tracing::warn!(
-                    event = "context.token_count.failed",
+                    event = "provider.request_token_estimate.failed",
+                    error_class = "tokenizer_error",
+                    error = error.to_string(),
+                );
+                None
+            }
+        }
+    }
+
+    fn count_context_tokens(&self) -> Option<usize> {
+        let messages = self.context.provider_messages_with_buf();
+        self.estimate_request_tokens(&messages)
+    }
+
+    fn refresh_output_tokens(&self, metrics: &mut TurnMetrics) {
+        let Some(output) = metrics.output() else {
+            return;
+        };
+        let tokens = match self.provider.estimate_output_tokens(&output) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                tracing::warn!(
+                    event = "provider.output_token_estimate.failed",
                     error_class = "tokenizer_error",
                     error = error.to_string(),
                 );
@@ -206,11 +336,31 @@ where
             }
         };
 
+        metrics.set_output_tokens(tokens);
+    }
+
+    fn broadcast_token_count(&mut self, count: Option<usize>, turn: Option<usize>) {
         self.context.set_token_count(count);
         self.view_bus.broadcast(AgentViewEvent::TokenUsage {
             context: count,
             turn,
         });
+    }
+
+    fn refresh_token_count(&mut self, turn: Option<usize>) {
+        let count = self.count_context_tokens();
+        self.broadcast_token_count(count, turn);
+    }
+
+    fn refresh_usage(&mut self, metrics: &mut TurnMetrics) {
+        self.refresh_output_tokens(metrics);
+        self.refresh_token_count(metrics.total_tokens);
+    }
+
+    fn settle_request(&mut self, metrics: &mut TurnMetrics) {
+        self.refresh_output_tokens(metrics);
+        metrics.finish_request();
+        self.refresh_token_count(metrics.total_tokens);
     }
 
     fn append_prompt(&mut self, prompt: impl AsRef<str>) {
@@ -222,6 +372,122 @@ where
     fn merge_text_delta(&mut self) {
         self.context.finalize_buf(Message::Assistant);
         self.context.prepare_buf();
+    }
+
+    async fn compact_context(&mut self) -> anyhow::Result<CompactOutcome> {
+        let input = self.context.compaction_input();
+        if input.is_empty() {
+            return Ok(CompactOutcome::Empty);
+        }
+
+        let Some(compaction) = self.provider.compact(&input).await? else {
+            return Ok(CompactOutcome::Unsupported);
+        };
+        let total_tokens = compaction.total_tokens();
+
+        self.context.apply_compaction(compaction);
+        Ok(CompactOutcome::Applied { total_tokens })
+    }
+
+    async fn auto_compact(&mut self, metrics: &mut TurnMetrics) -> Option<usize> {
+        let before = self.count_context_tokens();
+        self.context.set_token_count(before);
+
+        if !self.compact_available {
+            return before;
+        }
+
+        let Some(before) = before else {
+            return None;
+        };
+        if before < self.auto_compact_token_limit {
+            return Some(before);
+        }
+
+        let tools_compacted = self.context.summarize_tools(&self.tool);
+        let after_summary = self.count_context_tokens();
+        self.context.set_token_count(after_summary);
+
+        if tools_compacted {
+            self.view_bus
+                .broadcast(AgentViewEvent::ToolResultsCompacted);
+
+            tracing::info!(
+                event = "context.auto_compact.completed",
+                method = "tool_summary",
+                before_tokens = before,
+                after_tokens = after_summary,
+            );
+        }
+
+        let Some(after_summary) = after_summary else {
+            return None;
+        };
+        if after_summary < self.auto_compact_token_limit {
+            return Some(after_summary);
+        }
+
+        match self.compact_context().await {
+            Ok(CompactOutcome::Applied { total_tokens }) => {
+                metrics.add_tokens(total_tokens);
+                let after = self.count_context_tokens();
+                self.context.set_token_count(after);
+                self.view_bus.broadcast(AgentViewEvent::ContextCompacted);
+
+                tracing::info!(
+                    event = "context.auto_compact.completed",
+                    method = "provider",
+                    before_tokens = before,
+                    after_tokens = after,
+                );
+
+                after
+            }
+            Ok(CompactOutcome::Empty) => {
+                tracing::info!(
+                    event = "context.auto_compact.skipped",
+                    reason = "empty_history",
+                    context_tokens = after_summary,
+                );
+
+                Some(after_summary)
+            }
+            Ok(CompactOutcome::Unsupported) => {
+                self.compact_available = false;
+                tracing::warn!(
+                    event = "context.auto_compact.disabled",
+                    reason = "provider_unsupported",
+                    context_tokens = after_summary,
+                );
+
+                Some(after_summary)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "context.auto_compact.failed",
+                    error_class = "provider_compact_error",
+                    error = error.to_string(),
+                    context_tokens = after_summary,
+                );
+
+                Some(after_summary)
+            }
+        }
+    }
+
+    async fn prepare_provider_context(
+        &mut self,
+        metrics: &mut TurnMetrics,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let count = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return false,
+            count = self.auto_compact(metrics) => count,
+        };
+        self.broadcast_token_count(count, metrics.total_tokens);
+
+        true
     }
 
     async fn handle_tool_call(&self, call: &crate::tool::ToolCall) -> crate::tool::ToolCallResult {
@@ -238,20 +504,26 @@ where
             ProviderSignal::TextDelta(delta) => {
                 metrics.text_delta_count += 1;
                 metrics.text_delta_bytes += delta.len();
+                metrics.append_output(delta);
                 self.context.append_buf(delta);
                 self.view_bus
                     .broadcast(AgentViewEvent::TextDelta(delta.clone()));
+                self.refresh_usage(metrics);
             }
             ProviderSignal::ToolCallStarted(call) => {
                 metrics.tool_call_count += 1;
                 self.merge_text_delta();
 
                 let arguments = serde_json::to_string(call.arguments())?;
-                self.context.histories_mut().push(Message::ToolCall {
+                let message = Message::ToolCall {
                     call_id: call.id().as_str().to_owned(),
                     name: call.name().to_owned(),
                     arguments,
-                });
+                };
+
+                metrics.push_output(message.clone());
+                self.context.histories_mut().push(message);
+                self.refresh_usage(metrics);
 
                 self.view_bus
                     .broadcast(AgentViewEvent::Tool(self.tool.present_running(call)));
@@ -297,21 +569,27 @@ where
                 self.view_bus.broadcast(AgentViewEvent::Tool(
                     self.tool.present_completed(call, &result),
                 ));
-                self.refresh_token_count(metrics.total_tokens);
+
+                self.prepare_provider_context(metrics, cancellation).await;
             }
             ProviderSignal::ToolCallCompleted(result) => {
                 self.merge_text_delta();
 
-                self.context.histories_mut().push(Message::ToolCallResult {
+                let message = Message::ToolCallResult {
                     call_id: result.id().as_str().to_owned(),
                     output: result.clone().into_provider_output(),
                     summary: result.summary().cloned(),
-                });
-                self.refresh_token_count(metrics.total_tokens);
-            }
-            ProviderSignal::Completed { reason, usage } => {
-                metrics.add_usage(*usage);
+                };
 
+                metrics.push_output(message.clone());
+                self.context.histories_mut().push(message);
+                self.refresh_usage(metrics);
+
+                self.prepare_provider_context(metrics, cancellation).await;
+            }
+            ProviderSignal::Completed { reason } => {
+                self.refresh_output_tokens(metrics);
+                metrics.finish_request();
                 metrics.completion_reason = match reason {
                     CompletedReason::NeedCall => "needs_tool_call",
                     CompletedReason::Final => "final",
@@ -319,14 +597,20 @@ where
                 self.merge_text_delta();
                 self.view_bus.broadcast(AgentViewEvent::Completed);
 
-                if matches!(reason, CompletedReason::NeedCall) {
+                let final_answer = matches!(reason, CompletedReason::Final);
+                if !final_answer {
                     self.turn = NextTurn::Continue;
                 } else {
                     self.context
                         .complete_turn(self.tool_summary_turn_interval, &self.tool);
                 }
 
-                self.refresh_token_count(metrics.total_tokens);
+                if final_answer {
+                    let count = self.auto_compact(metrics).await;
+                    self.broadcast_token_count(count, metrics.total_tokens);
+                } else {
+                    self.refresh_token_count(metrics.total_tokens);
+                }
             }
             ProviderSignal::Unsupported => {
                 metrics.unsupported_signal_count += 1;
@@ -343,7 +627,7 @@ where
         self.view_bus
             .broadcast(AgentViewEvent::Err("Interrupted by user".to_owned()));
         self.view_bus.broadcast(AgentViewEvent::Completed);
-        self.refresh_token_count(metrics.total_tokens);
+        self.settle_request(metrics);
 
         tracing::info!(event = "agent.turn.interrupted");
     }
@@ -444,6 +728,63 @@ where
         self.context.archive().await
     }
 
+    pub async fn run_command(&mut self, command: Command) -> anyhow::Result<()> {
+        tracing::info!(event = "agent.command.started", command = command.label());
+
+        let result = match command {
+            Command::Clear => self.start_session().await,
+            Command::Compact => {
+                if self.context.summarize_tools(&self.tool) {
+                    self.view_bus
+                        .broadcast(AgentViewEvent::ToolResultsCompacted);
+                }
+
+                match self.compact_context().await? {
+                    CompactOutcome::Applied { .. } | CompactOutcome::Empty => {
+                        self.refresh_token_count(None);
+                        self.view_bus.broadcast(AgentViewEvent::ContextCompacted);
+                        Ok(())
+                    }
+                    CompactOutcome::Unsupported => {
+                        anyhow::bail!("the current provider does not support context compaction")
+                    }
+                }
+            }
+        };
+
+        match &result {
+            Ok(()) => tracing::info!(event = "agent.command.completed", command = command.label()),
+            Err(error) => {
+                tracing::error!(
+                    event = "agent.command.failed",
+                    command = command.label(),
+                    error_class = "command_error",
+                    error = error.to_string(),
+                );
+                self.view_bus.broadcast(AgentViewEvent::Err(format!(
+                    "Command {} failed: {error}",
+                    command.label()
+                )));
+            }
+        }
+
+        self.view_bus
+            .broadcast(AgentViewEvent::CommandFinished(command));
+
+        result
+    }
+
+    async fn start_session(&mut self) -> anyhow::Result<()> {
+        self.archive().await?;
+        self.context.start_session();
+        self.turn = NextTurn::Continue;
+
+        self.view_bus.broadcast(AgentViewEvent::SessionStarted);
+        self.refresh_token_count(None);
+
+        Ok(())
+    }
+
     /// What the user asked in this session, oldest first, for the prompt box to
     /// offer back on recall.
     pub fn prompts(&self) -> Vec<String> {
@@ -483,7 +824,9 @@ where
             match message {
                 // Global prompts, workspace info, and results already folded
                 // into the call above them were never on screen.
-                Message::System(_) | Message::ToolCallResult { .. } => continue,
+                Message::System(_) | Message::Compaction(_) | Message::ToolCallResult { .. } => {
+                    continue;
+                }
                 Message::User(prompt) => {
                     self.view_bus
                         .broadcast(AgentViewEvent::Prompt(prompt.clone()));
@@ -531,14 +874,13 @@ where
 
     async fn open_stream(
         &self,
+        messages: &[Message],
         cancellation: &CancellationToken,
     ) -> anyhow::Result<Option<ProviderEventStream<P::StreamEvent>>> {
-        let messages = self.context.provider_messages();
-
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Ok(None),
-            opened = self.provider.stream(&messages) => opened.map(Some),
+            opened = self.provider.stream(messages) => opened.map(Some),
         }
     }
 
@@ -547,7 +889,13 @@ where
         metrics: &mut TurnMetrics,
         cancellation: &CancellationToken,
     ) -> anyhow::Result<RequestAttempt> {
-        let mut stream = match self.open_stream(cancellation).await {
+        if !self.prepare_provider_context(metrics, cancellation).await {
+            return Ok(RequestAttempt::Interrupted);
+        }
+
+        let messages = self.context.provider_messages();
+        let input_tokens = self.estimate_request_tokens(&messages);
+        let mut stream = match self.open_stream(&messages, cancellation).await {
             Ok(Some(stream)) => stream,
             Ok(None) => return Ok(RequestAttempt::Interrupted),
             Err(error) => {
@@ -558,34 +906,53 @@ where
                 });
             }
         };
+
+        metrics.start_request(input_tokens);
+        self.refresh_token_count(metrics.total_tokens);
+
         let mut had_output = false;
 
         loop {
             let event = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(RequestAttempt::Interrupted),
+                _ = cancellation.cancelled() => {
+                    self.settle_request(metrics);
+                    return Ok(RequestAttempt::Interrupted);
+                }
                 event = stream.next() => event,
             };
 
             match event {
                 Some(Ok(event)) => {
                     if cancellation.is_cancelled() {
+                        self.settle_request(metrics);
                         return Ok(RequestAttempt::Interrupted);
                     }
 
-                    let signal = self.provider.handle(event).await?;
+                    let signal = match self.provider.handle(event).await {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            self.settle_request(metrics);
+                            return Err(error);
+                        }
+                    };
                     let completed = matches!(&signal, ProviderSignal::Completed { .. });
                     had_output |= !matches!(&signal, ProviderSignal::Unsupported);
 
                     let agent_event: AgentEvent = signal.clone().into();
                     self.event_bus.broadcast(agent_event);
-                    self.handle_signal(&signal, metrics, cancellation).await?;
+                    if let Err(error) = self.handle_signal(&signal, metrics, cancellation).await {
+                        self.settle_request(metrics);
+                        return Err(error);
+                    }
 
                     if completed {
+                        self.settle_request(metrics);
                         return Ok(RequestAttempt::Completed);
                     }
                 }
                 Some(Err(error)) => {
+                    self.settle_request(metrics);
                     return Ok(RequestAttempt::Retry {
                         error,
                         error_class: "provider_stream_error",
@@ -593,6 +960,7 @@ where
                     });
                 }
                 None => {
+                    self.settle_request(metrics);
                     return Ok(RequestAttempt::Retry {
                         error: anyhow::anyhow!("provider stream ended before response.completed"),
                         error_class: "provider_stream_eof",
@@ -619,7 +987,6 @@ where
         self.turn = NextTurn::Stop;
 
         self.context.prepare_buf();
-        self.refresh_token_count(metrics.total_tokens);
 
         metrics.provider_requests += 1;
         let request_index = metrics.provider_requests;
@@ -659,7 +1026,6 @@ where
                     if had_output {
                         self.view_bus.broadcast(AgentViewEvent::Completed);
                     }
-                    self.refresh_token_count(metrics.total_tokens);
 
                     if attempt == STREAM_MAX_ATTEMPTS {
                         tracing::error!(
@@ -721,9 +1087,12 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::tool::{
-        FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition,
-        ToolOutput, TypedTool,
+    use crate::{
+        provider::Compaction,
+        tool::{
+            FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition,
+            ToolOutput, TypedTool,
+        },
     };
 
     fn cancellation() -> CancellationToken {
@@ -731,21 +1100,7 @@ mod tests {
     }
 
     fn completed(reason: CompletedReason) -> ProviderSignal {
-        ProviderSignal::Completed {
-            reason,
-            usage: None,
-        }
-    }
-
-    fn completed_with_usage(reason: CompletedReason, total: usize) -> ProviderSignal {
-        ProviderSignal::Completed {
-            reason,
-            usage: Some(TokenUsage {
-                input: total,
-                output: 0,
-                total,
-            }),
-        }
+        ProviderSignal::Completed { reason }
     }
 
     struct TestProvider;
@@ -766,8 +1121,12 @@ mod tests {
             Ok(())
         }
 
-        fn count_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+        fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
             Ok(Some(input.len()))
+        }
+
+        fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(output.len()))
         }
 
         async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
@@ -780,6 +1139,77 @@ mod tests {
         ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
         {
             Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    struct CompactingProvider {
+        input: Arc<Mutex<Vec<Message>>>,
+        stream_saw_compaction: Option<Arc<AtomicBool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CompactingProvider {
+        type StreamEvent = ();
+
+        fn model(&self) -> &str {
+            "compacting-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+            let count = if input
+                .iter()
+                .any(|message| matches!(message, Message::Compaction(_)))
+            {
+                50
+            } else {
+                input.len().saturating_mul(100)
+            };
+
+            Ok(Some(count))
+        }
+
+        fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(output.len().saturating_mul(20)))
+        }
+
+        async fn compact(&self, input: &[Message]) -> anyhow::Result<Option<Compaction>> {
+            *self.input.lock().unwrap() = input.to_vec();
+
+            let state = serde_json::to_vec(&json!([{
+                "type": "compaction",
+                "id": "cmp-1",
+                "encrypted_content": "opaque",
+            }]))?;
+
+            Ok(Some(Compaction::new(state, Some(30))))
+        }
+
+        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(completed(CompletedReason::Final))
+        }
+
+        async fn stream(
+            &self,
+            input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            if let Some(stream_saw_compaction) = &self.stream_saw_compaction {
+                let compacted = !self.input.lock().unwrap().is_empty()
+                    && input
+                        .iter()
+                        .any(|message| matches!(message, Message::Compaction(_)));
+
+                stream_saw_compaction.store(compacted, Ordering::SeqCst);
+            }
+
+            Ok(Box::pin(stream::once(async { Ok(()) })))
         }
     }
 
@@ -857,6 +1287,14 @@ mod tests {
             Ok(())
         }
 
+        fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(input.len().saturating_mul(10)))
+        }
+
+        fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(text_bytes(output)))
+        }
+
         async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
             Ok(ProviderSignal::Unsupported)
         }
@@ -890,6 +1328,14 @@ mod tests {
 
         fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(input.len().saturating_mul(10)))
+        }
+
+        fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(text_bytes(output)))
         }
 
         async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
@@ -1031,12 +1477,12 @@ mod tests {
         }
     }
 
-    struct UsageProvider {
-        completions: std::collections::VecDeque<(CompletedReason, usize)>,
+    struct EstimatingProvider {
+        completions: std::collections::VecDeque<CompletedReason>,
     }
 
-    impl UsageProvider {
-        fn new(completions: impl IntoIterator<Item = (CompletedReason, usize)>) -> Self {
+    impl EstimatingProvider {
+        fn new(completions: impl IntoIterator<Item = CompletedReason>) -> Self {
             Self {
                 completions: completions.into_iter().collect(),
             }
@@ -1044,11 +1490,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Provider for UsageProvider {
+    impl Provider for EstimatingProvider {
         type StreamEvent = ();
 
         fn model(&self) -> &str {
-            "usage-model"
+            "estimating-model"
         }
 
         fn thinking_effort(&self) -> Option<&str> {
@@ -1059,17 +1505,19 @@ mod tests {
             Ok(())
         }
 
-        fn count_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+        fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
             Ok(Some(input.len()))
+        }
+
+        fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(output.len()))
         }
 
         async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
             Ok(self
                 .completions
                 .pop_front()
-                .map_or(ProviderSignal::Unsupported, |(reason, total)| {
-                    completed_with_usage(reason, total)
-                }))
+                .map_or(ProviderSignal::Unsupported, completed))
         }
 
         async fn stream(
@@ -1081,6 +1529,88 @@ mod tests {
         }
     }
 
+    struct SignalProvider {
+        streams: Mutex<std::collections::VecDeque<Vec<ProviderSignal>>>,
+        estimate_output: fn(&[Message]) -> usize,
+    }
+
+    impl SignalProvider {
+        fn new(
+            streams: impl IntoIterator<Item = Vec<ProviderSignal>>,
+            estimate_output: fn(&[Message]) -> usize,
+        ) -> Self {
+            Self {
+                streams: Mutex::new(streams.into_iter().collect()),
+                estimate_output,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SignalProvider {
+        type StreamEvent = ProviderSignal;
+
+        fn model(&self) -> &str {
+            "signal-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some(input.len().saturating_mul(10)))
+        }
+
+        fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+            Ok(Some((self.estimate_output)(output)))
+        }
+
+        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            Ok(event)
+        }
+
+        async fn stream(
+            &self,
+            _input: &[Message],
+        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+            let events = self.streams.lock().unwrap().pop_front().unwrap_or_default();
+
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    fn text_bytes(output: &[Message]) -> usize {
+        output
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(text) => Some(text.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn boundary_tokens(output: &[Message]) -> usize {
+        let text = output
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        match text.as_str() {
+            "" => 0,
+            "hel" | "lo" => 2,
+            "hello" => 1,
+            _ => text.len(),
+        }
+    }
+
     fn turn_finished(events: &mut UnboundedReceiver<AgentViewEvent>) -> Option<bool> {
         std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
             AgentViewEvent::TurnFinished { completed } => Some(completed),
@@ -1088,8 +1618,7 @@ mod tests {
         })
     }
 
-    fn agent_with_read_summary() -> Agent<TestProvider> {
-        let mut agent = Agent::new(TestProvider);
+    fn seed_read_summary<P: Provider>(agent: &mut Agent<P>) {
         agent
             .tool
             .register(ReadFileTool::new(FileBufferStore::default()));
@@ -1111,11 +1640,16 @@ mod tests {
                 )),
             },
         ];
+    }
+
+    fn agent_with_read_summary() -> Agent<TestProvider> {
+        let mut agent = Agent::new(TestProvider);
+        seed_read_summary(&mut agent);
 
         agent
     }
 
-    fn has_frozen_tool_summary(agent: &Agent<TestProvider>) -> bool {
+    fn has_frozen_tool_summary<P: Provider>(agent: &Agent<P>) -> bool {
         matches!(
             agent.context.provider_messages().as_slice(),
             [Message::Assistant(summary)]
@@ -1183,14 +1717,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_recomputes_the_tokenized_context_size() {
+    async fn completion_recomputes_the_tokenized_context_size() {
         let mut agent = agent_with_read_summary();
         agent.with_tool_summary_turn_interval(NonZeroUsize::new(1).unwrap());
         let mut metrics = TurnMetrics::new();
+        metrics.start_request(Some(7));
 
         agent
             .handle_signal(
-                &completed_with_usage(CompletedReason::Final, 2_400),
+                &completed(CompletedReason::Final),
                 &mut metrics,
                 &cancellation(),
             )
@@ -1199,7 +1734,257 @@ mod tests {
 
         assert!(has_frozen_tool_summary(&agent));
         assert_eq!(agent.context.token_count(), Some(1));
-        assert_eq!(metrics.total_tokens, Some(2_400));
+        assert_eq!(metrics.total_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn compact_command_summarizes_tools_before_provider_compaction() {
+        let input = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(CompactingProvider {
+            input: input.clone(),
+            stream_saw_compaction: None,
+        });
+        let mut events = agent.subscribe_view();
+        seed_read_summary(&mut agent);
+
+        agent.run_command(Command::Compact).await.unwrap();
+
+        assert!(matches!(
+            input.lock().unwrap().as_slice(),
+            [Message::Assistant(summary)]
+                if summary == "Tool summary:\n- Read files: src/main.rs; total_lines: 1"
+        ));
+        assert!(matches!(
+            agent.context.provider_messages().as_slice(),
+            [Message::Compaction(_)]
+        ));
+        let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted)),
+            "manual compaction identifies the tool-result aggregation"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentViewEvent::ContextCompacted)),
+            "manual compaction identifies the provider compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_tool_result_compaction_has_its_own_notice() {
+        let mut agent = agent_with_read_summary();
+        let mut events = agent.subscribe_view();
+        let mut metrics = TurnMetrics::new();
+
+        agent.with_auto_compact_token_limit(2);
+        assert_eq!(agent.auto_compact(&mut metrics).await, Some(1));
+
+        let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentViewEvent::ContextCompacted))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_results_compact_with_the_active_prompt_before_continuing() {
+        let input = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(CompactingProvider {
+            input: input.clone(),
+            stream_saw_compaction: None,
+        });
+        let mut events = agent.subscribe_view();
+        agent.with_auto_compact_token_limit(200);
+        agent.append_prompt("inspect the project");
+        let mut metrics = TurnMetrics::new();
+
+        agent
+            .handle_signal(
+                &ProviderSignal::ToolCallStarted(ToolCall::new(
+                    "call-1",
+                    "no_such_tool",
+                    json!({}),
+                )),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            input.lock().unwrap().as_slice(),
+            [
+                Message::User(prompt),
+                Message::ToolCall { call_id, .. },
+                Message::ToolCallResult {
+                    call_id: result_id,
+                    ..
+                },
+            ] if prompt == "inspect the project"
+                && call_id == "call-1"
+                && result_id == "call-1"
+        ));
+        assert!(matches!(
+            agent.context.provider_messages().as_slice(),
+            [Message::Compaction(_)]
+        ));
+        assert_eq!(agent.prompts(), ["inspect the project"]);
+
+        let seen = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, AgentViewEvent::ContextCompacted))
+        );
+        assert!(seen.iter().all(|event| !matches!(
+            event,
+            AgentViewEvent::TokenUsage {
+                context: Some(count),
+                ..
+            } if *count > 200
+        )));
+
+        agent
+            .handle_signal(
+                &completed(CompletedReason::NeedCall),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(agent.turn, NextTurn::Continue));
+        assert_eq!(agent.prompts(), ["inspect the project"]);
+    }
+
+    #[tokio::test]
+    async fn requests_trigger_provider_compaction_at_the_configured_limit() {
+        let input = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(CompactingProvider {
+            input: input.clone(),
+            stream_saw_compaction: None,
+        });
+        let mut events = agent.subscribe_view();
+        agent.with_auto_compact_token_limit(100);
+        agent
+            .context
+            .histories_mut()
+            .push(Message::System("instructions".to_owned()));
+
+        agent
+            .continue_turn("inspect the project", cancellation())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            input.lock().unwrap().as_slice(),
+            [Message::User(prompt)] if prompt == "inspect the project"
+        ));
+        assert!(matches!(
+            agent.context.provider_messages().as_slice(),
+            [Message::System(system), Message::Compaction(_)] if system == "instructions"
+        ));
+        let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentViewEvent::ContextCompacted))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentViewEvent::TokenUsage { turn, .. } => *turn,
+                    _ => None,
+                })
+                .last(),
+            Some(80),
+            "the turn total includes local estimates for compaction and the normal request"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_grown_context_is_compacted_before_the_next_request() {
+        let input = Arc::new(Mutex::new(Vec::new()));
+        let stream_saw_compaction = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(CompactingProvider {
+            input: input.clone(),
+            stream_saw_compaction: Some(stream_saw_compaction.clone()),
+        });
+        let mut events = agent.subscribe_view();
+        agent.with_auto_compact_token_limit(100);
+        seed_read_summary(&mut agent);
+        let mut metrics = TurnMetrics::new();
+
+        let attempt = agent
+            .attempt_request(&mut metrics, &cancellation())
+            .await
+            .unwrap();
+
+        assert!(!input.lock().unwrap().is_empty());
+        assert!(stream_saw_compaction.load(Ordering::SeqCst));
+
+        let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        let contexts = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentViewEvent::TokenUsage { context, .. } => *context,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(attempt, RequestAttempt::Completed));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentViewEvent::ContextCompacted))
+        );
+        assert!(!contexts.is_empty());
+        assert!(contexts.iter().all(|count| *count <= 100));
+    }
+
+    #[tokio::test]
+    async fn clear_command_starts_a_new_context_and_notifies_the_view() {
+        let mut agent = Agent::new(TestProvider);
+        let mut events = agent.subscribe_view();
+        let old_id = agent.context.id();
+
+        agent
+            .context
+            .histories_mut()
+            .push(Message::System("instructions".to_owned()));
+
+        agent.run_command(Command::Clear).await.unwrap();
+
+        assert_ne!(agent.context.id(), old_id);
+        assert!(matches!(
+            agent.context.histories(),
+            [Message::System(instructions)] if instructions == "instructions"
+        ));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, AgentViewEvent::SessionStarted))
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, AgentViewEvent::CommandFinished(Command::Clear)))
+        );
     }
 
     #[tokio::test]
@@ -1233,7 +2018,8 @@ mod tests {
             .context
             .complete_turn(NonZeroUsize::new(1).unwrap(), &agent.tool);
 
-        agent.open_stream(&cancellation()).await.unwrap();
+        let messages = agent.context.provider_messages();
+        agent.open_stream(&messages, &cancellation()).await.unwrap();
 
         assert!(matches!(
             input.lock().unwrap().as_slice(),
@@ -1465,10 +2251,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_usage_accumulates_across_every_request_in_a_turn() {
-        let mut agent = Agent::new(UsageProvider::new([
-            (CompletedReason::NeedCall, 2_400),
-            (CompletedReason::Final, 3_100),
+    async fn local_estimates_accumulate_across_every_request_in_a_turn() {
+        let mut agent = Agent::new(EstimatingProvider::new([
+            CompletedReason::NeedCall,
+            CompletedReason::Final,
         ]));
         let mut events = agent.subscribe_view();
 
@@ -1483,8 +2269,156 @@ mod tests {
             _ => None,
         });
 
-        assert_eq!(last_usage, Some((Some(1), Some(5_500))));
+        assert_eq!(last_usage, Some((Some(1), Some(2))));
         assert_eq!(agent.context.token_count(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn request_input_is_counted_before_the_first_stream_event() {
+        let (polled, dropped) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let mut agent = Agent::new(PendingStreamProvider {
+            polled: polled.clone(),
+            dropped: dropped.clone(),
+        });
+        let mut events = agent.subscribe_view();
+        let cancellation = cancellation();
+        let trigger = cancellation.clone();
+
+        let run = tokio::spawn(async move {
+            let result = agent.continue_turn("wait for output", cancellation).await;
+
+            (agent, result)
+        });
+
+        polled.notified().await;
+        let seen = drain(&mut events);
+
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            AgentViewEvent::TokenUsage {
+                context: Some(10),
+                turn: Some(10),
+            }
+        )));
+
+        trigger.cancel();
+        let (_, result) = run.await.unwrap();
+
+        result.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn text_deltas_update_turn_and_context_estimates_before_completion() {
+        let handled = Arc::new(Notify::new());
+        let mut agent = Agent::new(PartialProvider { handled });
+        let mut events = agent.subscribe_view();
+        let cancellation = cancellation();
+        let trigger = cancellation.clone();
+
+        let run = tokio::spawn(async move {
+            let result = agent.continue_turn("start answering", cancellation).await;
+
+            (agent, result)
+        });
+
+        let completed = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut completed = false;
+
+            loop {
+                match events.recv().await.unwrap() {
+                    AgentViewEvent::Completed => completed = true,
+                    AgentViewEvent::TokenUsage {
+                        context: Some(20),
+                        turn: Some(24),
+                    } => break completed,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !completed,
+            "the stream is still waiting for its completion event"
+        );
+
+        trigger.cancel();
+        let (_, result) = run.await.unwrap();
+
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_and_output_estimates_accumulate_across_small_rounds() {
+        let mut agent = Agent::new(SignalProvider::new(
+            [
+                vec![
+                    ProviderSignal::TextDelta("one".to_owned()),
+                    completed(CompletedReason::NeedCall),
+                ],
+                vec![
+                    ProviderSignal::TextDelta("two".to_owned()),
+                    completed(CompletedReason::Final),
+                ],
+            ],
+            text_bytes,
+        ));
+        let mut events = agent.subscribe_view();
+
+        agent
+            .continue_turn("ask something", cancellation())
+            .await
+            .unwrap();
+
+        let last_usage = drain(&mut events)
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                AgentViewEvent::TokenUsage { context, turn } => Some((context, turn)),
+                _ => None,
+            });
+
+        assert_eq!(last_usage, Some((Some(30), Some(36))));
+    }
+
+    #[tokio::test]
+    async fn chunked_text_is_retokenized_as_one_response() {
+        let mut agent = Agent::new(SignalProvider::new(
+            [vec![
+                ProviderSignal::TextDelta("hel".to_owned()),
+                ProviderSignal::TextDelta("lo".to_owned()),
+                completed(CompletedReason::Final),
+            ]],
+            boundary_tokens,
+        ));
+        let mut events = agent.subscribe_view();
+
+        agent
+            .continue_turn("say hello", cancellation())
+            .await
+            .unwrap();
+
+        let turns = drain(&mut events)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentViewEvent::TokenUsage {
+                    turn: Some(turn), ..
+                } => Some(turn),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            turns.contains(&12),
+            "the first chunk is estimated while streaming"
+        );
+        assert_eq!(turns.last(), Some(&11));
+        assert!(
+            !turns.contains(&14),
+            "chunks are not estimated independently and summed"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1761,7 +2695,8 @@ mod tests {
         let cancellation = cancellation();
 
         cancellation.cancel();
-        let stream = agent.open_stream(&cancellation).await.unwrap();
+        let messages = agent.context.provider_messages();
+        let stream = agent.open_stream(&messages, &cancellation).await.unwrap();
 
         assert!(stream.is_none());
         assert_eq!(agent.provider.attempts(), 0);

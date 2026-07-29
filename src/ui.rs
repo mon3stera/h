@@ -37,8 +37,16 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
             AgentViewEvent::TextDelta(_) => anyhow::bail!("must merge text delta"),
             AgentViewEvent::TurnStart
             | AgentViewEvent::TokenUsage { .. }
+            | AgentViewEvent::SessionStarted
+            | AgentViewEvent::CommandFinished(_)
             | AgentViewEvent::TurnFinished { .. } => {
                 anyhow::bail!("should not be rendered")
+            }
+            AgentViewEvent::ToolResultsCompacted => {
+                Ok(RenderUnit::Notice("tool results compacted".to_owned()))
+            }
+            AgentViewEvent::ContextCompacted => {
+                Ok(RenderUnit::Notice("context compacted".to_owned()))
             }
             AgentViewEvent::Prompt(prompt) => Ok(RenderUnit::Prompt(prompt)),
             AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
@@ -134,12 +142,13 @@ fn preprocess_events(events: &[AgentViewEvent]) -> anyhow::Result<Vec<RenderUnit
 #[derive(Debug, Clone)]
 pub enum RenderUnit {
     Text(String),
-    /// Duration and provider-reported token usage kept in the transcript so the
+    /// Duration and locally estimated token usage kept in the transcript so the
     /// turn summary survives scrolling away from it.
     Done(Duration, Option<usize>),
     ParsedMarkdown(Vec<MarkdownBlock>),
     Tool(Presentation),
     Prompt(String),
+    Notice(String),
     Separator,
     Err(String),
 }
@@ -186,6 +195,14 @@ pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow
             state.turn_tokens = turn;
             Ok(())
         }
+        AgentViewEvent::SessionStarted => {
+            state.units.clear();
+            state.turn_in_progress = false;
+            state.context_tokens = None;
+            state.turn_tokens = None;
+            Ok(())
+        }
+        AgentViewEvent::CommandFinished(_) => Ok(()),
         AgentViewEvent::TurnFinished { .. } => {
             state.turn_in_progress = false;
             Ok(())
@@ -631,6 +648,48 @@ mod view_event_tests {
         reduce_view_event(&mut state, AgentViewEvent::TurnStart).unwrap();
         assert_eq!(state.turn_tokens, None, "a new turn starts a fresh total");
         assert_eq!(state.context_tokens, Some(2_400));
+    }
+
+    #[test]
+    fn context_compaction_becomes_a_notice() {
+        let mut state = ViewState::default();
+
+        reduce_view_event(&mut state, AgentViewEvent::ContextCompacted).unwrap();
+
+        assert!(matches!(
+            state.units.as_slice(),
+            [RenderUnit::Notice(message)] if message == "context compacted"
+        ));
+    }
+
+    #[test]
+    fn tool_result_compaction_becomes_a_distinct_notice() {
+        let mut state = ViewState::default();
+
+        reduce_view_event(&mut state, AgentViewEvent::ToolResultsCompacted).unwrap();
+
+        assert!(matches!(
+            state.units.as_slice(),
+            [RenderUnit::Notice(message)] if message == "tool results compacted"
+        ));
+    }
+
+    #[test]
+    fn starting_a_session_clears_the_previous_view() {
+        let mut state = ViewState {
+            units: vec![RenderUnit::Prompt("old prompt".to_owned())],
+            turn_in_progress: true,
+            context_tokens: Some(2_400),
+            turn_tokens: Some(5_500),
+            ..ViewState::default()
+        };
+
+        reduce_view_event(&mut state, AgentViewEvent::SessionStarted).unwrap();
+
+        assert!(state.units.is_empty());
+        assert!(!state.turn_in_progress);
+        assert_eq!(state.context_tokens, None);
+        assert_eq!(state.turn_tokens, None);
     }
 
     #[test]

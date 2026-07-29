@@ -5,67 +5,37 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::responses::{
-        CodeInterpreterTool, CreateResponse, CreateResponseArgs, EasyInputContent,
-        EasyInputMessage, FileSearchTool, FunctionCallOutput, FunctionCallOutputItemParam,
-        FunctionTool, FunctionToolCall, FunctionToolCallOutputResource,
-        InputItem::{self, EasyMessage},
-        Item, MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning,
-        ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, ResponseUsage, Role,
-        Tool as OpenAITool, WebSearchTool,
+        EasyInputContent, EasyInputMessage, FunctionCallOutput, FunctionCallOutputItemParam,
+        FunctionTool, FunctionToolCall, FunctionToolCallOutputResource, InputItem, Item,
+        MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning,
+        ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool,
+        WebSearchTool,
     },
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tiktoken_rs::{bpe_for_model, o200k_base_singleton};
 
 use crate::{
     config::ReasoningEffort,
-    context::{Context, Message},
-    event::{CompletedReason, ProviderSignal, TokenUsage},
-    provider::{Provider, ProviderEventStream},
+    context::Message,
+    event::{CompletedReason, ProviderSignal},
+    provider::{Compaction, Provider, ProviderEventStream},
     tool::{ToolCall, ToolCallResult, ToolDefinition},
 };
 
-impl From<&ResponseUsage> for TokenUsage {
-    fn from(usage: &ResponseUsage) -> Self {
-        Self {
-            input: usage.input_tokens as usize,
-            output: usage.output_tokens as usize,
-            total: usage.total_tokens as usize,
-        }
-    }
-}
+const COMPACT_PROMPT: &str = "Create a concise continuation state from the conversation. \
+Preserve the current user request verbatim, decisions, constraints, exact file paths, code changes, \
+relevant tool results, failures, and pending work. Clearly distinguish completed work from the next \
+action the assistant must take. Never describe context compression itself as the user's task. Never \
+invent tools, results, files, or decisions that are absent from the input. Do not continue the task \
+or call tools. Output only the continuation state without wrapper tags.";
 
-/// OpenAI does not publish the exact Responses framing. The tokenizer tracks
-/// the visible request, then the latest server `input_tokens` corrects its bias.
-#[derive(Default)]
-struct TokenEstimator {
-    pending: Option<usize>,
-    offset: isize,
-}
-
-impl TokenEstimator {
-    fn begin(&mut self, estimate: usize) {
-        self.pending = Some(estimate);
-    }
-
-    fn calibrate(&mut self, actual: Option<usize>) {
-        let (Some(estimate), Some(actual)) = (self.pending.take(), actual) else {
-            return;
-        };
-
-        self.offset = if actual >= estimate {
-            isize::try_from(actual - estimate).unwrap_or(isize::MAX)
-        } else {
-            -isize::try_from(estimate - actual).unwrap_or(isize::MAX)
-        };
-    }
-
-    fn apply(&self, estimate: usize) -> usize {
-        estimate.saturating_add_signed(self.offset)
-    }
-}
+const SUMMARY_OPEN: &str = "<context_summary>";
+const SUMMARY_CLOSE: &str = "</context_summary>";
+const SUMMARY_CONTINUE: &str = "Continue the pending task using the context above.";
 
 fn reasoning_effort_name(effort: &OpenAIReasoningEffort) -> &'static str {
     match effort {
@@ -102,6 +72,26 @@ fn is_ignorable_stream_event(error: &OpenAIError) -> bool {
         .is_some_and(|event_type| event_type == "response.metadata")
 }
 
+fn is_unsupported_compact_error(error: &OpenAIError) -> bool {
+    let OpenAIError::ApiError(response) = error else {
+        return false;
+    };
+
+    matches!(
+        response.status_code,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    ) || response.api_error.code.as_deref() == Some("model_not_found")
+        || response.api_error.message.contains("model_not_found")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactMode {
+    Native,
+    Model,
+}
+
 pub struct OpenAIProviderConfig {
     base_url: String,
     bearer_token: String,
@@ -129,7 +119,34 @@ pub struct OpenAIProvider {
     config: OpenAIProviderConfig,
     client: Client<OpenAIConfig>,
     tools: Vec<OpenAITool>,
-    tokens: Mutex<TokenEstimator>,
+    compact_mode: Mutex<CompactMode>,
+}
+
+#[derive(Serialize)]
+struct ResponseRequest {
+    model: String,
+    input: Vec<Value>,
+    tools: Vec<OpenAITool>,
+    stream: bool,
+    reasoning: Reasoning,
+}
+
+#[derive(Serialize)]
+struct CompactRequest {
+    model: String,
+    input: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct SummaryRequest {
+    model: String,
+    input: Vec<Value>,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct CompactResponse {
+    output: Vec<Value>,
 }
 
 impl OpenAIProvider {
@@ -148,38 +165,152 @@ impl OpenAIProvider {
             config,
             client,
             tools,
-            tokens: Mutex::new(TokenEstimator::default()),
+            compact_mode: Mutex::new(CompactMode::Native),
         }
     }
 
-    fn input(messages: &[Message]) -> Vec<InputItem> {
-        messages.iter().cloned().map(InputItem::from).collect()
+    fn input(messages: &[Message]) -> anyhow::Result<Vec<Value>> {
+        let mut input = Vec::with_capacity(messages.len());
+
+        for message in messages {
+            match message {
+                Message::Compaction(compaction) => {
+                    let items = serde_json::from_slice::<Vec<Value>>(compaction.state())?;
+                    input.extend(items);
+                }
+                message => input.push(serde_json::to_value(Self::input_item(message.clone()))?),
+            }
+        }
+
+        Ok(input)
     }
 
-    fn estimate_tokens(&self, messages: &[Message]) -> anyhow::Result<usize> {
-        // Serialize the same input items and tools sent by `stream` so changes
-        // to roles, call IDs, arguments, outputs, and schemas all affect the count.
-        let (input, tools) = (
-            serde_json::to_string(&Self::input(messages))?,
-            serde_json::to_string(&self.tools)?,
-        );
+    fn input_item(message: Message) -> InputItem {
+        match message {
+            Message::User(text) => EasyInputMessage::from(text).into(),
+            Message::System(text) => EasyInputMessage {
+                r#type: MessageType::Message,
+                role: Role::System,
+                content: EasyInputContent::Text(text),
+                phase: None,
+            }
+            .into(),
+            Message::Assistant(text) => EasyInputMessage {
+                r#type: MessageType::Message,
+                role: Role::Assistant,
+                content: EasyInputContent::Text(text),
+                phase: None,
+            }
+            .into(),
+            Message::ToolCall {
+                call_id,
+                arguments,
+                name,
+            } => InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                call_id,
+                arguments,
+                namespace: None,
+                name,
+                id: None,
+                status: Some(OutputStatus::Completed),
+            })),
+            Message::ToolCallResult {
+                call_id, output, ..
+            } => InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
+                call_id,
+                output: FunctionCallOutput::Text(output),
+                id: None,
+                status: Some(OutputStatus::Completed),
+            })),
+            Message::Compaction(_) => {
+                unreachable!("compaction messages are expanded before item conversion")
+            }
+        }
+    }
+
+    fn estimate_values(&self, values: &[Value]) -> anyhow::Result<usize> {
+        if values.is_empty() {
+            return Ok(0);
+        }
+
+        let input = serde_json::to_string(values)?;
         let tokenizer =
             bpe_for_model(&self.config.model).unwrap_or_else(|_| o200k_base_singleton());
 
-        Ok(tokenizer.count_ordinary(&input) + tokenizer.count_ordinary(&tools))
+        Ok(tokenizer.count_ordinary(&input))
     }
 
-    fn build_request(&self, input: Vec<InputItem>) -> anyhow::Result<CreateResponse> {
-        let mut request = CreateResponseArgs::default();
-        request
-            .model(&self.config.model)
-            .input(input)
-            .tools(self.tools.clone())
-            .stream(true);
+    fn estimate_messages(&self, messages: &[Message]) -> anyhow::Result<usize> {
+        self.estimate_values(&Self::input(messages)?)
+    }
 
-        request.reasoning(Reasoning::from(self.config.reasoning_effort.clone()));
+    fn build_request(&self, input: Vec<Value>) -> anyhow::Result<ResponseRequest> {
+        Ok(ResponseRequest {
+            model: self.config.model.clone(),
+            input,
+            tools: self.tools.clone(),
+            stream: true,
+            reasoning: Reasoning::from(self.config.reasoning_effort.clone()),
+        })
+    }
 
-        Ok(request.build()?)
+    fn build_summary_request(&self, input: Vec<Value>) -> anyhow::Result<SummaryRequest> {
+        let instruction =
+            serde_json::to_value(Self::input_item(Message::System(COMPACT_PROMPT.to_owned())))?;
+        let mut messages = Vec::with_capacity(input.len() + 1);
+
+        messages.push(instruction);
+        messages.extend(input);
+
+        Ok(SummaryRequest {
+            model: self.config.model.clone(),
+            input: messages,
+            stream: false,
+        })
+    }
+
+    fn summary_state(output: Vec<Value>) -> anyhow::Result<Vec<u8>> {
+        let text = output
+            .into_iter()
+            .filter_map(|item| serde_json::from_value::<OutputItem>(item).ok())
+            .filter_map(|item| match Message::try_from(item) {
+                Ok(Message::Assistant(text)) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if text.trim().is_empty() {
+            anyhow::bail!("the compaction model returned no text");
+        }
+
+        let summary = format!(
+            "{SUMMARY_OPEN}\n{}\n{SUMMARY_CLOSE}\n\n{SUMMARY_CONTINUE}",
+            text.trim()
+        );
+        let item = serde_json::to_value(Self::input_item(Message::User(summary)))?;
+        Ok(serde_json::to_vec(&vec![item])?)
+    }
+
+    async fn compact_with_model(&self, input: Vec<Value>) -> anyhow::Result<Compaction> {
+        let request = self.build_summary_request(input)?;
+        let input_tokens = self.estimate_values(&request.input)?;
+        let response: CompactResponse = self.client.responses().create_byot(request).await?;
+        let output_tokens = self.estimate_values(&response.output)?;
+        let state = Self::summary_state(response.output)?;
+        let total_tokens = input_tokens.saturating_add(output_tokens);
+
+        tracing::info!(
+            event = "provider.context.compacted",
+            provider = "openai",
+            method = "model",
+            state_bytes = state.len(),
+            estimated_input_tokens = input_tokens,
+            estimated_output_tokens = output_tokens,
+            estimated_total_tokens = total_tokens,
+        );
+
+        Ok(Compaction::new(state, Some(total_tokens)))
     }
 
     fn sanitize_schema(schema: &Value) -> anyhow::Result<Value> {
@@ -760,48 +891,6 @@ impl OpenAIProvider {
     }
 }
 
-impl From<Message> for InputItem {
-    fn from(value: Message) -> Self {
-        match value {
-            Message::User(text) => EasyInputMessage::from(text).into(),
-            Message::System(text) => EasyInputMessage {
-                r#type: MessageType::Message,
-                role: Role::System,
-                content: EasyInputContent::Text(text),
-                phase: None,
-            }
-            .into(),
-            Message::Assistant(text) => EasyInputMessage {
-                r#type: MessageType::Message,
-                role: Role::Assistant,
-                content: EasyInputContent::Text(text),
-                phase: None,
-            }
-            .into(),
-            Message::ToolCall {
-                call_id,
-                arguments,
-                name,
-            } => InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                call_id: call_id,
-                arguments: arguments,
-                namespace: None,
-                name: name,
-                id: None,
-                status: Some(OutputStatus::Completed),
-            })),
-            Message::ToolCallResult {
-                call_id, output, ..
-            } => InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
-                call_id,
-                output: FunctionCallOutput::Text(output),
-                id: None,
-                status: Some(OutputStatus::Completed),
-            })),
-        }
-    }
-}
-
 impl TryFrom<OutputItem> for Message {
     type Error = anyhow::Error;
 
@@ -899,10 +988,71 @@ impl Provider for OpenAIProvider {
         Ok(())
     }
 
-    fn count_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
-        let estimate = self.estimate_tokens(input)?;
+    fn estimate_request_tokens(&self, input: &[Message]) -> anyhow::Result<Option<usize>> {
+        let (input_tokens, tools) = (
+            self.estimate_messages(input)?,
+            serde_json::to_string(&self.tools)?,
+        );
+        let tokenizer =
+            bpe_for_model(&self.config.model).unwrap_or_else(|_| o200k_base_singleton());
 
-        Ok(Some(self.tokens.lock().apply(estimate)))
+        Ok(Some(
+            input_tokens.saturating_add(tokenizer.count_ordinary(&tools)),
+        ))
+    }
+
+    fn estimate_output_tokens(&self, output: &[Message]) -> anyhow::Result<Option<usize>> {
+        self.estimate_messages(output).map(Some)
+    }
+
+    async fn compact(&self, messages: &[Message]) -> anyhow::Result<Option<Compaction>> {
+        let input = Self::input(messages)?;
+        if input.is_empty() {
+            return Ok(None);
+        }
+
+        if *self.compact_mode.lock() == CompactMode::Model {
+            return self.compact_with_model(input).await.map(Some);
+        }
+
+        let request = CompactRequest {
+            model: self.config.model.clone(),
+            input: input.clone(),
+        };
+        let input_tokens = self.estimate_values(&input)?;
+        let response: CompactResponse = match self.client.responses().compact_byot(request).await {
+            Ok(response) => response,
+            Err(error) if is_unsupported_compact_error(&error) => {
+                *self.compact_mode.lock() = CompactMode::Model;
+
+                tracing::warn!(
+                    event = "provider.context.compact_fallback",
+                    provider = "openai",
+                    reason = "native_unsupported",
+                    error = error.to_string(),
+                );
+
+                return self.compact_with_model(input).await.map(Some);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let item_count = response.output.len();
+        let output_tokens = self.estimate_values(&response.output)?;
+        let state = serde_json::to_vec(&response.output)?;
+        let total_tokens = input_tokens.saturating_add(output_tokens);
+
+        tracing::info!(
+            event = "provider.context.compacted",
+            provider = "openai",
+            method = "native",
+            item_count,
+            state_bytes = state.len(),
+            estimated_input_tokens = input_tokens,
+            estimated_output_tokens = output_tokens,
+            estimated_total_tokens = total_tokens,
+        );
+
+        Ok(Some(Compaction::new(state, Some(total_tokens))))
     }
 
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
@@ -948,9 +1098,6 @@ impl Provider for OpenAIProvider {
                     .output
                     .iter()
                     .any(|e| matches!(e, OutputItem::FunctionCall(_)));
-                let usage = completed.response.usage.as_ref().map(TokenUsage::from);
-                self.tokens.lock().calibrate(usage.map(|usage| usage.input));
-
                 tracing::info!(
                     event = "provider.response.completed",
                     provider = "openai",
@@ -959,9 +1106,6 @@ impl Provider for OpenAIProvider {
                     } else {
                         "final"
                     },
-                    input_tokens = usage.map(|usage| usage.input),
-                    output_tokens = usage.map(|usage| usage.output),
-                    total_tokens = usage.map(|usage| usage.total),
                 );
 
                 Ok(ProviderSignal::Completed {
@@ -970,7 +1114,6 @@ impl Provider for OpenAIProvider {
                     } else {
                         CompletedReason::Final
                     },
-                    usage,
                 })
             }
             _ => Ok(ProviderSignal::Unsupported),
@@ -983,11 +1126,9 @@ impl Provider for OpenAIProvider {
     ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
         let message_count = messages.len();
         let tool_count = self.tools.len();
-        let input = Self::input(messages);
+        let input = Self::input(messages)?;
 
         let request = self.build_request(input)?;
-        let estimate = self.estimate_tokens(messages)?;
-        self.tokens.lock().begin(estimate);
 
         // Keep this as a foreground Responses request. OpenAI's explicit
         // `/cancel` endpoint is background-only; synchronous cancellation is
@@ -1033,7 +1174,70 @@ mod tests {
         provider::Provider,
         tool::{BashToolArgs, WriteFileToolArgs},
     };
+    use async_openai::error::{ApiError, ApiErrorResponse};
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    async fn read_request(stream: &mut TcpStream) -> (String, Value) {
+        let mut request = Vec::new();
+
+        let (header_end, content_len) = loop {
+            let mut chunk = [0; 4_096];
+            let len = stream.read(&mut chunk).await.unwrap();
+            assert!(len > 0, "the client closed before sending HTTP headers");
+            request.extend_from_slice(&chunk[..len]);
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = str::from_utf8(&request[..header_end]).unwrap();
+            let content_len = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .and_then(|len| len.parse::<usize>().ok())
+                })
+                .unwrap_or_default();
+
+            break (header_end, content_len);
+        };
+
+        let body_start = header_end + 4;
+        while request.len() < body_start + content_len {
+            let mut chunk = [0; 4_096];
+            let len = stream.read(&mut chunk).await.unwrap();
+            assert!(len > 0, "the client closed before sending the HTTP body");
+            request.extend_from_slice(&chunk[..len]);
+        }
+
+        let headers = str::from_utf8(&request[..header_end]).unwrap();
+        let path = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let body = serde_json::from_slice(&request[body_start..body_start + content_len]).unwrap();
+
+        (path, body)
+    }
+
+    async fn respond(stream: &mut TcpStream, status: &str, body: Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
 
     fn provider(reasoning_effort: ReasoningEffort) -> OpenAIProvider {
         OpenAIProvider::from_config(OpenAIProviderConfig::new(
@@ -1075,53 +1279,234 @@ mod tests {
     }
 
     #[test]
-    fn response_usage_maps_to_provider_independent_token_counts() {
-        let usage = serde_json::from_value::<ResponseUsage>(json!({
-            "input_tokens": 2_400,
-            "input_tokens_details": {"cached_tokens": 1_200},
-            "output_tokens": 600,
-            "output_tokens_details": {"reasoning_tokens": 300},
-            "total_tokens": 3_000
-        }))
-        .unwrap();
-
-        assert_eq!(
-            TokenUsage::from(&usage),
-            TokenUsage {
-                input: 2_400,
-                output: 600,
-                total: 3_000,
-            }
-        );
-    }
-
-    #[test]
-    fn tokenizer_counts_messages_and_registered_tools() {
+    fn tokenizer_estimates_requests_and_outputs_locally() {
         let provider = provider(ReasoningEffort::High);
-        let empty = provider.count_tokens(&[]).unwrap().unwrap();
         let messages = [
             Message::System("You are a coding agent.".to_owned()),
             Message::User("Inspect the repository.".to_owned()),
         ];
-        let populated = provider.count_tokens(&messages).unwrap().unwrap();
+        let (empty_request, request, output) = (
+            provider.estimate_request_tokens(&[]).unwrap().unwrap(),
+            provider
+                .estimate_request_tokens(&messages)
+                .unwrap()
+                .unwrap(),
+            provider.estimate_output_tokens(&messages).unwrap().unwrap(),
+        );
 
-        assert!(empty > 0, "registered tools occupy context too");
-        assert!(populated > empty, "message text must add tokens");
+        assert!(empty_request > 0, "registered tools occupy request context");
+        assert!(request > empty_request, "message text must add tokens");
+        assert!(
+            request > output,
+            "output estimates exclude request-only tools"
+        );
     }
 
     #[test]
-    fn provider_input_usage_calibrates_local_token_estimates() {
+    fn compacted_windows_are_expanded_without_pruning_items() {
+        let compacted = json!([
+            {
+                "id": "msg-1",
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "input_text", "text": "old prompt"}],
+                "role": "user"
+            },
+            {
+                "id": "cmp-1",
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            }
+        ]);
+        let messages = [
+            Message::System("instructions".to_owned()),
+            Message::Compaction(Compaction::new(
+                serde_json::to_vec(&compacted).unwrap(),
+                None,
+            )),
+            Message::User("new prompt".to_owned()),
+        ];
+
+        let input = OpenAIProvider::input(&messages).unwrap();
+
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[1], compacted[0]);
+        assert_eq!(input[2], compacted[1]);
+        assert_eq!(input[3]["role"], "user");
+        assert_eq!(input[3]["content"], "new prompt");
+    }
+
+    #[test]
+    fn compact_requests_use_input_messages_instead_of_instructions() {
+        let request = CompactRequest {
+            model: "gpt-5.6-sol".to_owned(),
+            input: vec![json!({"role": "user", "content": "old prompt"})],
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["model"], "gpt-5.6-sol");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert!(value.get("instructions").is_none());
+    }
+
+    #[test]
+    fn model_not_found_disables_native_compaction() {
+        let error = OpenAIError::ApiError(ApiErrorResponse {
+            status_code: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            api_error: ApiError {
+                message: "the compact route has no channel".to_owned(),
+                r#type: Some("new_api_error".to_owned()),
+                param: None,
+                code: Some("model_not_found".to_owned()),
+            },
+        });
+
+        assert!(is_unsupported_compact_error(&error));
+    }
+
+    #[test]
+    fn summary_requests_use_a_system_message_without_tools() {
         let provider = provider(ReasoningEffort::High);
-        let messages = [Message::User("calibrate this request".to_owned())];
-        let estimate = provider.estimate_tokens(&messages).unwrap();
+        let input = OpenAIProvider::input(&[Message::User("old prompt".to_owned())]).unwrap();
+        let request = provider.build_summary_request(input).unwrap();
+        let value = serde_json::to_value(request).unwrap();
 
-        provider.tokens.lock().begin(estimate);
-        provider.tokens.lock().calibrate(Some(estimate + 17));
+        assert_eq!(value["model"], "gpt-5.6-sol");
+        assert_eq!(value["stream"], false);
+        assert_eq!(value["input"][0]["role"], "system");
+        assert_eq!(value["input"][0]["content"], COMPACT_PROMPT);
+        assert_eq!(value["input"][1]["role"], "user");
+        assert!(value.get("tools").is_none());
+        assert!(value.get("instructions").is_none());
+    }
 
-        assert_eq!(
-            provider.count_tokens(&messages).unwrap(),
-            Some(estimate + 17)
+    #[tokio::test]
+    async fn unsupported_native_compaction_falls_back_to_a_normal_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                requests.push(request);
+
+                if index < 4 {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        json!({
+                            "error": {
+                                "message": "the compact route has no channel",
+                                "type": "new_api_error",
+                                "param": null,
+                                "code": "model_not_found"
+                            }
+                        }),
+                    )
+                    .await;
+                } else {
+                    respond(
+                        &mut stream,
+                        "200 OK",
+                        json!({
+                            "output": [{
+                                "type": "message",
+                                "id": "msg-1",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": "Current task: inspect the project.",
+                                    "annotations": []
+                                }]
+                            }]
+                        }),
+                    )
+                    .await;
+                }
+            }
+
+            requests
+        });
+
+        let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
+            format!("http://{address}"),
+            "secret",
+            "gpt-5.6-sol",
+            ReasoningEffort::High,
+        ));
+
+        let compaction = provider
+            .compact(&[Message::User("inspect the project".to_owned())])
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = server.await.unwrap();
+        let state = serde_json::from_slice::<Vec<Value>>(compaction.state()).unwrap();
+
+        assert!(
+            requests[..4]
+                .iter()
+                .all(|request| request.0 == "/responses/compact")
         );
+        assert_eq!(requests[4].0, "/responses");
+        assert_eq!(requests[4].1["input"][0]["role"], "system");
+        assert_eq!(requests[4].1["input"][1]["role"], "user");
+        assert_eq!(*provider.compact_mode.lock(), CompactMode::Model);
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0]["role"], "user");
+        assert_eq!(
+            state[0]["content"],
+            "<context_summary>\nCurrent task: inspect the project.\n</context_summary>\n\nContinue the pending task using the context above."
+        );
+        assert!(compaction.total_tokens().is_some_and(|tokens| tokens > 0));
+    }
+
+    #[tokio::test]
+    async fn native_compaction_reports_a_local_token_estimate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+
+            respond(
+                &mut stream,
+                "200 OK",
+                json!({
+                    "output": [{
+                        "type": "compaction",
+                        "id": "cmp-1",
+                        "encrypted_content": "opaque"
+                    }]
+                }),
+            )
+            .await;
+
+            request
+        });
+
+        let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
+            format!("http://{address}"),
+            "secret",
+            "gpt-5.6-sol",
+            ReasoningEffort::High,
+        ));
+
+        let compaction = provider
+            .compact(&[Message::User("inspect the project".to_owned())])
+            .await
+            .unwrap()
+            .unwrap();
+
+        let request = server.await.unwrap();
+
+        assert_eq!(request.0, "/responses/compact");
+        assert!(compaction.total_tokens().is_some_and(|tokens| tokens > 0));
     }
 
     #[test]

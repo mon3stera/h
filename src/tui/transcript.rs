@@ -128,6 +128,10 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
                     format!("✖ {error}"),
                     ratatui::style::Style::default().fg(ratatui::style::Color::Red),
                 ))],
+                RenderUnit::Notice(message) => vec![Line::from(Span::styled(
+                    format!("! {message}"),
+                    Style::default().fg(Color::Yellow),
+                ))],
                 // Still marks where a response begins, but draws as nothing.
                 RenderUnit::Separator => continue,
                 RenderUnit::Tool(presentation) => tool::render(presentation, width),
@@ -370,6 +374,20 @@ mod tests {
             Some(Color::DarkGray),
             "it reports rather than announces"
         );
+    }
+
+    #[test]
+    fn a_notice_is_yellow_and_starts_with_an_exclamation_mark() {
+        let mut transcript = Transcript::default();
+        transcript.sync(
+            &state(vec![RenderUnit::Notice("context compacted".to_owned())]),
+            40,
+        );
+
+        let lines = transcript.visible(10);
+
+        assert_eq!(texts(lines), ["! context compacted"]);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Yellow));
     }
 
     #[test]
