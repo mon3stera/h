@@ -11,6 +11,7 @@ use crate::{
     context::{Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, built_in_workspace_info},
     event::{AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     provider::{Provider, ProviderEventStream},
+    skill::Registry as SkillRegistry,
     tool::{
         AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolCall,
         ToolCallResult, ToolRegistry, WriteFileTool,
@@ -279,6 +280,16 @@ where
 
     pub async fn with_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
         self.context.inject_global_prompts().await?;
+        Ok(self)
+    }
+
+    pub async fn with_skills(&mut self) -> anyhow::Result<&mut Self> {
+        let registry = SkillRegistry::discover().await?;
+
+        if let Some(prompt) = registry.prompt() {
+            self.context.inject_skill_catalog(prompt);
+        }
+
         Ok(self)
     }
 

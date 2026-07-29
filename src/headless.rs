@@ -4,11 +4,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{agent::Agent, event::AgentEvent, provider::Provider};
 
 /// Runs one complete agent turn and returns only its final text response.
-pub async fn run<P>(agent: &mut Agent<P>, prompt: String) -> anyhow::Result<String>
+///
+/// The agent is consumed so this ephemeral lifecycle cannot accidentally fall
+/// through to the interactive session's archive step.
+pub async fn run<P>(mut agent: Agent<P>, prompt: String) -> anyhow::Result<String>
 where
     P: Provider,
 {
     let mut events = agent.subscribe();
+    agent.initialize()?;
 
     agent
         .continue_turn(prompt, CancellationToken::new())
@@ -106,10 +110,9 @@ mod tests {
         let provider = TwoRoundProvider {
             requests: AtomicUsize::new(0),
         };
-        let mut agent = Agent::new(provider);
-        agent.initialize().unwrap();
+        let agent = Agent::new(provider);
 
-        let response = run(&mut agent, "What tools can you use?".to_owned())
+        let response = run(agent, "What tools can you use?".to_owned())
             .await
             .unwrap();
 

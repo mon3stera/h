@@ -317,6 +317,12 @@ impl Context {
         Ok(self)
     }
 
+    pub fn inject_skill_catalog(&mut self, catalog: String) -> &mut Self {
+        debug_assert!(!catalog.trim().is_empty());
+        self.histories_mut().push(Message::System(catalog));
+        self
+    }
+
     pub async fn inject_workspace_info(
         &mut self,
         info: impl AsRef<[Box<dyn WorkspaceInfo>]>,
@@ -1273,6 +1279,22 @@ mod tests {
         };
 
         assert!(!context.has_exchange());
+    }
+
+    #[test]
+    fn a_skill_catalog_is_its_own_system_message() {
+        let mut context = Context::new();
+        context
+            .histories_mut()
+            .push(Message::System("global prompts".to_owned()));
+
+        context.inject_skill_catalog("<available_skills />".to_owned());
+
+        assert!(matches!(
+            context.histories(),
+            [Message::System(global), Message::System(skills)]
+                if global == "global prompts" && skills == "<available_skills />"
+        ));
     }
 
     #[test]

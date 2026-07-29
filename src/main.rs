@@ -26,6 +26,7 @@ mod event;
 mod headless;
 mod logger;
 mod provider;
+mod skill;
 mod tool;
 mod tui;
 mod ui;
@@ -92,14 +93,11 @@ async fn run_prompt(prompt: String) -> anyhow::Result<()> {
     let (bridge, ui_request_rx) = UiBridge::new();
     drop(ui_request_rx);
 
-    let (mut agent, _) = build_agent(None, bridge).await?;
-    agent.initialize()?;
+    let (agent, _) = build_agent(None, bridge).await?;
 
     tracing::info!(event = "app.ready", mode = "headless");
 
-    let result = headless::run(&mut agent, prompt).await;
-    let archived = agent.archive().await;
-    let response = result?;
+    let response = headless::run(agent, prompt).await?;
 
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(response.as_bytes())?;
@@ -108,9 +106,7 @@ async fn run_prompt(prompt: String) -> anyhow::Result<()> {
     }
     stdout.flush()?;
 
-    archived?;
-
-    tracing::info!(event = "app.archived");
+    tracing::info!(event = "app.headless.completed");
     Ok(())
 }
 
@@ -165,6 +161,8 @@ async fn build_agent(
         None => {
             agent
                 .with_global_prompts()
+                .await?
+                .with_skills()
                 .await?
                 .with_workspace_info()
                 .await?;
