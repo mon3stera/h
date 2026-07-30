@@ -31,7 +31,9 @@ pub const DEFAULT_TOOL_SUMMARY_TURN_INTERVAL: usize = 8;
 
 const HARNESS_PROMPT: &str = "You are h, a coding agent.\n\n\
 When multiple tool calls are independent, call them in parallel. Prefer parallel tool calls whenever \
-possible, but preserve sequential execution when one call depends on the result of another.";
+possible, but preserve sequential execution when one call depends on the result of another.\n\n\
+When running a Bash command whose successful output is not needed, set `brief` to true. Failed \
+commands still return their output.";
 
 #[async_trait::async_trait]
 pub trait WorkspaceInfo: Send + Sync {
@@ -1407,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_prompt_identifies_h_and_encourages_parallel_calls() {
+    fn harness_prompt_describes_parallel_calls_and_brief_bash_output() {
         let mut context = Context::new();
 
         context.inject_harness_prompt();
@@ -1418,6 +1420,8 @@ mod tests {
                 if prompt.contains("You are h, a coding agent.")
                     && prompt.contains("call them in parallel")
                     && prompt.contains("one call depends on the result of another")
+                    && prompt.contains("set `brief` to true")
+                    && prompt.contains("Failed commands still return their output")
         ));
     }
 
