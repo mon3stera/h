@@ -546,9 +546,6 @@ where
         self.context.set_token_count(after_tool_compaction);
 
         if tools_compacted {
-            self.view_bus
-                .broadcast(AgentViewEvent::ToolResultsCompacted);
-
             tracing::info!(
                 event = "context.auto_compact.completed",
                 method = "tool_output",
@@ -906,23 +903,16 @@ where
 
         let result = match command {
             Command::Clear => self.start_session().await,
-            Command::Compact => {
-                if self.context.compact_tool_outputs(&self.tool) {
-                    self.view_bus
-                        .broadcast(AgentViewEvent::ToolResultsCompacted);
+            Command::Compact => match self.compact_context().await? {
+                CompactOutcome::Applied { .. } | CompactOutcome::Empty => {
+                    self.refresh_token_count(None);
+                    self.view_bus.broadcast(AgentViewEvent::ContextCompacted);
+                    Ok(())
                 }
-
-                match self.compact_context().await? {
-                    CompactOutcome::Applied { .. } | CompactOutcome::Empty => {
-                        self.refresh_token_count(None);
-                        self.view_bus.broadcast(AgentViewEvent::ContextCompacted);
-                        Ok(())
-                    }
-                    CompactOutcome::Unsupported => {
-                        anyhow::bail!("the current provider does not support context compaction")
-                    }
+                CompactOutcome::Unsupported => {
+                    anyhow::bail!("the current provider does not support context compaction")
                 }
-            }
+            },
         };
 
         match &result {
@@ -2216,7 +2206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_command_compacts_tool_outputs_before_provider_compaction() {
+    async fn compact_command_preserves_tool_outputs_for_provider_compaction() {
         let input = Arc::new(Mutex::new(Vec::new()));
         let mut agent = Agent::new(CompactingProvider {
             input: input.clone(),
@@ -2234,7 +2224,7 @@ mod tests {
                 Message::ToolCallResult { call_id: result, output, .. },
             ] if call == "read-1"
                 && result == call
-                && output == &compacted_read_output(1)
+                && output == r#"{"content":"fn main() {}"}"#
         ));
         assert!(matches!(
             agent.context.provider_messages().as_slice(),
@@ -2245,19 +2235,13 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted)),
-            "manual compaction identifies compacted tool outputs"
-        );
-        assert!(
-            events
-                .iter()
                 .any(|event| matches!(event, AgentViewEvent::ContextCompacted)),
             "manual compaction identifies the provider compaction"
         );
     }
 
     #[tokio::test]
-    async fn automatic_tool_result_compaction_has_its_own_notice() {
+    async fn automatic_tool_result_compaction_does_not_emit_a_context_notice() {
         let mut agent = agent_with_read_summary();
         let mut events = agent.subscribe_view();
         let mut metrics = TurnMetrics::new();
@@ -2267,11 +2251,7 @@ mod tests {
 
         let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
 
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted))
-        );
+        assert!(has_compacted_tool_output(&agent));
         assert!(
             events
                 .iter()
@@ -2427,11 +2407,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(matches!(attempt, RequestAttempt::Completed));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted))
-        );
         assert!(
             events
                 .iter()

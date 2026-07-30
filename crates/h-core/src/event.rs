@@ -51,9 +51,6 @@ pub enum AgentViewEvent {
     /// A slash command finished, whether successfully or with an error already
     /// reported through [`Self::Err`].
     CommandFinished(Command),
-    /// Older successful tool outputs were compacted without removing their
-    /// call/result structure.
-    ToolResultsCompacted,
     /// Context compaction completed and replaced the previous context window.
     ContextCompacted,
     /// `completed` is true when the turn ended because the model finished

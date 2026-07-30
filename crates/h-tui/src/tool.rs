@@ -89,17 +89,26 @@ fn render_block(block: &DisplayBlock, width: usize) -> Vec<Line<'static>> {
             })
             .collect(),
         DisplayBlock::CodeBlock {
+            language,
             content,
             truncated_lines,
             show_line_numbers,
             start_line_number,
-            ..
-        } => code_lines(
-            content,
-            *truncated_lines,
-            *show_line_numbers,
-            *start_line_number,
-        ),
+        } => {
+            let style = if language.as_deref() == Some("console") {
+                Style::default().fg(MUTED)
+            } else {
+                Style::default()
+            };
+
+            code_lines(
+                content,
+                *truncated_lines,
+                *show_line_numbers,
+                *start_line_number,
+                style,
+            )
+        }
         DisplayBlock::Diff { lines } => diff_lines(lines, width),
         DisplayBlock::Table { headers, rows } => table_lines(headers, rows),
     }
@@ -139,6 +148,7 @@ fn code_lines(
     truncated_lines: usize,
     show_line_numbers: bool,
     start_line_number: usize,
+    style: Style,
 ) -> Vec<Line<'static>> {
     let lines = if content.is_empty() {
         vec![""]
@@ -152,13 +162,15 @@ fn code_lines(
         .into_iter()
         .enumerate()
         .map(|(offset, line)| {
-            if show_line_numbers {
+            let content = if show_line_numbers {
                 let number = start_line_number.saturating_add(offset);
 
-                Line::from(format!("{NESTED_INDENT}{number:>number_width$} {line}"))
+                format!("{NESTED_INDENT}{number:>number_width$} {line}")
             } else {
-                Line::from(format!("{NESTED_INDENT}{line}"))
-            }
+                format!("{NESTED_INDENT}{line}")
+            };
+
+            Line::from(content).style(style)
         })
         .collect()
 }
@@ -494,6 +506,26 @@ mod tests {
         );
 
         assert_eq!(rows, ["     a", "     b"]);
+    }
+
+    #[test]
+    fn console_code_blocks_are_muted_without_affecting_other_languages() {
+        let block = |language: &str| {
+            block_lines(
+                &presentation(vec![DisplayBlock::CodeBlock {
+                    language: Some(language.to_owned()),
+                    content: "output".to_owned(),
+                    truncated_lines: 1,
+                    show_line_numbers: false,
+                    start_line_number: 1,
+                }]),
+                40,
+            )
+        };
+        let (console, raw) = (block("console"), block("raw"));
+
+        assert_eq!(console[0].style.fg, Some(MUTED));
+        assert_eq!(raw[0].style.fg, None);
     }
 
     #[test]

@@ -38,6 +38,7 @@ use crate::{
     command::{CommandEvent, CommandMenu},
     format_tokens,
     input::Input,
+    rainbow_spans,
     transcript::Transcript,
     ui::{RenderUnit, ViewState, reduce_view_event},
 };
@@ -642,18 +643,29 @@ impl App {
     }
 
     fn context_line(&self) -> Line<'static> {
-        let current = self
-            .state
-            .context_tokens
-            .map(format_tokens)
-            .unwrap_or_else(|| "?".to_owned());
-        let limit = format_tokens(self.context_window);
+        let (current, percent) = match self.state.context_tokens {
+            Some(current) if self.context_window > 0 => {
+                let remaining = self.context_window.saturating_sub(current);
 
-        Line::from(Span::styled(
-            format!("context {current}/{limit}"),
-            Style::default().fg(Color::DarkGray),
-        ))
-        .alignment(Alignment::Right)
+                (
+                    format_tokens(current),
+                    format!(
+                        "{:.1}% left",
+                        remaining as f64 / self.context_window as f64 * 100.0
+                    ),
+                )
+            }
+            Some(current) => (format_tokens(current), "?% left".to_owned()),
+            None => ("?".to_owned(), "?% left".to_owned()),
+        };
+        let limit = format_tokens(self.context_window);
+        let muted = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::styled(format!("context {current}/{limit} ("), muted)];
+
+        spans.extend(rainbow_spans(&percent, Style::default()));
+        spans.push(Span::styled(")", muted));
+
+        Line::from(spans).alignment(Alignment::Right)
     }
 }
 
@@ -1350,7 +1362,7 @@ mod tests {
         assert!(
             !drawn(&mut app, &mut terminal)
                 .iter()
-                .any(|row| row.contains("(")),
+                .any(|row| row.contains("(0s")),
             "no turn has started, so there is nothing to count"
         );
 
@@ -1395,9 +1407,55 @@ mod tests {
 
         assert!(
             rows.last()
-                .is_some_and(|row| row.ends_with("context 2.4K/200K")),
+                .is_some_and(|row| row.ends_with("context 2.4K/200K (98.8% left)")),
             "the status belongs on the bottom row: {rows:?}"
         );
+    }
+
+    #[test]
+    fn context_percentage_uses_rainbow_spans() {
+        let mut app = App {
+            context_window: 100_000,
+            ..App::default()
+        };
+        app.state.context_tokens = Some(45_000);
+
+        let line = app.context_line();
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let colors = line
+            .spans
+            .iter()
+            .filter(|span| span.content != "context 45K/100K (" && span.content != ")")
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(text, "context 45K/100K (55.0% left)");
+        assert!(
+            colors.len() > 1,
+            "the percentage should use the rainbow ramp"
+        );
+    }
+
+    #[test]
+    fn context_percentage_stops_at_zero_after_the_limit() {
+        let mut app = App {
+            context_window: 100_000,
+            ..App::default()
+        };
+        app.state.context_tokens = Some(120_000);
+
+        let text = app
+            .context_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "context 120K/100K (0.0% left)");
     }
 
     #[tokio::test]

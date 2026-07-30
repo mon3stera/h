@@ -30,9 +30,6 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
             | AgentViewEvent::TurnFinished { .. } => {
                 anyhow::bail!("should not be rendered")
             }
-            AgentViewEvent::ToolResultsCompacted => {
-                Ok(RenderUnit::Notice("tool results compacted".to_owned()))
-            }
             AgentViewEvent::ContextCompacted => {
                 Ok(RenderUnit::Notice("context compacted".to_owned()))
             }
@@ -644,18 +641,6 @@ mod view_event_tests {
         assert!(matches!(
             state.units.as_slice(),
             [RenderUnit::Notice(message)] if message == "context compacted"
-        ));
-    }
-
-    #[test]
-    fn tool_result_compaction_becomes_a_distinct_notice() {
-        let mut state = ViewState::default();
-
-        reduce_view_event(&mut state, AgentViewEvent::ToolResultsCompacted).unwrap();
-
-        assert!(matches!(
-            state.units.as_slice(),
-            [RenderUnit::Notice(message)] if message == "tool results compacted"
         ));
     }
 
