@@ -17,6 +17,7 @@ use ratatui::{
 pub mod app;
 pub mod banner;
 pub mod choice_list;
+mod clipboard;
 pub mod command;
 pub mod highlight;
 pub mod input;

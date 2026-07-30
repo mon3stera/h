@@ -9,8 +9,9 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::{
         event::{
-            DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-            KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+            Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+            MouseEventKind,
         },
         execute,
     },
@@ -27,11 +28,13 @@ use tokio::sync::{
 use h_core::{
     command::Command,
     event::{AgentCommand, AgentViewEvent},
+    input::UserInput,
     interaction::{AskAnswer, Request},
 };
 
 use crate::{
     choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome},
+    clipboard::{self, Content as ClipboardContent},
     command::{CommandEvent, CommandMenu},
     format_tokens,
     input::Input,
@@ -98,14 +101,14 @@ pub async fn run(
 fn enter() -> anyhow::Result<DefaultTerminal> {
     let terminal = ratatui::init();
 
-    execute!(stdout(), EnableMouseCapture)?;
+    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
 
     // `ratatui::init` installs a hook that puts the screen back, but it knows
     // nothing about mouse capture; a panic would otherwise leave the terminal
     // reporting every mouse move as escape codes.
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
         previous(info);
     }));
 
@@ -113,7 +116,7 @@ fn enter() -> anyhow::Result<DefaultTerminal> {
 }
 
 fn leave() {
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
 }
 
@@ -147,6 +150,7 @@ async fn drive(
                     }
                 }
                 Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
+                Some(Ok(Event::Paste(text))) => app.handle_paste(&text),
                 // A closed input stream leaves nothing to drive the view.
                 None => return Ok(()),
                 _ => {}
@@ -332,7 +336,13 @@ impl App {
             return Flow::Continue;
         }
 
-        self.command_menu.update(&self.input.text());
+        if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.paste_clipboard().await;
+
+            return Flow::Continue;
+        }
+
+        self.update_command_menu();
 
         match self.command_menu.handle_key(key) {
             CommandEvent::Ignored => {}
@@ -346,13 +356,19 @@ impl App {
             CommandEvent::Submit(command) => {
                 self.input.replace(command.label());
 
-                if let Some(prompt) = self.input.take() {
-                    self.command_menu.update("");
-                    self.submit(prompt, commands).await;
+                if let Some(input) = self.input.take() {
+                    self.command_menu.reset();
+                    self.submit(input, commands).await;
                 }
 
                 return Flow::Continue;
             }
+        }
+
+        if key.code == KeyCode::Esc && self.input.attachments_focused() {
+            self.input.handle_key(key);
+
+            return Flow::Continue;
         }
 
         if key.code == KeyCode::Esc {
@@ -374,25 +390,28 @@ impl App {
                 self.transcript.scroll(PAGE, self.viewport as usize);
             }
             _ => {
-                if let Some(prompt) = self.input.handle_key(key) {
-                    self.submit(prompt, commands).await;
+                if let Some(input) = self.input.handle_key(key) {
+                    self.submit(input, commands).await;
                 }
 
-                self.command_menu.update(&self.input.text());
+                self.update_command_menu();
             }
         }
 
         Flow::Continue
     }
 
-    async fn submit(&mut self, prompt: String, commands: &Sender<AgentCommand>) {
+    async fn submit(&mut self, input: UserInput, commands: &Sender<AgentCommand>) {
         if self.pending_command.is_some() {
             tracing::warn!(event = "ui.submission_blocked", reason = "command_pending",);
 
             return;
         }
 
-        if let Some(command) = Command::parse(&prompt) {
+        let text = input.text();
+        if !input.has_images()
+            && let Some(command) = Command::parse(&text)
+        {
             tracing::info!(event = "ui.command_submitted", command = command.label());
 
             match commands.send(AgentCommand::Run(command)).await {
@@ -411,7 +430,7 @@ impl App {
 
         // Echo it locally: nothing on the event bus carries the user's own turn
         // back to the view.
-        self.state.units.push(RenderUnit::Prompt(prompt.clone()));
+        self.state.units.push(RenderUnit::Prompt(input.display()));
         self.state.revision += 1;
 
         // A prompt is why the newest output matters, so follow it again.
@@ -419,12 +438,45 @@ impl App {
 
         tracing::info!(event = "ui.prompt_submitted");
 
-        if commands.send(AgentCommand::Prompt(prompt)).await.is_err() {
+        if commands.send(AgentCommand::Prompt(input)).await.is_err() {
             tracing::warn!(
                 event = "ui.prompt_send.failed",
                 operation = "prompt_channel_send",
                 error_class = "prompt_channel_closed"
             );
+        }
+    }
+
+    async fn paste_clipboard(&mut self) {
+        match clipboard::read().await {
+            Ok(ClipboardContent::Image(image)) => self.input.add_image(image),
+            Ok(ClipboardContent::Text(text)) => self.input.insert_text(&text),
+            Err(error) => {
+                self.state
+                    .units
+                    .push(RenderUnit::Err(format!("Clipboard: {error}")));
+                self.state.revision += 1;
+                self.transcript.pin();
+            }
+        }
+
+        self.update_command_menu();
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if self.asking.is_some() || self.pending_command.is_some() {
+            return;
+        }
+
+        self.input.insert_text(text);
+        self.update_command_menu();
+    }
+
+    fn update_command_menu(&mut self) {
+        if self.input.has_images() {
+            self.command_menu.reset();
+        } else {
+            self.command_menu.update(&self.input.text());
         }
     }
 
@@ -441,6 +493,13 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.asking.is_none() && self.pending_command.is_none() && self.input.handle_mouse(mouse)
+        {
+            self.update_command_menu();
+
+            return;
+        }
+
         let step = match mouse.kind {
             MouseEventKind::ScrollUp => -WHEEL_STEP,
             MouseEventKind::ScrollDown => WHEEL_STEP,
@@ -629,6 +688,7 @@ fn render_ask(frame: &mut Frame, area: Rect, asking: &mut Asking) {
 
 #[cfg(test)]
 mod tests {
+    use h_core::input::Image;
     use ratatui::{Terminal, backend::TestBackend};
     use tokio::sync::mpsc;
 
@@ -705,12 +765,41 @@ mod tests {
 
         assert_eq!(
             received.recv().await,
-            Some(AgentCommand::Prompt("hello".to_owned()))
+            Some(AgentCommand::Prompt("hello".into()))
         );
         assert!(
             matches!(app.state.units.as_slice(), [RenderUnit::Prompt(text)] if text == "hello"),
             "the view has to echo the user's own turn"
         );
+    }
+
+    #[tokio::test]
+    async fn an_attachment_prevents_slash_text_from_becoming_a_command() {
+        let (mut app, _) = app_with_size(48, 10);
+        let (committer, mut received) = mpsc::channel(1);
+
+        app.handle_paste("/clear");
+        app.input
+            .add_image(Image::new("image/png", [1, 2, 3], 32, 32).unwrap());
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::ALT), &committer)
+            .await;
+
+        let Some(AgentCommand::Prompt(input)) = received.recv().await else {
+            panic!("an image-bearing slash prompt must remain a prompt");
+        };
+
+        assert_eq!(input.text(), "/clear");
+        assert_eq!(input.image_count(), 1);
+        assert!(app.pending_command.is_none());
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_text_at_the_cursor() {
+        let (mut app, _) = app_with_size(48, 10);
+
+        app.handle_paste("pasted\ntext");
+
+        assert_eq!(app.input.text(), "pasted\ntext");
     }
 
     #[tokio::test]

@@ -6,10 +6,10 @@ use async_openai::{
     error::OpenAIError,
     types::responses::{
         EasyInputContent, EasyInputMessage, FunctionCallOutput, FunctionCallOutputItemParam,
-        FunctionTool, FunctionToolCall, FunctionToolCallOutputResource, InputItem, Item,
-        MessageType, OutputItem, OutputMessageContent, OutputStatus, Reasoning,
-        ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool,
-        WebSearchTool,
+        FunctionTool, FunctionToolCall, FunctionToolCallOutputResource, ImageDetail, InputContent,
+        InputImageContent, InputItem, InputTextContent, Item, MessageType, OutputItem,
+        OutputMessageContent, OutputStatus, Reasoning, ReasoningEffort as OpenAIReasoningEffort,
+        ResponseStreamEvent, Role, Tool as OpenAITool, WebSearchTool,
     },
 };
 use futures::StreamExt;
@@ -22,6 +22,7 @@ use crate::{
     config::ReasoningEffort,
     context::Message,
     event::{CompletedReason, ProviderSignal},
+    input::{InputPart, UserInput},
     provider::{Compaction, Provider, ProviderEventStream},
     tool::{ToolCall, ToolCallResult, ToolDefinition},
 };
@@ -36,6 +37,25 @@ or call tools. Output only the continuation state without wrapper tags.";
 const SUMMARY_OPEN: &str = "<context_summary>";
 const SUMMARY_CLOSE: &str = "</context_summary>";
 const SUMMARY_CONTINUE: &str = "Continue the pending task using the context above.";
+
+/// Used only when provider-native compacted items no longer carry dimensions.
+const UNKNOWN_IMAGE_TOKENS: usize = 1024;
+
+fn redact_images(value: &mut Value) -> usize {
+    match value {
+        Value::Array(values) => values.iter_mut().map(redact_images).sum(),
+        Value::Object(object) => {
+            let is_image = object.get("type").and_then(Value::as_str) == Some("input_image");
+
+            if is_image && let Some(url) = object.get_mut("image_url") {
+                *url = Value::String("[image data]".to_owned());
+            }
+
+            usize::from(is_image) + object.values_mut().map(redact_images).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
 
 fn reasoning_effort_name(effort: &OpenAIReasoningEffort) -> &'static str {
     match effort {
@@ -189,7 +209,7 @@ impl OpenAIProvider {
 
     fn input_item(message: Message) -> InputItem {
         match message {
-            Message::User(text) => EasyInputMessage::from(text).into(),
+            Message::User(input) => Self::user_input_item(input),
             Message::System(text) => EasyInputMessage {
                 r#type: MessageType::Message,
                 role: Role::System,
@@ -233,20 +253,80 @@ impl OpenAIProvider {
         }
     }
 
+    fn user_input_item(input: UserInput) -> InputItem {
+        if !input.has_images() {
+            return EasyInputMessage::from(input.text()).into();
+        }
+
+        let mut content = Vec::with_capacity(input.parts().len() * 2);
+        let mut image_index = 0_usize;
+
+        for part in input.parts() {
+            match part {
+                InputPart::Text(text) if !text.is_empty() => {
+                    content.push(InputContent::InputText(InputTextContent {
+                        text: text.clone(),
+                    }));
+                }
+                InputPart::Text(_) => {}
+                InputPart::Image(image) => {
+                    image_index += 1;
+                    content.push(InputContent::InputText(InputTextContent {
+                        text: format!("[Image {image_index}]"),
+                    }));
+                    content.push(InputContent::InputImage(InputImageContent {
+                        detail: ImageDetail::Auto,
+                        file_id: None,
+                        image_url: Some(image.data_url()),
+                    }));
+                }
+            }
+        }
+
+        EasyInputMessage {
+            r#type: MessageType::Message,
+            role: Role::User,
+            content: EasyInputContent::ContentList(content),
+            phase: None,
+        }
+        .into()
+    }
+
     fn estimate_values(&self, values: &[Value]) -> anyhow::Result<usize> {
         if values.is_empty() {
             return Ok(0);
         }
 
-        let input = serde_json::to_string(values)?;
+        let mut values = values.to_vec();
+        let image_count = values.iter_mut().map(redact_images).sum::<usize>();
+        let input = serde_json::to_string(&values)?;
         let tokenizer =
             bpe_for_model(&self.config.model).unwrap_or_else(|_| o200k_base_singleton());
 
-        Ok(tokenizer.count_ordinary(&input))
+        Ok(tokenizer
+            .count_ordinary(&input)
+            .saturating_add(image_count.saturating_mul(UNKNOWN_IMAGE_TOKENS)))
     }
 
     fn estimate_messages(&self, messages: &[Message]) -> anyhow::Result<usize> {
-        self.estimate_values(&Self::input(messages)?)
+        let (image_count, image_tokens) = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(input) => Some(input.images()),
+                _ => None,
+            })
+            .flatten()
+            .fold((0_usize, 0_usize), |(count, tokens), image| {
+                (
+                    count.saturating_add(1),
+                    tokens.saturating_add(image.estimated_tokens()),
+                )
+            });
+        let estimate = self.estimate_values(&Self::input(messages)?)?;
+
+        Ok(estimate
+            .saturating_sub(image_count.saturating_mul(UNKNOWN_IMAGE_TOKENS))
+            .saturating_add(image_tokens))
     }
 
     fn build_request(&self, input: Vec<Value>) -> anyhow::Result<ResponseRequest> {
@@ -294,7 +374,7 @@ impl OpenAIProvider {
             "{SUMMARY_OPEN}\n{}\n{SUMMARY_CLOSE}\n\n{SUMMARY_CONTINUE}",
             text.trim()
         );
-        let item = serde_json::to_value(Self::input_item(Message::User(summary)))?;
+        let item = serde_json::to_value(Self::input_item(Message::User(summary.into())))?;
         Ok(serde_json::to_vec(&vec![item])?)
     }
 
@@ -1207,6 +1287,7 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
     use crate::{
+        input::Image,
         provider::Provider,
         tool::{BashToolArgs, WriteFileToolArgs},
     };
@@ -1320,7 +1401,7 @@ mod tests {
         let provider = provider(ReasoningEffort::High);
         let messages = [
             Message::System("You are a coding agent.".to_owned()),
-            Message::User("Inspect the repository.".to_owned()),
+            Message::User("Inspect the repository.".into()),
         ];
         let (empty_request, request, output) = (
             provider.estimate_request_tokens(&[]).unwrap().unwrap(),
@@ -1337,6 +1418,74 @@ mod tests {
             request > output,
             "output estimates exclude request-only tools"
         );
+    }
+
+    #[test]
+    fn image_inputs_keep_order_and_stable_labels() {
+        let input = UserInput::new(vec![
+            InputPart::Text("compare ".to_owned()),
+            InputPart::Image(Image::new("image/png", [1, 2, 3], 32, 32).unwrap()),
+            InputPart::Text(" with ".to_owned()),
+            InputPart::Image(Image::new("image/jpeg", [4, 5, 6], 64, 32).unwrap()),
+        ]);
+
+        let values = OpenAIProvider::input(&[Message::User(input)]).unwrap();
+        let content = values[0]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 6);
+        assert_eq!(
+            content[0],
+            json!({ "type": "input_text", "text": "compare " })
+        );
+        assert_eq!(
+            content[1],
+            json!({ "type": "input_text", "text": "[Image 1]" })
+        );
+        assert_eq!(content[2]["type"], "input_image");
+        assert_eq!(content[2]["detail"], "auto");
+        assert!(
+            content[2]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert_eq!(
+            content[3],
+            json!({ "type": "input_text", "text": " with " })
+        );
+        assert_eq!(
+            content[4],
+            json!({ "type": "input_text", "text": "[Image 2]" })
+        );
+        assert!(
+            content[5]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
+    }
+
+    #[test]
+    fn base64_payload_is_not_tokenized_as_text() {
+        let provider = provider(ReasoningEffort::High);
+        let small = UserInput::from_text_and_images(
+            "inspect".to_owned(),
+            vec![Image::new("image/png", vec![0; 16], 64, 64).unwrap()],
+        );
+        let large = UserInput::from_text_and_images(
+            "inspect".to_owned(),
+            vec![Image::new("image/png", vec![0; 100_000], 64, 64).unwrap()],
+        );
+        let (small, large) = (
+            provider
+                .estimate_output_tokens(&[Message::User(small)])
+                .unwrap(),
+            provider
+                .estimate_output_tokens(&[Message::User(large)])
+                .unwrap(),
+        );
+
+        assert_eq!(small, large);
     }
 
     #[test]
@@ -1361,7 +1510,7 @@ mod tests {
                 serde_json::to_vec(&compacted).unwrap(),
                 None,
             )),
-            Message::User("new prompt".to_owned()),
+            Message::User("new prompt".into()),
         ];
 
         let input = OpenAIProvider::input(&messages).unwrap();
@@ -1464,7 +1613,7 @@ mod tests {
     #[test]
     fn summary_requests_use_a_system_message_without_tools() {
         let provider = provider(ReasoningEffort::High);
-        let input = OpenAIProvider::input(&[Message::User("old prompt".to_owned())]).unwrap();
+        let input = OpenAIProvider::input(&[Message::User("old prompt".into())]).unwrap();
         let request = provider.build_summary_request(input).unwrap();
         let value = serde_json::to_value(request).unwrap();
 
@@ -1537,7 +1686,7 @@ mod tests {
         ));
 
         let compaction = provider
-            .compact(&[Message::User("inspect the project".to_owned())])
+            .compact(&[Message::User("inspect the project".into())])
             .await
             .unwrap()
             .unwrap();
@@ -1595,7 +1744,7 @@ mod tests {
         ));
 
         let compaction = provider
-            .compact(&[Message::User("inspect the project".to_owned())])
+            .compact(&[Message::User("inspect the project".into())])
             .await
             .unwrap()
             .unwrap();

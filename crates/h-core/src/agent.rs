@@ -12,6 +12,7 @@ use crate::{
         Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, archive_dir, built_in_workspace_info,
     },
     event::{AgentCommand, AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
+    input::UserInput,
     interaction::Bridge,
     provider::{Provider, ProviderEventStream},
     skill::Registry as SkillRegistry,
@@ -200,7 +201,7 @@ enum CompactOutcome {
 }
 
 pub enum NextTurn {
-    Prompt(String),
+    Prompt(UserInput),
     Continue,
     Stop,
 }
@@ -501,10 +502,8 @@ where
         self.refresh_token_count(metrics.total_tokens);
     }
 
-    fn append_prompt(&mut self, prompt: impl AsRef<str>) {
-        self.context
-            .histories_mut()
-            .push(Message::User(prompt.as_ref().to_string()));
+    fn append_prompt(&mut self, prompt: UserInput) {
+        self.context.histories_mut().push(Message::User(prompt));
     }
 
     fn merge_text_delta(&mut self) {
@@ -780,7 +779,7 @@ where
 
     pub async fn continue_turn(
         &mut self,
-        prompt: impl Into<String>,
+        prompt: impl Into<UserInput>,
         cancellation: CancellationToken,
     ) -> anyhow::Result<()> {
         self.continue_turn_with_persistence(prompt.into(), cancellation, false)
@@ -789,7 +788,7 @@ where
 
     async fn continue_turn_with_persistence(
         &mut self,
-        prompt: String,
+        prompt: UserInput,
         cancellation: CancellationToken,
         archive_after_turn: bool,
     ) -> anyhow::Result<()> {
@@ -844,7 +843,7 @@ where
 
     async fn run_turn(
         &mut self,
-        prompt: String,
+        prompt: UserInput,
         cancellation: &CancellationToken,
     ) -> anyhow::Result<TurnMetrics> {
         self.turn = NextTurn::Prompt(prompt);
@@ -1004,7 +1003,7 @@ where
                 | Message::ToolCallResult { .. } => continue,
                 Message::User(prompt) => {
                     self.view_bus
-                        .broadcast(AgentViewEvent::Prompt(prompt.clone()));
+                        .broadcast(AgentViewEvent::Prompt(prompt.display()));
                 }
                 Message::Assistant(text) => {
                     self.view_bus
@@ -1856,7 +1855,7 @@ mod tests {
         let run = agent.run(receiver);
         let drive = async move {
             commands
-                .send(AgentCommand::Prompt("say hello".to_owned()))
+                .send(AgentCommand::Prompt("say hello".into()))
                 .await
                 .unwrap();
 
@@ -1878,7 +1877,7 @@ mod tests {
         assert!(matches!(
             saved.histories(),
             [Message::User(prompt), Message::Assistant(answer)]
-                if prompt == "say hello" && answer == "hello"
+                if prompt.text() == "say hello" && answer == "hello"
         ));
     }
 
@@ -1905,11 +1904,11 @@ mod tests {
         let run = agent.run(receiver);
         let drive = async move {
             commands
-                .send(AgentCommand::Prompt("first prompt".to_owned()))
+                .send(AgentCommand::Prompt("first prompt".into()))
                 .await
                 .unwrap();
             commands
-                .send(AgentCommand::Prompt("second prompt".to_owned()))
+                .send(AgentCommand::Prompt("second prompt".into()))
                 .await
                 .unwrap();
 
@@ -1931,9 +1930,9 @@ mod tests {
                 Message::Assistant(first_answer),
                 Message::User(second_prompt),
                 Message::Assistant(second_answer),
-            ] if first_prompt == "first prompt"
+            ] if first_prompt.text() == "first prompt"
                 && first_answer == "first answer"
-                && second_prompt == "second prompt"
+                && second_prompt.text() == "second prompt"
                 && second_answer == "second answer"
         ));
     }
@@ -1953,7 +1952,7 @@ mod tests {
         let run = agent.run(receiver);
         let drive = async move {
             commands
-                .send(AgentCommand::Prompt("wait forever".to_owned()))
+                .send(AgentCommand::Prompt("wait forever".into()))
                 .await
                 .unwrap();
             polled.notified().await;
@@ -1993,7 +1992,7 @@ mod tests {
         let run = agent.run(receiver);
         let drive = async move {
             commands
-                .send(AgentCommand::Prompt("wait forever".to_owned()))
+                .send(AgentCommand::Prompt("wait forever".into()))
                 .await
                 .unwrap();
             polled.notified().await;
@@ -2032,7 +2031,7 @@ mod tests {
         let run = agent.run(receiver);
         let drive = async move {
             commands
-                .send(AgentCommand::Prompt("save this prompt".to_owned()))
+                .send(AgentCommand::Prompt("save this prompt".into()))
                 .await
                 .unwrap();
 
@@ -2289,7 +2288,7 @@ mod tests {
         });
         let mut events = agent.subscribe_view();
         agent.with_auto_compact_token_limit(200);
-        agent.append_prompt("inspect the project");
+        agent.append_prompt("inspect the project".into());
         let mut metrics = TurnMetrics::new();
 
         agent
@@ -2314,7 +2313,7 @@ mod tests {
                     call_id: result_id,
                     ..
                 },
-            ] if prompt == "inspect the project"
+            ] if prompt.text() == "inspect the project"
                 && call_id == "call-1"
                 && result_id == "call-1"
         ));
@@ -2371,7 +2370,7 @@ mod tests {
 
         assert!(matches!(
             input.lock().unwrap().as_slice(),
-            [Message::User(prompt)] if prompt == "inspect the project"
+            [Message::User(prompt)] if prompt.text() == "inspect the project"
         ));
         assert!(matches!(
             agent.context.provider_messages().as_slice(),
@@ -2525,7 +2524,7 @@ mod tests {
         });
         let mut events = agent.subscribe_view();
 
-        agent.append_prompt("earlier prompt");
+        agent.append_prompt("earlier prompt".into());
 
         let cancellation = cancellation();
         let trigger = cancellation.clone();
@@ -3303,9 +3302,9 @@ mod tests {
     fn rebroadcast_replays_prompts_and_responses_in_order() {
         let agent = agent_with_histories(vec![
             Message::System("workspace info".to_owned()),
-            Message::User("first question".to_owned()),
+            Message::User("first question".into()),
             Message::Assistant("first answer".to_owned()),
-            Message::User("second question".to_owned()),
+            Message::User("second question".into()),
             Message::Assistant("second answer".to_owned()),
         ]);
         let mut receiver = agent.subscribe_view();

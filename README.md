@@ -12,6 +12,8 @@ may still change.
 
 - Interactive terminal UI with streaming Markdown, syntax highlighting, diffs,
   tool activity, token estimates, and context usage.
+- Clipboard image attachments for multimodal prompts, including keyboard and
+  mouse removal controls.
 - Headless mode for running a single prompt and printing the final response.
 - Built-in tools for reading, writing, and editing files; searching with grep;
   fetching web pages; running Bash commands; and asking interactive questions.
@@ -121,6 +123,10 @@ Inside the TUI:
 
 - `Alt+Enter` submits the prompt; `Ctrl+Enter` also works in terminals that
   support an enhanced keyboard protocol. Plain Enter inserts a newline.
+- Paste an image with `Ctrl+V`. Attached images appear below the prompt and can
+  be removed with their `×` button or with Backspace while the text is empty.
+- `Shift+Tab` focuses image attachments; Left/Right selects one, Backspace or
+  Delete removes it, and Esc or Tab returns to text input.
 - `Esc` cancels the active turn.
 - `Ctrl+C` exits the application.
 - `/clear` archives the current context and starts a new session.

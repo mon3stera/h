@@ -1,11 +1,12 @@
 use crate::{
     command::Command,
+    input::UserInput,
     tool::{Presentation, ToolCall, ToolCallResult},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCommand {
-    Prompt(String),
+    Prompt(UserInput),
     Run(Command),
     Cancel,
 }

@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod event;
 pub mod headless;
+pub mod input;
 pub mod interaction;
 pub mod provider;
 pub mod skill;

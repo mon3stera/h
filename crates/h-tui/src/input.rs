@@ -1,15 +1,20 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+use h_core::input::{Image, UserInput};
 
 use ratatui::{
     Frame,
     buffer::Buffer,
-    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
+use unicode_width::UnicodeWidthStr;
 
 const PROMPT_MARKER: &str = "❯ ";
 const MARKER_WIDTH: u16 = 2;
@@ -23,6 +28,7 @@ const MIN_HEIGHT: u16 = 3;
 const MAX_HEIGHT: u16 = 10;
 /// The top and bottom rules.
 const BORDER_HEIGHT: u16 = 2;
+const ATTACHMENT_GAP: u16 = 2;
 
 use Direction::{Newer, Older};
 
@@ -33,6 +39,21 @@ enum Direction {
     Newer,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Focus {
+    #[default]
+    Text,
+    Image(usize),
+}
+
+struct Chip {
+    index: usize,
+    x: u16,
+    row: u16,
+    width: u16,
+    label: String,
+}
+
 /// The prompt box.
 ///
 /// A bare Enter inserts a newline; submitting takes a modified one. Ctrl+Enter
@@ -41,6 +62,8 @@ enum Direction {
 /// arrives as an ESC-prefixed return, which nearly every terminal sends.
 pub struct Input {
     area: TextArea<'static>,
+    images: Vec<Image>,
+    focus: Focus,
     /// Prompts already sent, oldest first.
     history: Vec<String>,
     /// Which entry the box is showing. `None` means it is showing the draft.
@@ -52,6 +75,8 @@ pub struct Input {
     wrapped: Cell<Option<(u16, u16)>>,
     /// First visual row shown by the textarea on its last render.
     scroll_top: Cell<u16>,
+    /// Close-button hit boxes from the latest render.
+    close_areas: RefCell<Vec<(Rect, usize)>>,
 }
 
 impl Default for Input {
@@ -63,18 +88,21 @@ impl Default for Input {
 
         Self {
             area,
+            images: Vec::new(),
+            focus: Focus::Text,
             history: Vec::new(),
             recalled: None,
             draft: String::new(),
             wrapped: Cell::new(None),
             scroll_top: Cell::new(0),
+            close_areas: RefCell::new(Vec::new()),
         }
     }
 }
 
 impl Input {
     /// Takes a key. A submitted prompt is handed back and the box is cleared.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<UserInput> {
         if key.kind == KeyEventKind::Release {
             return None;
         }
@@ -85,6 +113,36 @@ impl Input {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             return self.take();
+        }
+
+        if let Focus::Image(index) = self.focus {
+            match key.code {
+                KeyCode::Left => self.focus = Focus::Image(index.saturating_sub(1)),
+                KeyCode::Right => {
+                    self.focus = Focus::Image((index + 1).min(self.images.len() - 1));
+                }
+                KeyCode::Backspace | KeyCode::Delete => self.remove_image(index),
+                KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Text,
+                _ => {}
+            }
+
+            return None;
+        }
+
+        if matches!(key.code, KeyCode::BackTab)
+            || key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if !self.images.is_empty() {
+                self.focus = Focus::Image(0);
+            }
+
+            return None;
+        }
+
+        if key.code == KeyCode::Backspace && self.text().is_empty() && !self.images.is_empty() {
+            self.images.pop();
+
+            return None;
         }
 
         // Arrows reach the history only from the edges of the text, so a
@@ -118,19 +176,27 @@ impl Input {
         row == end.screen_cursor().row
     }
 
-    pub(crate) fn take(&mut self) -> Option<String> {
-        let prompt = self.area.lines().join("\n");
+    pub(crate) fn take(&mut self) -> Option<UserInput> {
+        let (text, images) = (
+            self.area.lines().join("\n"),
+            std::mem::take(&mut self.images),
+        );
+        let input = UserInput::from_text_and_images(text.clone(), images);
 
-        if prompt.trim().is_empty() {
+        if input.is_empty() {
             return None;
         }
 
-        self.remember(prompt.clone());
+        if !text.trim().is_empty() {
+            self.remember(text);
+        }
         self.show("");
+        self.focus = Focus::Text;
         self.recalled = None;
         self.draft.clear();
+        self.close_areas.borrow_mut().clear();
 
-        Some(prompt)
+        Some(input)
     }
 
     /// Fills the history from a resumed session, so what was asked before can be
@@ -157,7 +223,7 @@ impl Input {
 
     /// Steps through the history, stashing the draft on the way in and putting
     /// it back on the way out.
-    fn recall(&mut self, direction: Direction) -> Option<String> {
+    fn recall(&mut self, direction: Direction) -> Option<UserInput> {
         let target = match (direction, self.recalled) {
             (Older, None) => {
                 self.draft = self.area.lines().join("\n");
@@ -202,12 +268,72 @@ impl Input {
         self.show(text);
     }
 
+    pub(crate) fn insert_text(&mut self, text: &str) {
+        self.area.insert_str(text);
+        self.wrapped.set(None);
+    }
+
+    pub(crate) fn add_image(&mut self, image: Image) {
+        self.images.push(image);
+    }
+
+    pub(crate) fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+
+    pub(crate) fn attachments_focused(&self) -> bool {
+        matches!(self.focus, Focus::Image(_))
+    }
+
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return false;
+        }
+
+        let index = self
+            .close_areas
+            .borrow()
+            .iter()
+            .find(|(area, _)| {
+                mouse.column >= area.x
+                    && mouse.column < area.x.saturating_add(area.width)
+                    && mouse.row >= area.y
+                    && mouse.row < area.y.saturating_add(area.height)
+            })
+            .map(|(_, index)| *index);
+
+        let Some(index) = index else {
+            return false;
+        };
+
+        self.remove_image(index);
+        true
+    }
+
+    fn remove_image(&mut self, index: usize) {
+        if index >= self.images.len() {
+            self.focus = Focus::Text;
+
+            return;
+        }
+
+        self.images.remove(index);
+        self.focus = if self.images.is_empty() {
+            Focus::Text
+        } else {
+            Focus::Image(index.min(self.images.len() - 1))
+        };
+    }
+
     /// Clears the draft and recall entries for a newly started session.
     pub(crate) fn reset(&mut self) {
         self.show("");
         self.history.clear();
+        self.images.clear();
+        self.focus = Focus::Text;
         self.recalled = None;
         self.draft.clear();
+        self.close_areas.borrow_mut().clear();
     }
 
     /// What the box currently holds.
@@ -219,8 +345,18 @@ impl Input {
     /// never crowds out the conversation.
     pub fn height(&self, width: u16) -> u16 {
         self.wrapped_rows(width)
+            .saturating_add(self.attachment_rows(width))
             .saturating_add(BORDER_HEIGHT)
             .clamp(MIN_HEIGHT, MAX_HEIGHT)
+    }
+
+    fn attachment_rows(&self, width: u16) -> u16 {
+        let width = field_width(width);
+
+        chips(width, self.images.len())
+            .last()
+            .map(|chip| chip.row.saturating_add(1))
+            .unwrap_or(0)
     }
 
     fn wrapped_rows(&self, width: u16) -> u16 {
@@ -264,6 +400,18 @@ impl Input {
 
         frame.render_widget(block, area);
 
+        let attachment_height = self
+            .attachment_rows(area.width)
+            .min(inner.height.saturating_sub(1));
+        let [text, attachments] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(attachment_height)])
+                .areas(inner);
+
+        self.render_text(frame, text);
+        self.render_attachments(frame, attachments);
+    }
+
+    fn render_text(&self, frame: &mut Frame, area: Rect) {
         // The marker sits beside the field rather than inside it, so it stays put
         // as the text scrolls and never lands in what gets submitted.
         let [marker, field, cursor_gutter] = Layout::horizontal([
@@ -271,7 +419,7 @@ impl Input {
             Constraint::Min(0),
             Constraint::Length(CURSOR_GUTTER_WIDTH),
         ])
-        .areas(inner);
+        .areas(area);
 
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -283,6 +431,49 @@ impl Input {
         frame.render_widget(&self.area, field);
 
         self.render_cursor_gutter(frame, field, cursor_gutter);
+    }
+
+    fn render_attachments(&self, frame: &mut Frame, area: Rect) {
+        self.close_areas.borrow_mut().clear();
+
+        if area.is_empty() {
+            return;
+        }
+
+        let [_marker, field, _gutter] = Layout::horizontal([
+            Constraint::Length(MARKER_WIDTH),
+            Constraint::Min(0),
+            Constraint::Length(CURSOR_GUTTER_WIDTH),
+        ])
+        .areas(area);
+
+        for chip in chips(field.width, self.images.len()) {
+            if chip.row >= field.height {
+                continue;
+            }
+
+            let rect = Rect::new(
+                field.x.saturating_add(chip.x),
+                field.y.saturating_add(chip.row),
+                chip.width.min(field.width.saturating_sub(chip.x)),
+                1,
+            );
+            let selected = self.focus == Focus::Image(chip.index);
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+
+            frame.render_widget(Paragraph::new(Span::styled(chip.label, style)), rect);
+
+            let close_x = rect.x.saturating_add(chip.width.saturating_sub(2));
+            if close_x < rect.x.saturating_add(rect.width) {
+                self.close_areas
+                    .borrow_mut()
+                    .push((Rect::new(close_x, rect.y, 1, 1), chip.index));
+            }
+        }
     }
 
     /// Draws the synthetic end-of-line cursor that the textarea clips when it
@@ -309,6 +500,40 @@ impl Input {
             area,
         );
     }
+}
+
+fn field_width(width: u16) -> u16 {
+    width
+        .saturating_sub(MARKER_WIDTH + CURSOR_GUTTER_WIDTH)
+        .max(1)
+}
+
+fn chips(width: u16, count: usize) -> Vec<Chip> {
+    let (mut x, mut row) = (0_u16, 0_u16);
+    let mut chips = Vec::with_capacity(count);
+
+    for index in 0..count {
+        let label = format!("[Image {} ×]", index + 1);
+        let chip_width = UnicodeWidthStr::width(label.as_str())
+            .try_into()
+            .unwrap_or(u16::MAX);
+
+        if x > 0 && x.saturating_add(chip_width) > width {
+            x = 0;
+            row = row.saturating_add(1);
+        }
+
+        chips.push(Chip {
+            index,
+            x,
+            row,
+            width: chip_width,
+            label,
+        });
+        x = x.saturating_add(chip_width).saturating_add(ATTACHMENT_GAP);
+    }
+
+    chips
 }
 
 /// Mirrors the textarea's viewport rule to place a cursor in the gutter.
@@ -338,6 +563,10 @@ mod tests {
         }
     }
 
+    fn image() -> Image {
+        Image::new("image/png", [1, 2, 3], 32, 32).unwrap()
+    }
+
     #[test]
     fn a_bare_enter_inserts_a_newline_instead_of_submitting() {
         let mut input = Input::default();
@@ -347,7 +576,9 @@ mod tests {
         type_text(&mut input, "two");
 
         assert_eq!(
-            input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            input
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+                .map(|input| input.text()),
             Some("one\ntwo".to_owned())
         );
     }
@@ -359,7 +590,9 @@ mod tests {
             type_text(&mut input, "hi");
 
             assert_eq!(
-                input.handle_key(KeyEvent::new(KeyCode::Enter, modifier)),
+                input
+                    .handle_key(KeyEvent::new(KeyCode::Enter, modifier))
+                    .map(|input| input.text()),
                 Some("hi".to_owned()),
                 "{modifier:?} should submit"
             );
@@ -391,6 +624,88 @@ mod tests {
             input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             None
         );
+    }
+
+    #[test]
+    fn an_image_can_be_submitted_without_text() {
+        let mut input = Input::default();
+        input.add_image(image());
+
+        let submitted = input
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+            .unwrap();
+
+        assert_eq!(submitted.text(), "");
+        assert_eq!(submitted.image_count(), 1);
+        assert!(!input.has_images());
+    }
+
+    #[test]
+    fn backspace_on_empty_text_removes_the_last_image() {
+        let mut input = Input::default();
+        input.add_image(image());
+        input.add_image(image());
+
+        input.handle_key(press(KeyCode::Backspace));
+
+        assert_eq!(input.take().unwrap().image_count(), 1);
+    }
+
+    #[test]
+    fn attachment_focus_selects_and_deletes_images() {
+        let mut input = Input::default();
+        input.add_image(image());
+        input.add_image(image());
+
+        input.handle_key(press(KeyCode::BackTab));
+        assert_eq!(input.focus, Focus::Image(0));
+
+        input.handle_key(press(KeyCode::Right));
+        assert_eq!(input.focus, Focus::Image(1));
+
+        input.handle_key(press(KeyCode::Delete));
+        assert_eq!(input.focus, Focus::Image(0));
+        assert_eq!(input.take().unwrap().image_count(), 1);
+    }
+
+    #[test]
+    fn escape_returns_attachment_focus_to_text() {
+        let mut input = Input::default();
+        input.add_image(image());
+
+        input.handle_key(press(KeyCode::BackTab));
+        input.handle_key(press(KeyCode::Esc));
+        type_text(&mut input, "describe");
+
+        let submitted = input.take().unwrap();
+        assert_eq!(submitted.text(), "describe");
+        assert_eq!(submitted.image_count(), 1);
+    }
+
+    #[test]
+    fn rendered_close_button_removes_its_image() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut input = Input::default();
+        input.add_image(image());
+        input.add_image(image());
+        let height = input.height(TEST_WIDTH);
+        let mut terminal = Terminal::new(TestBackend::new(TEST_WIDTH, height)).unwrap();
+
+        terminal
+            .draw(|frame| input.render(frame, frame.area()))
+            .unwrap();
+
+        let close = input.close_areas.borrow()[0].0;
+        let removed = input.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close.x,
+            row: close.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(removed);
+        assert_eq!(input.take().unwrap().image_count(), 1);
     }
 
     #[test]
@@ -462,7 +777,9 @@ mod tests {
     }
 
     fn submit(input: &mut Input) -> Option<String> {
-        input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+        input
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+            .map(|input| input.text())
     }
 
     fn send(input: &mut Input, prompt: &str) {

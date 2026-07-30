@@ -1,13 +1,13 @@
 use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError};
 use tokio_util::sync::CancellationToken;
 
-use crate::{agent::Agent, event::AgentEvent, provider::Provider};
+use crate::{agent::Agent, event::AgentEvent, input::UserInput, provider::Provider};
 
 /// Runs one complete agent turn and returns only its final text response.
 ///
 /// The agent is consumed so this ephemeral lifecycle cannot accidentally fall
 /// through to the interactive session's archive step.
-pub async fn run<P>(mut agent: Agent<P>, prompt: String) -> anyhow::Result<String>
+pub async fn run<P>(mut agent: Agent<P>, prompt: impl Into<UserInput>) -> anyhow::Result<String>
 where
     P: Provider,
 {
@@ -15,7 +15,7 @@ where
     agent.initialize()?;
 
     agent
-        .continue_turn(prompt, CancellationToken::new())
+        .continue_turn(prompt.into(), CancellationToken::new())
         .await?;
 
     Ok(final_response(&mut events))

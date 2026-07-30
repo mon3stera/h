@@ -23,6 +23,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    input::UserInput,
     provider::Compaction,
     tool::{Summary, ToolRegistry},
 };
@@ -190,7 +191,7 @@ pub(crate) fn built_in_workspace_info() -> Vec<Box<dyn WorkspaceInfo>> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
     System(String),
-    User(String),
+    User(UserInput),
     Assistant(String),
     /// Opaque provider-native reasoning item. Only the originating provider is
     /// expected to deserialize and replay these bytes.
@@ -532,7 +533,11 @@ impl Context {
         self.histories
             .iter()
             .filter_map(|message| match message {
-                Message::User(prompt) => Some(prompt.clone()),
+                Message::User(prompt) => {
+                    let text = prompt.text();
+
+                    (!text.trim().is_empty()).then_some(text)
+                }
                 _ => None,
             })
             .collect()
@@ -687,7 +692,7 @@ impl Context {
         self.histories
             .iter()
             .find_map(|message| match message {
-                Message::User(prompt) => Some(summarize(prompt)),
+                Message::User(prompt) => Some(summarize(&prompt.display())),
                 _ => None,
             })
             .unwrap_or_default()
@@ -941,7 +946,7 @@ mod tests {
         Context {
             id: id.to_owned(),
             buf: String::new(),
-            histories: vec![Message::User(prompt.to_owned())],
+            histories: vec![Message::User(prompt.into())],
             token_count: None,
             tool_compaction: ToolCompaction::default(),
         }
@@ -963,7 +968,7 @@ mod tests {
         assert!(
             matches!(
                 resumed.histories.as_slice(),
-                [Message::User(prompt)] if prompt == "teach me borrow checking"
+                [Message::User(prompt)] if prompt.text() == "teach me borrow checking"
             ),
             "unexpected histories: {:?}",
             resumed.histories.len()
@@ -992,7 +997,7 @@ mod tests {
         assert!(matches!(
             resumed.histories(),
             [Message::User(prompt), Message::Assistant(answer)]
-                if prompt == "first prompt" && answer == "first answer"
+                if prompt.text() == "first prompt" && answer == "first answer"
         ));
         assert!(
             entries
@@ -1010,6 +1015,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted.token_count, None);
+    }
+
+    #[test]
+    fn archives_with_legacy_text_prompts_remain_readable() {
+        let persisted = serde_json::from_value::<PersistHistories>(json!({
+            "id": "older-session",
+            "histories": [{ "User": "old prompt" }]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            persisted.histories.as_slice(),
+            [Message::User(input)] if input.text() == "old prompt" && !input.has_images()
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_prompts_survive_archive_and_resume() {
+        let archive = TempArchive::new();
+        let image = crate::input::Image::new("image/png", [1, 2, 3], 2, 2).unwrap();
+        let mut context = Context::new();
+
+        context.id = "session-1".to_owned();
+        context
+            .histories_mut()
+            .push(Message::User(UserInput::from_text_and_images(
+                "inspect".to_owned(),
+                vec![image],
+            )));
+        context.archive_in(&archive.path).await.unwrap();
+
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            resumed.histories(),
+            [Message::User(input)]
+                if input.text() == "inspect"
+                    && input.image_count() == 1
+                    && input.images().next().unwrap().byte_len() == 3
+        ));
     }
 
     #[tokio::test]
@@ -1035,11 +1082,11 @@ mod tests {
         let mut context = Context::new();
         *context.histories_mut() = vec![
             Message::System("instructions".to_owned()),
-            Message::User("old prompt".to_owned()),
+            Message::User("old prompt".into()),
             Message::Compaction(compaction("cmp-1")),
             Message::Assistant("after first compaction".to_owned()),
             Message::Compaction(compaction("cmp-2")),
-            Message::User("new prompt".to_owned()),
+            Message::User("new prompt".into()),
         ];
 
         assert!(matches!(
@@ -1050,7 +1097,7 @@ mod tests {
                 Message::User(prompt),
             ] if system == "instructions"
                 && serde_json::from_slice::<Value>(compaction.state()).unwrap()[0]["id"] == "cmp-2"
-                && prompt == "new prompt"
+                && prompt.text() == "new prompt"
         ));
     }
 
@@ -1060,14 +1107,14 @@ mod tests {
         *context.histories_mut() = vec![
             Message::System("global prompts".to_owned()),
             Message::System("workspace info".to_owned()),
-            Message::User("inspect the project".to_owned()),
+            Message::User("inspect the project".into()),
             Message::System("later system data".to_owned()),
         ];
 
         assert!(matches!(
             context.compaction_input().as_slice(),
             [Message::User(prompt), Message::System(later)]
-                if prompt == "inspect the project" && later == "later system data"
+                if prompt.text() == "inspect the project" && later == "later system data"
         ));
     }
 
@@ -1080,7 +1127,7 @@ mod tests {
                 .to_vec();
 
         *context.histories_mut() = vec![
-            Message::User("inspect the project".to_owned()),
+            Message::User("inspect the project".into()),
             Message::Reasoning(reasoning.clone()),
             tool_call("read-1", "read_file"),
             tool_result("read-1", read_summary("a.rs", 10)),
@@ -1134,7 +1181,7 @@ mod tests {
                 Message::ToolCall { call_id: read_2_call, name: read_2_name, .. },
                 Message::ToolCallResult { call_id: read_2_result, output: read_2_output, .. },
                 Message::Assistant(answer),
-            ] if prompt == "inspect the project"
+            ] if prompt.text() == "inspect the project"
                 && projected_reasoning == &reasoning
                 && read_1_call == "read-1"
                 && read_1_result == read_1_call
@@ -1362,14 +1409,14 @@ mod tests {
             buf: String::new(),
             histories: vec![
                 Message::System("workspace info".to_owned()),
-                Message::User("first".to_owned()),
+                Message::User("first".into()),
                 Message::Assistant("answer".to_owned()),
                 Message::ToolCall {
                     call_id: "call-1".to_owned(),
                     name: "bash".to_owned(),
                     arguments: "{}".to_owned(),
                 },
-                Message::User("second".to_owned()),
+                Message::User("second".into()),
             ],
             token_count: None,
             tool_compaction: ToolCompaction::default(),
@@ -1444,7 +1491,7 @@ mod tests {
             buf: "partial response".to_owned(),
             histories: vec![
                 Message::System("global prompts".to_owned()),
-                Message::User("old question".to_owned()),
+                Message::User("old question".into()),
                 Message::Assistant("old answer".to_owned()),
                 Message::System("workspace info".to_owned()),
             ],
