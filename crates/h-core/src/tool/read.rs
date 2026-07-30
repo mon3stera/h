@@ -15,7 +15,7 @@ use super::{
 };
 
 pub(super) const MAX_READ_LINES: usize = 500;
-pub(super) const MAX_READ_CHARS: usize = 2_048;
+pub(super) const MAX_READ_CHARS: usize = 16 * 1024;
 const SUMMARY_VERSION: u32 = 1;
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -289,7 +289,7 @@ impl TypedTool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "read a file page with at most 500 lines and 2048 characters; line ranges are 1-based and inclusive, offset is a zero-based byte position within start_line, and next_start_line/next_offset continue truncated output"
+        "read a file page with at most 500 lines and 16384 characters; line ranges are 1-based and inclusive, offset is a zero-based byte position within start_line, and next_start_line/next_offset continue truncated output"
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {

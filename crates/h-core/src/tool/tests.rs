@@ -146,7 +146,7 @@ async fn read_file_clamps_explicit_ranges_to_the_page_limit() {
 fn read_file_description_explains_the_clamp() {
     let tool = ReadFileTool::new(FileBufferStore::default());
 
-    assert!(TypedTool::description(&tool).contains("500 lines and 2048 characters"));
+    assert!(TypedTool::description(&tool).contains("500 lines and 16384 characters"));
 }
 
 #[tokio::test]
@@ -194,7 +194,8 @@ async fn read_file_continues_a_long_unicode_line_by_byte_offset() {
 #[tokio::test]
 async fn read_file_continues_after_a_multiline_character_page() {
     let path = temporary_file("multiline-character-page");
-    let (first_line, second_line, third_line) = ("a".repeat(1_000), "界".repeat(1_500), "tail");
+    let (first_line, second_line, third_line) =
+        ("a".repeat(1_000), "界".repeat(MAX_READ_CHARS), "tail");
     let content = format!("{first_line}\n{second_line}\n{third_line}");
     fs::write(&path, content).await.unwrap();
     let tool = ReadFileTool::new(FileBufferStore::default());
