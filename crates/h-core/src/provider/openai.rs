@@ -11,7 +11,6 @@ use async_openai::{
         ReasoningEffort as OpenAIReasoningEffort, ResponseStreamEvent, Role, Tool as OpenAITool,
         WebSearchTool,
     },
-    types::stream::SseEvent,
 };
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -91,12 +90,6 @@ fn is_unsupported_compact_error(error: &OpenAIError) -> bool {
 enum CompactMode {
     Native,
     Model,
-}
-
-#[derive(Debug)]
-pub enum StreamEvent {
-    Response(Box<ResponseStreamEvent>),
-    Done { need_call: bool },
 }
 
 pub struct OpenAIProviderConfig {
@@ -979,7 +972,7 @@ fn patch(v: &mut Value) {
 
 #[async_trait::async_trait]
 impl Provider for OpenAIProvider {
-    type StreamEvent = StreamEvent;
+    type StreamEvent = ResponseStreamEvent;
 
     fn model(&self) -> &str {
         &self.config.model
@@ -1073,29 +1066,6 @@ impl Provider for OpenAIProvider {
     }
 
     async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-        let event = match event {
-            StreamEvent::Response(event) => *event,
-            StreamEvent::Done { need_call } => {
-                let reason = if need_call {
-                    CompletedReason::NeedCall
-                } else {
-                    CompletedReason::Final
-                };
-
-                tracing::warn!(
-                    event = "provider.stream.done_without_response_completed",
-                    provider = "openai",
-                    completion_reason = if need_call {
-                        "needs_tool_call"
-                    } else {
-                        "final"
-                    },
-                );
-
-                return Ok(ProviderSignal::Completed { reason });
-            }
-        };
-
         match &event {
             /* ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
                 delta.
@@ -1202,34 +1172,16 @@ impl Provider for OpenAIProvider {
         let stream = self
             .client
             .responses()
-            .create_stream_with_done_byot::<_, Value>(request)
+            .create_stream_byot::<_, Value>(request)
             .await?
-            .scan(false, |need_call, event| {
-                let event = match event {
-                    Ok(SseEvent::Event(mut value)) => {
-                        patch(&mut value);
-                        let raw = serde_json::to_string(&value).unwrap();
-                        serde_json::from_value::<ResponseStreamEvent>(value)
-                            .map(|event| {
-                                if matches!(
-                                    &event,
-                                    ResponseStreamEvent::ResponseOutputItemDone(done)
-                                        if matches!(&done.item, OutputItem::FunctionCall(_))
-                                ) {
-                                    *need_call = true;
-                                }
-
-                                StreamEvent::Response(Box::new(event))
-                            })
-                            .map_err(|err| OpenAIError::JSONDeserialize(err, raw))
-                    }
-                    Ok(SseEvent::Done) => Ok(StreamEvent::Done {
-                        need_call: *need_call,
-                    }),
-                    Err(error) => Err(error),
-                };
-
-                futures::future::ready(Some(event))
+            .map(|event| match event {
+                Ok(mut value) => {
+                    patch(&mut value);
+                    let raw = serde_json::to_string(&value).unwrap();
+                    serde_json::from_value::<ResponseStreamEvent>(value)
+                        .map_err(|error| OpenAIError::JSONDeserialize(error, raw))
+                }
+                Err(error) => Err(error),
             })
             .filter_map(|result| async move {
                 match result {
@@ -1323,15 +1275,6 @@ mod tests {
         stream.write_all(response.as_bytes()).await.unwrap();
     }
 
-    async fn respond_sse(stream: &mut TcpStream, body: &str) {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}",
-            body.len(),
-        );
-
-        stream.write_all(response.as_bytes()).await.unwrap();
-    }
-
     fn provider(reasoning_effort: ReasoningEffort) -> OpenAIProvider {
         OpenAIProvider::from_config(OpenAIProviderConfig::new(
             "https://example.com",
@@ -1370,60 +1313,6 @@ mod tests {
         assert_eq!(value["reasoning"]["effort"], "high");
         assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
         assert!(!value.to_string().contains("secret"));
-    }
-
-    #[tokio::test]
-    async fn done_sentinel_completes_compatible_streams() {
-        let mut provider = provider(ReasoningEffort::High);
-
-        let final_signal = provider
-            .handle(StreamEvent::Done { need_call: false })
-            .await
-            .unwrap();
-        let call_signal = provider
-            .handle(StreamEvent::Done { need_call: true })
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            final_signal,
-            ProviderSignal::Completed {
-                reason: CompletedReason::Final
-            }
-        ));
-        assert!(matches!(
-            call_signal,
-            ProviderSignal::Completed {
-                reason: CompletedReason::NeedCall
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn provider_stream_exposes_done_before_transport_eof() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-
-            read_request(&mut stream).await;
-            respond_sse(&mut stream, "data: [DONE]\n\n").await;
-        });
-        let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
-            format!("http://{address}"),
-            "secret",
-            "gpt-5.6-sol",
-            ReasoningEffort::High,
-        ));
-        let mut stream = provider.stream(&[]).await.unwrap();
-
-        assert!(matches!(
-            stream.next().await.unwrap().unwrap(),
-            StreamEvent::Done { need_call: false }
-        ));
-        assert!(stream.next().await.is_none());
-
-        server.await.unwrap();
     }
 
     #[test]
@@ -1535,10 +1424,7 @@ mod tests {
         .unwrap();
         let mut provider = provider(ReasoningEffort::High);
 
-        let signal = provider
-            .handle(StreamEvent::Response(Box::new(event)))
-            .await
-            .unwrap();
+        let signal = provider.handle(event).await.unwrap();
 
         assert!(matches!(
             signal,
