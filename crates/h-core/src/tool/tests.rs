@@ -926,6 +926,32 @@ fn grep_context_defaults_to_zero() {
 }
 
 #[tokio::test]
+async fn grep_groups_lines_under_a_single_file_heading() {
+    let path = temporary_file("grep-grouped");
+    fs::write(&path, "before\nneedle\nafter\n").await.unwrap();
+    let tool = GrepTool;
+
+    let output = TypedTool::call(
+        &tool,
+        GrepToolArgs {
+            path: path.to_string_lossy().into_owned(),
+            pattern: "needle".to_owned(),
+            before: Some(1),
+            after: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        output.value().results,
+        format!("{}\n1-before\n2:needle\n3-after\n", path.display())
+    );
+
+    fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
 async fn grep_saves_full_results_and_summarizes_before_truncation() {
     let path = temporary_file("grep-output");
     let content = (1..=300)
@@ -953,11 +979,13 @@ async fn grep_saves_full_results_and_summarizes_before_truncation() {
         .find_map(|line| line.strip_prefix("Full output: "))
         .unwrap();
     let full_output = fs::read_to_string(output_path).await.unwrap();
+    let source_path = path.display().to_string();
 
-    assert!(full_output.contains(":1:needle 1\n"));
-    assert!(full_output.contains(":300:needle 300"));
-    assert!(output.value().results.contains(":1:needle 1\n"));
-    assert!(output.value().results.contains(":300:needle 300"));
+    assert_eq!(full_output.matches(&source_path).count(), 1);
+    assert!(full_output.starts_with(&format!("{source_path}\n1:needle 1\n")));
+    assert!(full_output.contains("\n300:needle 300"));
+    assert!(output.value().results.contains("\n1:needle 1\n"));
+    assert!(output.value().results.contains("\n300:needle 300"));
     assert!(output.value().results.contains("bytes omitted"));
 
     let compact = TypedTool::compact(&tool, output.summary().unwrap())

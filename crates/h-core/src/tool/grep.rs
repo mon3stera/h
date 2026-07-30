@@ -54,7 +54,7 @@ pub struct GrepToolOutput {
 
 struct GrepSink {
     output: String,
-    path: String,
+    returned_lines: usize,
 }
 
 impl Sink for GrepSink {
@@ -68,8 +68,8 @@ impl Sink for GrepSink {
         let line_num = mat.line_number().unwrap_or(0);
         let line = std::str::from_utf8(mat.bytes()).unwrap_or("");
 
-        self.output
-            .push_str(&format!("{}:{}:{}", self.path, line_num, line));
+        self.output.push_str(&format!("{line_num}:{line}"));
+        self.returned_lines += 1;
         Ok(true)
     }
 
@@ -81,8 +81,8 @@ impl Sink for GrepSink {
         let line_num = ctx.line_number().unwrap_or(0);
         let line = std::str::from_utf8(ctx.bytes()).unwrap_or("");
 
-        self.output
-            .push_str(&format!("{}-{}-{}", self.path, line_num, line));
+        self.output.push_str(&format!("{line_num}-{line}"));
+        self.returned_lines += 1;
         Ok(true)
     }
 
@@ -114,7 +114,7 @@ impl TypedTool for GrepTool {
             .passthru(false)
             .build();
 
-        let mut results = String::new();
+        let (mut results, mut returned_lines) = (String::new(), 0);
         for result in WalkBuilder::new(&arguments.path).build() {
             let entry = result?;
 
@@ -125,21 +125,29 @@ impl TypedTool for GrepTool {
                 let path = entry.path();
                 let mut sink = GrepSink {
                     output: String::new(),
-                    path: path.display().to_string(),
+                    returned_lines: 0,
                 };
 
                 searcher.search_path(&matcher, path, &mut sink)?;
 
+                if sink.output.is_empty() {
+                    continue;
+                }
+                if !results.is_empty() {
+                    if !results.ends_with('\n') {
+                        results.push('\n');
+                    }
+
+                    results.push('\n');
+                }
+
+                results.push_str(&path.display().to_string());
                 results.push('\n');
                 results.push_str(&sink.output);
+                returned_lines += sink.returned_lines;
             }
         }
 
-        let returned_lines = results
-            .trim_matches('\n')
-            .lines()
-            .filter(|line| !line.is_empty() && *line != "--")
-            .count();
         let preview = save_and_preview(&results, "grep", Limits::DEFAULT).await?;
         let output_path = preview.path.clone();
         let output = GrepToolOutput {
