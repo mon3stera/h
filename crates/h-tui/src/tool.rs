@@ -2,6 +2,7 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use h_core::tool::{DiffLine, DiffLineKind, DisplayBlock, Presentation, ToolCallStatus};
 
@@ -99,7 +100,7 @@ fn render_block(block: &DisplayBlock, width: usize) -> Vec<Line<'static>> {
             *show_line_numbers,
             *start_line_number,
         ),
-        DisplayBlock::Diff { lines } => diff_lines(lines),
+        DisplayBlock::Diff { lines } => diff_lines(lines, width),
         DisplayBlock::Table { headers, rows } => table_lines(headers, rows),
     }
 }
@@ -168,8 +169,8 @@ fn code_lines(
 /// The colour is a background rather than a foreground because the row is filled
 /// edge to edge; tinting the glyphs the same hue would leave them unreadable
 /// against it.
-fn diff_lines(lines: &[DiffLine]) -> Vec<Line<'static>> {
-    let width = lines
+fn diff_lines(lines: &[DiffLine], width: usize) -> Vec<Line<'static>> {
+    let number_width = lines
         .iter()
         .map(|line| line.number)
         .max()
@@ -187,14 +188,20 @@ fn diff_lines(lines: &[DiffLine]) -> Vec<Line<'static>> {
             };
 
             let style = wash.map_or_else(Style::default, |wash| Style::default().bg(wash));
+            let mut content = format!(
+                "{NESTED_INDENT}{:>number_width$} {sign}{}",
+                line.number, line.text
+            );
 
-            Line::from(Span::styled(
-                format!("{NESTED_INDENT}{:>width$} {sign}{}", line.number, line.text),
-                style,
-            ))
-            // Filling the row to the edge is what makes the wash read as a band
-            // rather than as highlighted text.
-            .style(style)
+            if wash.is_some() {
+                let padding = width.saturating_sub(content.width());
+                content.push_str(&" ".repeat(padding));
+            }
+
+            Line::from(Span::styled(content, style))
+                // Filling the row to the edge is what makes the wash read as a band
+                // rather than as highlighted text.
+                .style(style)
         })
         .collect()
 }
@@ -243,6 +250,7 @@ fn table_lines(headers: &[String], rows: &[Vec<String>]) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use h_core::tool::{KeyValueEntry, ToolCallId};
+    use unicode_width::UnicodeWidthStr;
 
     use super::*;
 
@@ -394,8 +402,9 @@ mod tests {
             }]),
             40,
         );
+        let content = rows.iter().map(|row| row.trim_end()).collect::<Vec<_>>();
 
-        assert_eq!(rows, ["      9  kept", "     10 -old", "     10 +new"]);
+        assert_eq!(content, ["      9  kept", "     10 -old", "     10 +new"]);
     }
 
     #[test]
@@ -418,6 +427,25 @@ mod tests {
             [None, Some(REMOVED_WASH), Some(ADDED_WASH)],
             "the wash belongs to the whole row, not to its glyphs"
         );
+    }
+
+    #[test]
+    fn changed_diff_rows_fill_the_available_width() {
+        let width = 40;
+        let rows = block_rows(
+            &presentation(vec![DisplayBlock::Diff {
+                lines: vec![
+                    diff_line(1, DiffLineKind::Context, "kept"),
+                    diff_line(2, DiffLineKind::Removed, "旧值"),
+                    diff_line(2, DiffLineKind::Added, "新值"),
+                ],
+            }]),
+            width,
+        );
+
+        assert!(UnicodeWidthStr::width(rows[0].as_str()) < width);
+        assert_eq!(UnicodeWidthStr::width(rows[1].as_str()), width);
+        assert_eq!(UnicodeWidthStr::width(rows[2].as_str()), width);
     }
 
     #[test]

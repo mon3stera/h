@@ -11,7 +11,6 @@ use super::{
     Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
     ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
     output::{Limits, save_and_preview},
-    presentation::truncate_preview,
     summary::Targets,
 };
 
@@ -214,68 +213,19 @@ impl GrepPresenter {
 
 impl Presenter for GrepPresenter {
     fn running(&self, call: &ToolCall) -> Presentation {
-        let pattern = call
-            .arguments
-            .get("pattern")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let blocks = if pattern.is_empty() {
-            Vec::new()
-        } else {
-            vec![DisplayBlock::Summary(format!("Searching for {pattern:?}"))]
-        };
-
         Presentation {
             call_id: call.id.clone(),
             name: "Grep".to_owned(),
             label: "built-in".to_owned(),
             target: Self::target(call),
             status: ToolCallStatus::Running,
-            blocks,
+            blocks: Vec::new(),
         }
     }
 
     fn completed(&self, call: &ToolCall, result: &ToolCallResult) -> Presentation {
         let (status, blocks) = match &result.outcome {
-            ToolCallOutcome::Success(output) => {
-                let results = output
-                    .get("results")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim_matches('\n');
-
-                if results.is_empty() {
-                    (
-                        ToolCallStatus::Succeeded,
-                        vec![DisplayBlock::Summary("No matches".to_owned())],
-                    )
-                } else {
-                    let returned_lines = result
-                        .summary()
-                        .and_then(|summary| {
-                            summary.deserialize::<GrepSummary>(SUMMARY_VERSION).ok()
-                        })
-                        .map(|summary| summary.returned_lines)
-                        .unwrap_or_else(|| {
-                            results
-                                .lines()
-                                .filter(|line| !line.is_empty() && *line != "--")
-                                .count()
-                        });
-                    let (content, truncated_lines) = truncate_preview(results);
-
-                    (
-                        ToolCallStatus::Succeeded,
-                        vec![
-                            DisplayBlock::Summary(format!("Returned {returned_lines} lines")),
-                            DisplayBlock::TextOutput {
-                                content,
-                                truncated_lines,
-                            },
-                        ],
-                    )
-                }
-            }
+            ToolCallOutcome::Success(_) => (ToolCallStatus::Succeeded, Vec::new()),
             ToolCallOutcome::Failure { message } => (
                 ToolCallStatus::Failed {
                     message: message.clone(),

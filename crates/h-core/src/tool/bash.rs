@@ -36,14 +36,13 @@ use super::{
     DisplayBlock, KeyValueEntry, Presentation, Presenter, ToolCall, ToolCallOutcome,
     ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
     output::{Limits, save, save_and_preview},
-    presentation::{
-        MAX_ERROR_CHARS, MAX_FIELD_CHARS, truncate_chars, truncate_preview, value_to_display_block,
-    },
+    presentation::{MAX_ERROR_CHARS, MAX_FIELD_CHARS, truncate_chars, value_to_display_block},
 };
 
 const TMUX_HISTORY_LIMIT: &str = "100000";
 const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TMUX_TERMINATE_TIMEOUT: Duration = Duration::from_secs(1);
+const PREVIEW_EDGE_LINES: usize = 2;
 
 #[derive(Debug, Clone)]
 struct MemoryLog {
@@ -1215,13 +1214,26 @@ impl BashPresenter {
             return None;
         }
 
-        let (content, _) = truncate_preview(output);
-        let truncated_lines = content.lines().count().max(1);
+        let lines = output.lines().collect::<Vec<_>>();
+        let content = if lines.len() <= PREVIEW_EDGE_LINES * 2 {
+            lines.join("\n")
+        } else {
+            let omitted = lines.len() - PREVIEW_EDGE_LINES * 2;
+            let (head, tail) = lines.split_at(PREVIEW_EDGE_LINES);
+            let tail = &tail[tail.len() - PREVIEW_EDGE_LINES..];
+
+            format!(
+                "{}\n... +{omitted} lines\n{}",
+                head.join("\n"),
+                tail.join("\n")
+            )
+        };
+        let visible_lines = content.lines().count().max(1);
 
         Some(DisplayBlock::CodeBlock {
             language: Some("console".to_owned()),
             content,
-            truncated_lines,
+            truncated_lines: visible_lines,
             show_line_numbers: false,
             start_line_number: 1,
         })

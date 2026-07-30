@@ -672,6 +672,70 @@ fn bash_presenter_separates_blocking_output_streams() {
 }
 
 #[test]
+fn bash_presenter_keeps_two_head_and_tail_lines() {
+    let call = call(
+        "bash",
+        json!({
+            "action": "run_blocking",
+            "command": "printf output",
+        }),
+    );
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        serde_json::to_value(BashToolOutput::RanBlocking {
+            stdout: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n".to_owned(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            signal: None,
+        })
+        .unwrap(),
+    );
+
+    let presentation = BashPresenter.completed(&call, &result);
+
+    assert!(matches!(
+        &presentation.blocks[3],
+        DisplayBlock::CodeBlock {
+            content,
+            truncated_lines: 5,
+            ..
+        } if content == "line 1\nline 2\n... +2 lines\nline 5\nline 6"
+    ));
+}
+
+#[test]
+fn bash_presenter_keeps_four_lines_without_an_omission_marker() {
+    let call = call(
+        "bash",
+        json!({
+            "action": "run_blocking",
+            "command": "printf output",
+        }),
+    );
+    let result = ToolCallResult::success(
+        call.id.clone(),
+        serde_json::to_value(BashToolOutput::RanBlocking {
+            stdout: "one\ntwo\nthree\nfour\n".to_owned(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            signal: None,
+        })
+        .unwrap(),
+    );
+
+    let presentation = BashPresenter.completed(&call, &result);
+
+    assert!(matches!(
+        &presentation.blocks[3],
+        DisplayBlock::CodeBlock {
+            content,
+            truncated_lines: 4,
+            ..
+        } if content == "one\ntwo\nthree\nfour"
+    ));
+}
+
+#[test]
 fn bash_presenter_surfaces_a_terminating_signal_without_output() {
     let call = call(
         "bash",
@@ -1256,14 +1320,11 @@ fn grep_presenter_presents_running_query() {
     assert_eq!(presentation.name, "Grep");
     assert_eq!(presentation.label, "built-in");
     assert_eq!(presentation.target.as_deref(), Some("src"));
-    assert!(matches!(
-        &presentation.blocks[0],
-        DisplayBlock::Summary(summary) if summary == "Searching for \"parse_markdown\""
-    ));
+    assert!(presentation.blocks.is_empty());
 }
 
 #[test]
-fn grep_presenter_presents_matches() {
+fn grep_presenter_hides_successful_output() {
     let call = call(
         "grep",
         json!({
@@ -1284,39 +1345,7 @@ fn grep_presenter_presents_matches() {
 
     assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
     assert_eq!(presentation.target.as_deref(), Some("src"));
-    assert!(matches!(
-        &presentation.blocks[0],
-        DisplayBlock::Summary(summary) if summary == "Returned 2 lines"
-    ));
-    assert!(matches!(
-        &presentation.blocks[1],
-        DisplayBlock::TextOutput {
-            content,
-            truncated_lines: 0,
-        } if content == results.trim_end()
-    ));
-}
-
-#[test]
-fn grep_presenter_presents_no_matches() {
-    let call = call(
-        "grep",
-        json!({ "path": "src", "pattern": "missing", "before": 0, "after": 0 }),
-    );
-    let result = ToolCallResult {
-        id: call.id.clone(),
-        outcome: ToolCallOutcome::Success(json!({ "results": "\n" })),
-        summary: None,
-    };
-
-    let presentation = GrepPresenter.completed(&call, &result);
-
-    assert!(matches!(presentation.status, ToolCallStatus::Succeeded));
-    assert_eq!(presentation.blocks.len(), 1);
-    assert!(matches!(
-        &presentation.blocks[0],
-        DisplayBlock::Summary(summary) if summary == "No matches"
-    ));
+    assert!(presentation.blocks.is_empty());
 }
 
 #[test]
@@ -1346,7 +1375,7 @@ fn grep_presenter_presents_failure() {
 }
 
 #[test]
-fn read_file_presenter_presents_successful_output() {
+fn read_file_presenter_hides_successful_output() {
     let call = call("read_file", json!({ "path": "src/main.rs" }));
     let result = ToolCallResult {
         id: call.id.clone(),
@@ -1365,67 +1394,18 @@ fn read_file_presenter_presents_successful_output() {
     assert_eq!(presentation.name, "ReadFile");
     assert_eq!(presentation.label, "built-in");
     assert_eq!(presentation.target.as_deref(), Some("src/main.rs"));
-    assert!(matches!(
-        &presentation.blocks[0],
-        DisplayBlock::Summary(summary) if summary == "Read lines 2–3 of 10"
-    ));
-    assert!(matches!(
-        &presentation.blocks[1],
-        DisplayBlock::CodeBlock {
-            language: Some(language),
-            content,
-            truncated_lines: 10,
-            show_line_numbers: true,
-            start_line_number: 2,
-        } if language == "raw" && content == "fn two() {}\nfn three() {}"
-    ));
+    assert!(presentation.blocks.is_empty());
 }
 
 #[test]
-fn read_file_presenter_presents_unknown_total() {
-    let call = call("read_file", json!({ "path": "large.rs" }));
-    let result = ToolCallResult {
-        id: call.id.clone(),
-        outcome: ToolCallOutcome::Success(json!({
-            "content": "line 1\nline 2",
-            "start_line": 1,
-            "end_line": 2,
-            "total_lines": null,
-            "has_more": true,
-        })),
-        summary: None,
-    };
-    let presentation = ReadFilePresenter.completed(&call, &result);
+fn read_file_presenter_hides_running_output() {
+    let call = call("read_file", json!({ "path": "src/main.rs" }));
 
-    assert!(matches!(
-        &presentation.blocks[0],
-        DisplayBlock::Summary(summary)
-            if summary == "Read lines 1–2 (total unknown; more available)"
-    ));
-}
+    let presentation = ReadFilePresenter.running(&call);
 
-#[test]
-fn read_file_presenter_omits_code_block_past_eof() {
-    let call = call("read_file", json!({ "path": "small.rs" }));
-    let result = ToolCallResult {
-        id: call.id.clone(),
-        outcome: ToolCallOutcome::Success(json!({
-            "content": "",
-            "start_line": 10,
-            "end_line": null,
-            "total_lines": 3,
-            "has_more": false,
-        })),
-        summary: None,
-    };
-    let presentation = ReadFilePresenter.completed(&call, &result);
-
-    assert_eq!(presentation.blocks.len(), 1);
-    assert!(matches!(
-        &presentation.blocks[0],
-        DisplayBlock::Summary(summary)
-            if summary == "No lines at or after 10 (file has 3 lines)"
-    ));
+    assert!(matches!(presentation.status, ToolCallStatus::Running));
+    assert_eq!(presentation.target.as_deref(), Some("src/main.rs"));
+    assert!(presentation.blocks.is_empty());
 }
 
 #[test]

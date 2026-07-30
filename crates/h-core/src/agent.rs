@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, VecDeque},
     num::NonZeroUsize,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use crate::{
     bus::EventBus,
     command::Command,
-    context::{Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, built_in_workspace_info},
+    context::{
+        Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, archive_dir, built_in_workspace_info,
+    },
     event::{AgentCommand, AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     interaction::Bridge,
     provider::{Provider, ProviderEventStream},
@@ -212,6 +215,7 @@ pub struct Agent<P> {
     auto_compact_token_limit: usize,
     compact_available: bool,
     tool_summary_turn_interval: NonZeroUsize,
+    archive_dir: PathBuf,
 }
 
 impl<P> Agent<P>
@@ -230,6 +234,7 @@ where
             compact_available: true,
             tool_summary_turn_interval: NonZeroUsize::new(DEFAULT_TOOL_SUMMARY_TURN_INTERVAL)
                 .expect("the default tool summary interval is non-zero"),
+            archive_dir: archive_dir(),
         }
     }
 
@@ -241,6 +246,12 @@ where
 
     pub fn with_tool_summary_turn_interval(&mut self, interval: NonZeroUsize) -> &mut Self {
         self.tool_summary_turn_interval = interval;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_archive_dir(&mut self, directory: impl Into<PathBuf>) -> &mut Self {
+        self.archive_dir = directory.into();
         self
     }
 
@@ -347,7 +358,8 @@ where
                 AgentCommand::Prompt(prompt) => {
                     let cancellation = CancellationToken::new();
                     let result = {
-                        let turn = self.continue_turn(prompt, cancellation.clone());
+                        let turn =
+                            self.continue_turn_with_persistence(prompt, cancellation.clone(), true);
                         tokio::pin!(turn);
 
                         loop {
@@ -736,7 +748,16 @@ where
         prompt: impl Into<String>,
         cancellation: CancellationToken,
     ) -> anyhow::Result<()> {
-        let prompt = prompt.into();
+        self.continue_turn_with_persistence(prompt.into(), cancellation, false)
+            .await
+    }
+
+    async fn continue_turn_with_persistence(
+        &mut self,
+        prompt: String,
+        cancellation: CancellationToken,
+        archive_after_turn: bool,
+    ) -> anyhow::Result<()> {
         let turn_id = Uuid::now_v7();
         let started = Instant::now();
         let span = tracing::info_span!("agent.turn", turn_id = %turn_id);
@@ -771,6 +792,10 @@ where
         }
         .instrument(span)
         .await;
+
+        if archive_after_turn {
+            self.save_session("turn_finished").await;
+        }
 
         // Only a turn that ran to a final answer is worth summarising; one that
         // failed already reported why.
@@ -824,7 +849,22 @@ where
             return Ok(());
         }
 
-        self.context.archive().await
+        self.context.archive_in(&self.archive_dir).await
+    }
+
+    async fn save_session(&mut self, trigger: &'static str) {
+        if let Err(error) = self.archive().await {
+            tracing::error!(
+                event = "agent.archive.failed",
+                operation = "autosave",
+                error_class = "archive_error",
+                trigger,
+                error = error.to_string(),
+            );
+            self.view_bus.broadcast(AgentViewEvent::Err(format!(
+                "Failed to save session: {error}"
+            )));
+        }
     }
 
     pub async fn run_command(&mut self, command: Command) -> anyhow::Result<()> {
@@ -891,7 +931,7 @@ where
     }
 
     pub async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {
-        let context = Context::resume(id).await?;
+        let context = Context::resume_in(&self.archive_dir, id.as_ref()).await?;
         self.context = context;
         Ok(self)
     }
@@ -1032,7 +1072,11 @@ where
                         Ok(signal) => signal,
                         Err(error) => {
                             self.settle_request(metrics);
-                            return Err(error);
+                            return Ok(RequestAttempt::Retry {
+                                error,
+                                error_class: "provider_event_error",
+                                had_output,
+                            });
                         }
                     };
                     let completed = matches!(&signal, ProviderSignal::Completed { .. });
@@ -1126,6 +1170,9 @@ where
                         self.view_bus.broadcast(AgentViewEvent::Completed);
                     }
 
+                    self.view_bus
+                        .broadcast(AgentViewEvent::Err(error.to_string()));
+
                     if attempt == STREAM_MAX_ATTEMPTS {
                         tracing::error!(
                             event = "agent.provider_request.exhausted",
@@ -1135,8 +1182,6 @@ where
                             error = error.to_string(),
                             duration_ms = request_started.elapsed().as_millis() as u64
                         );
-                        self.view_bus
-                            .broadcast(AgentViewEvent::Err(error.to_string()));
 
                         return Err(error);
                     }
@@ -1171,6 +1216,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        fs as std_fs,
+        path::PathBuf,
         pin::Pin,
         sync::{
             Arc, Mutex,
@@ -1196,6 +1243,25 @@ mod tests {
 
     fn cancellation() -> CancellationToken {
         CancellationToken::new()
+    }
+
+    struct TempArchive {
+        path: PathBuf,
+    }
+
+    impl TempArchive {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("h-agent-archive-{}", Uuid::new_v4()));
+            std_fs::create_dir_all(&path).unwrap();
+
+            Self { path }
+        }
+    }
+
+    impl Drop for TempArchive {
+        fn drop(&mut self) {
+            let _ = std_fs::remove_dir_all(&self.path);
+        }
     }
 
     fn completed(reason: CompletedReason) -> ProviderSignal {
@@ -1717,6 +1783,15 @@ mod tests {
         })
     }
 
+    fn error_messages(events: &mut UnboundedReceiver<AgentViewEvent>) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentViewEvent::Err(message) => Some(message),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn receive_turn_finished(events: &mut UnboundedReceiver<AgentViewEvent>) -> bool {
         loop {
             match events.recv().await {
@@ -1729,6 +1804,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_loop_executes_a_prompt_to_completion() {
+        let archive = TempArchive::new();
         let mut agent = Agent::new(SignalProvider::new(
             [vec![
                 ProviderSignal::TextDelta("hello".to_owned()),
@@ -1736,6 +1812,8 @@ mod tests {
             ]],
             text_bytes,
         ));
+        agent.with_archive_dir(&archive.path);
+        let (archive_path, session_id) = (archive.path.clone(), agent.context.id());
         let mut events = agent.subscribe_view();
         let (commands, receiver) = tokio::sync::mpsc::channel(1);
 
@@ -1747,6 +1825,7 @@ mod tests {
                 .unwrap();
 
             assert!(receive_turn_finished(&mut events).await);
+            assert!(archive_path.join(format!("{session_id}.archive")).is_file());
             drop(commands);
         };
 
@@ -1756,8 +1835,12 @@ mod tests {
         .await
         .expect("the command loop should finish after its sender closes");
 
+        let saved = Context::resume_in(&archive.path, &agent.context.id())
+            .await
+            .unwrap();
+
         assert!(matches!(
-            agent.context.histories(),
+            saved.histories(),
             [Message::User(prompt), Message::Assistant(answer)]
                 if prompt == "say hello" && answer == "hello"
         ));
@@ -1765,6 +1848,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_loop_preserves_queued_prompt_order() {
+        let archive = TempArchive::new();
         let mut agent = Agent::new(SignalProvider::new(
             [
                 vec![
@@ -1778,6 +1862,7 @@ mod tests {
             ],
             text_bytes,
         ));
+        agent.with_archive_dir(&archive.path);
         let mut events = agent.subscribe_view();
         let (commands, receiver) = tokio::sync::mpsc::channel(2);
 
@@ -1819,11 +1904,13 @@ mod tests {
 
     #[tokio::test]
     async fn command_loop_cancels_the_active_turn() {
+        let archive = TempArchive::new();
         let (polled, dropped) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
         let mut agent = Agent::new(PendingStreamProvider {
             polled: polled.clone(),
             dropped: dropped.clone(),
         });
+        agent.with_archive_dir(&archive.path);
         let mut events = agent.subscribe_view();
         let (commands, receiver) = tokio::sync::mpsc::channel(1);
 
@@ -1847,17 +1934,23 @@ mod tests {
         .await
         .expect("cancellation should stop the active turn");
 
+        let saved = Context::resume_in(&archive.path, &agent.context.id())
+            .await
+            .unwrap();
+
         assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(agent.prompts(), ["wait forever"]);
+        assert_eq!(saved.prompts(), ["wait forever"]);
     }
 
     #[tokio::test]
     async fn closing_the_command_channel_cancels_the_active_turn() {
+        let archive = TempArchive::new();
         let (polled, dropped) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
         let mut agent = Agent::new(PendingStreamProvider {
             polled: polled.clone(),
             dropped: dropped.clone(),
         });
+        agent.with_archive_dir(&archive.path);
         let mut events = agent.subscribe_view();
         let (commands, receiver) = tokio::sync::mpsc::channel(1);
 
@@ -1880,8 +1973,49 @@ mod tests {
         .await
         .expect("closing the command channel should stop the worker");
 
+        let saved = Context::resume_in(&archive.path, &agent.context.id())
+            .await
+            .unwrap();
+
         assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(agent.prompts(), ["wait forever"]);
+        assert_eq!(saved.prompts(), ["wait forever"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_loop_archives_a_turn_that_ends_with_an_error() {
+        let archive = TempArchive::new();
+        let mut agent = Agent::new(FlakyProvider::new(
+            FailurePoint::Open,
+            STREAM_MAX_ATTEMPTS as usize,
+        ));
+        agent.with_archive_dir(&archive.path);
+        let (archive_path, session_id) = (archive.path.clone(), agent.context.id());
+        let mut events = agent.subscribe_view();
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+
+        let run = agent.run(receiver);
+        let drive = async move {
+            commands
+                .send(AgentCommand::Prompt("save this prompt".to_owned()))
+                .await
+                .unwrap();
+
+            assert!(!receive_turn_finished(&mut events).await);
+            assert!(archive_path.join(format!("{session_id}.archive")).is_file());
+            drop(commands);
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(run, drive);
+        })
+        .await
+        .expect("a failed turn should still reach its archive boundary");
+
+        let saved = Context::resume_in(&archive.path, &agent.context.id())
+            .await
+            .unwrap();
+
+        assert_eq!(saved.prompts(), ["save this prompt"]);
     }
 
     fn seed_read_summary<P: Provider>(agent: &mut Agent<P>) {
@@ -2726,6 +2860,7 @@ mod tests {
         Open,
         Stream,
         Eof,
+        Handle,
     }
 
     /// Fails a provider request at one point a set number of times before
@@ -2767,6 +2902,12 @@ mod tests {
         }
 
         async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+            if matches!(self.point, FailurePoint::Handle)
+                && matches!(&event, ProviderSignal::Unsupported)
+            {
+                anyhow::bail!("provider response error");
+            }
+
             Ok(event)
         }
 
@@ -2791,6 +2932,9 @@ mod tests {
                         Err(anyhow::anyhow!("stream reset by peer"))
                     }))),
                     FailurePoint::Eof => Ok(Box::pin(stream::empty())),
+                    FailurePoint::Handle => Ok(Box::pin(stream::once(async {
+                        Ok(ProviderSignal::Unsupported)
+                    }))),
                 };
             }
 
@@ -2858,6 +3002,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_transient_failure_is_retried_until_the_stream_opens() {
         let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Open, 2));
+        let mut events = agent.subscribe_view();
         let started = tokio::time::Instant::now();
 
         agent
@@ -2870,11 +3015,16 @@ mod tests {
             Duration::from_millis(450),
             "waited 150ms then 300ms"
         );
+        assert_eq!(
+            error_messages(&mut events),
+            vec!["connection reset by peer", "connection reset by peer"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_stream_that_never_opens_gives_up_after_the_last_attempt() {
         let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Open, usize::MAX));
+        let mut events = agent.subscribe_view();
         let started = tokio::time::Instant::now();
 
         assert!(
@@ -2888,6 +3038,10 @@ mod tests {
             started.elapsed(),
             Duration::from_millis(1050),
             "waited 150ms, 300ms, 600ms, then stopped"
+        );
+        assert_eq!(
+            error_messages(&mut events),
+            vec!["connection reset by peer"; STREAM_MAX_ATTEMPTS as usize]
         );
     }
 
@@ -2907,6 +3061,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stream_error_is_retried() {
         let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Stream, 1));
+        let mut events = agent.subscribe_view();
         let started = tokio::time::Instant::now();
 
         agent
@@ -2916,11 +3071,13 @@ mod tests {
 
         assert_eq!(agent.provider.attempts(), 2);
         assert_eq!(started.elapsed(), Duration::from_millis(150));
+        assert_eq!(error_messages(&mut events), vec!["stream reset by peer"]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_premature_eof_is_retried() {
         let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Eof, 1));
+        let mut events = agent.subscribe_view();
         let started = tokio::time::Instant::now();
 
         agent
@@ -2930,6 +3087,26 @@ mod tests {
 
         assert_eq!(agent.provider.attempts(), 2);
         assert_eq!(started.elapsed(), Duration::from_millis(150));
+        assert_eq!(
+            error_messages(&mut events),
+            vec!["provider stream ended before response.completed"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_event_error_is_broadcast_and_retried() {
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Handle, 1));
+        let mut events = agent.subscribe_view();
+        let started = tokio::time::Instant::now();
+
+        agent
+            .continue_turn("retry a provider event error", cancellation())
+            .await
+            .unwrap();
+
+        assert_eq!(agent.provider.attempts(), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+        assert_eq!(error_messages(&mut events), vec!["provider response error"]);
     }
 
     #[tokio::test(start_paused = true)]

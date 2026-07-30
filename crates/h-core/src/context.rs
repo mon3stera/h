@@ -17,8 +17,8 @@ use gix::{
 use serde::{Deserialize, Serialize};
 use shellexpand::tilde;
 use tokio::{
-    fs::{self, File},
-    io::AsyncReadExt,
+    fs::{self, File, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
 };
 use uuid::Uuid;
 
@@ -655,6 +655,67 @@ fn meta_path_in(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.{META_EXTENSION}"))
 }
 
+fn temporary_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("archive path has no file name: {}", path.display()))?;
+    let temporary_name = format!(".{}.{}.tmp", file_name.to_string_lossy(), Uuid::new_v4());
+
+    Ok(path.with_file_name(temporary_name))
+}
+
+#[cfg(unix)]
+async fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path).await?.sync_all().await
+}
+
+#[cfg(not(unix))]
+async fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+async fn write_atomic(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("archive path has no parent: {}", path.display()))?;
+    let temporary = temporary_path(path)?;
+
+    let result: anyhow::Result<()> = async {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+
+        file.write_all(content).await?;
+        file.sync_all().await?;
+        drop(file);
+
+        fs::rename(&temporary, path).await?;
+        sync_directory(parent).await?;
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        match fs::remove_file(&temporary).await {
+            Ok(()) => {}
+            Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => tracing::warn!(
+                event = "context.archive.temporary_cleanup_failed",
+                path = %temporary.display(),
+                error = cleanup_error.to_string(),
+            ),
+        }
+
+        return Err(error)
+            .with_context(|| format!("failed to atomically write {}", path.display()));
+    }
+
+    Ok(())
+}
+
 const TITLE_CHARS: usize = 60;
 
 fn summarize(prompt: &str) -> String {
@@ -702,23 +763,28 @@ impl Context {
         self.archive_in(&archive_dir()).await
     }
 
-    async fn archive_in(&self, dir: &Path) -> anyhow::Result<()> {
+    pub(crate) async fn archive_in(&self, dir: &Path) -> anyhow::Result<()> {
         // Archiving is the one path that must not fail for want of a directory,
         // and creating it is idempotent.
         fs::create_dir_all(dir).await?;
 
+        let (histories, metadata) = (
+            serde_json::to_vec(&self.to_persist_histories())?,
+            serde_json::to_vec(&self.to_meta())?,
+        );
+        let (histories_path, metadata_path) =
+            (archive_path_in(dir, &self.id), meta_path_in(dir, &self.id));
+
         // Histories first: metadata must never advertise a session whose
         // conversation has not landed yet.
-        fs::write(
-            archive_path_in(dir, &self.id),
-            serde_json::to_vec(&self.to_persist_histories())?,
-        )
-        .await?;
-        fs::write(
-            meta_path_in(dir, &self.id),
-            serde_json::to_vec(&self.to_meta())?,
-        )
-        .await?;
+        write_atomic(&histories_path, &histories).await?;
+        write_atomic(&metadata_path, &metadata).await?;
+
+        tracing::info!(
+            event = "context.archive.saved",
+            session_id = self.id,
+            message_count = self.histories.len(),
+        );
 
         Ok(())
     }
@@ -727,7 +793,7 @@ impl Context {
         Self::resume_in(&archive_dir(), id.as_ref()).await
     }
 
-    async fn resume_in(dir: &Path, id: &str) -> anyhow::Result<Self> {
+    pub(crate) async fn resume_in(dir: &Path, id: &str) -> anyhow::Result<Self> {
         let path = archive_path_in(dir, id);
         let content = fs::read_to_string(&path)
             .await
@@ -961,6 +1027,37 @@ mod tests {
             ),
             "unexpected histories: {:?}",
             resumed.histories.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn rearchiving_replaces_the_session_without_leaving_temporary_files() {
+        let archive = TempArchive::new();
+        let mut context = context_with_prompt("session-1", "first prompt");
+
+        context.archive_in(&archive.path).await.unwrap();
+        context
+            .histories_mut()
+            .push(Message::Assistant("first answer".to_owned()));
+        context.archive_in(&archive.path).await.unwrap();
+
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+        let entries = std_fs::read_dir(&archive.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            resumed.histories(),
+            [Message::User(prompt), Message::Assistant(answer)]
+                if prompt == "first prompt" && answer == "first answer"
+        ));
+        assert!(
+            entries
+                .iter()
+                .all(|name| !name.to_string_lossy().ends_with(".tmp"))
         );
     }
 

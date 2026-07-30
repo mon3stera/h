@@ -41,6 +41,8 @@ fn final_response(events: &mut UnboundedReceiver<AgentEvent>) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
+        path::PathBuf,
         pin::Pin,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -56,6 +58,25 @@ mod tests {
 
     struct TwoRoundProvider {
         requests: AtomicUsize,
+    }
+
+    struct TempArchive {
+        path: PathBuf,
+    }
+
+    impl TempArchive {
+        fn new() -> Self {
+            Self {
+                path: std::env::temp_dir()
+                    .join(format!("h-headless-archive-{}", uuid::Uuid::new_v4())),
+            }
+        }
+    }
+
+    impl Drop for TempArchive {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     #[async_trait::async_trait]
@@ -117,5 +138,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(response, "The available tools are ...");
+    }
+
+    #[tokio::test]
+    async fn a_headless_turn_does_not_create_an_archive() {
+        let archive = TempArchive::new();
+        let provider = TwoRoundProvider {
+            requests: AtomicUsize::new(0),
+        };
+        let mut agent = Agent::new(provider);
+        agent.with_archive_dir(&archive.path);
+
+        run(agent, "What tools can you use?".to_owned())
+            .await
+            .unwrap();
+
+        assert!(!archive.path.exists());
     }
 }
