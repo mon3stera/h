@@ -615,7 +615,7 @@ fn bash_presenter_presents_running_command() {
 }
 
 #[test]
-fn bash_presenter_separates_blocking_output_streams() {
+fn bash_presenter_renders_combined_blocking_output() {
     let call = call(
         "bash",
         json!({
@@ -626,8 +626,7 @@ fn bash_presenter_separates_blocking_output_streams() {
     let result = ToolCallResult::success(
         call.id.clone(),
         serde_json::to_value(BashToolOutput::RanBlocking {
-            stdout: "\u{1b}[32mok\u{1b}[0m\n".to_owned(),
-            stderr: "warning\n".to_owned(),
+            output: "\u{1b}[32mok\u{1b}[0m\nwarning\n".to_owned(),
             exit_code: Some(0),
             signal: None,
         })
@@ -641,33 +640,16 @@ fn bash_presenter_separates_blocking_output_streams() {
         &presentation.blocks[..],
         [
             DisplayBlock::Summary(summary),
-            DisplayBlock::KeyValue { entries },
-            DisplayBlock::Summary(stdout_label),
             DisplayBlock::CodeBlock {
                 language: Some(language),
-                content: stdout,
-                truncated_lines: 1,
-                show_line_numbers: false,
-                start_line_number: 1,
-            },
-            DisplayBlock::Summary(stderr_label),
-            DisplayBlock::CodeBlock {
-                language: Some(stderr_language),
-                content: stderr,
-                truncated_lines: 1,
+                content: output,
+                truncated_lines: 2,
                 show_line_numbers: false,
                 start_line_number: 1,
             },
         ] if summary == "Command completed"
-            && entries.len() == 1
-            && entries[0].key == "exit_code"
-            && entries[0].value == "0"
-            && stdout_label == "stdout"
             && language == "console"
-            && stdout == "ok"
-            && stderr_label == "stderr"
-            && stderr_language == "console"
-            && stderr == "warning"
+            && output == "ok\nwarning"
     ));
 }
 
@@ -683,8 +665,7 @@ fn bash_presenter_keeps_two_head_and_tail_lines() {
     let result = ToolCallResult::success(
         call.id.clone(),
         serde_json::to_value(BashToolOutput::RanBlocking {
-            stdout: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n".to_owned(),
-            stderr: String::new(),
+            output: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n".to_owned(),
             exit_code: Some(0),
             signal: None,
         })
@@ -694,7 +675,7 @@ fn bash_presenter_keeps_two_head_and_tail_lines() {
     let presentation = BashPresenter.completed(&call, &result);
 
     assert!(matches!(
-        &presentation.blocks[3],
+        &presentation.blocks[1],
         DisplayBlock::CodeBlock {
             content,
             truncated_lines: 5,
@@ -715,8 +696,7 @@ fn bash_presenter_keeps_four_lines_without_an_omission_marker() {
     let result = ToolCallResult::success(
         call.id.clone(),
         serde_json::to_value(BashToolOutput::RanBlocking {
-            stdout: "one\ntwo\nthree\nfour\n".to_owned(),
-            stderr: String::new(),
+            output: "one\ntwo\nthree\nfour\n".to_owned(),
             exit_code: Some(0),
             signal: None,
         })
@@ -726,7 +706,7 @@ fn bash_presenter_keeps_four_lines_without_an_omission_marker() {
     let presentation = BashPresenter.completed(&call, &result);
 
     assert!(matches!(
-        &presentation.blocks[3],
+        &presentation.blocks[1],
         DisplayBlock::CodeBlock {
             content,
             truncated_lines: 4,
@@ -747,8 +727,7 @@ fn bash_presenter_surfaces_a_terminating_signal_without_output() {
     let result = ToolCallResult::success(
         call.id.clone(),
         serde_json::to_value(BashToolOutput::RanBlocking {
-            stdout: String::new(),
-            stderr: String::new(),
+            output: String::new(),
             exit_code: None,
             signal: Some(15),
         })

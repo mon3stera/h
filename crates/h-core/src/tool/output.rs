@@ -17,27 +17,6 @@ impl Limits {
         lines: MAX_OUTPUT_LINES,
         chars: MAX_OUTPUT_CHARS,
     };
-
-    pub(super) fn split(left: &str, right: &str) -> (Self, Self) {
-        let (left_lines, right_lines) =
-            split_limit(MAX_OUTPUT_LINES, line_count(left), line_count(right));
-        let (left_chars, right_chars) = split_limit(
-            MAX_OUTPUT_CHARS,
-            left.chars().count(),
-            right.chars().count(),
-        );
-
-        (
-            Self {
-                lines: left_lines,
-                chars: left_chars,
-            },
-            Self {
-                lines: right_lines,
-                chars: right_chars,
-            },
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -150,27 +129,6 @@ fn line_count(content: &str) -> usize {
         content.bytes().filter(|byte| *byte == b'\n').count()
             + usize::from(!content.ends_with('\n'))
     }
-}
-
-fn split_limit(total: usize, left_need: usize, right_need: usize) -> (usize, usize) {
-    if left_need == 0 {
-        return (0, total.min(right_need));
-    }
-    if right_need == 0 {
-        return (total.min(left_need), 0);
-    }
-
-    let (mut left, mut right) = (total.div_ceil(2), total / 2);
-    if left_need < left {
-        right = right.saturating_add(left - left_need);
-        left = left_need;
-    }
-    if right_need < right {
-        left = left.saturating_add(right - right_need).min(left_need);
-        right = right_need;
-    }
-
-    (left, right)
 }
 
 fn prefix_end(content: &str, max_lines: usize, max_chars: usize) -> usize {
@@ -299,15 +257,5 @@ mod tests {
 
         assert!(preview.content.contains("lines 3-98 omitted"));
         assert!(!preview.content.contains("contain omitted content"));
-    }
-
-    #[test]
-    fn paired_outputs_share_the_global_budget() {
-        let left = "a".repeat(MAX_OUTPUT_CHARS);
-        let right = "b".repeat(MAX_OUTPUT_CHARS);
-        let (left_limits, right_limits) = Limits::split(&left, &right);
-
-        assert_eq!(left_limits.chars + right_limits.chars, MAX_OUTPUT_CHARS);
-        assert_eq!(left_limits.lines + right_limits.lines, 2);
     }
 }

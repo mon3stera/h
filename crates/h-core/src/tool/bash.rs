@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
-    process::{Command as StdCommand, Output, Stdio},
+    process::{Command as StdCommand, ExitStatus, Output, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -26,6 +26,7 @@ use serde_json::Value;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    net::unix::pipe,
     process::Command,
     sync::Mutex as AsyncMutex,
     time::{sleep, timeout},
@@ -974,42 +975,50 @@ async fn run_blocking(command: String, brief: bool) -> anyhow::Result<BashToolOu
         anyhow::bail!("Empty command");
     }
 
-    let mut process = Command::new("bash");
-    process.arg("-c").arg(&command).kill_on_drop(true);
+    let (status, output) = capture_output(&command).await?;
+    let exit_code = status.code();
+    let signal = status.signal();
 
-    let output = process.output().await?;
-    let exit_code = output.status.code();
-    let signal = output.status.signal();
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    );
-
-    if brief && output.status.success() {
-        let (stdout_path, stderr_path) =
-            tokio::try_join!(save(&stdout, "bash-stdout"), save(&stderr, "bash-stderr"),)?;
+    if brief && status.success() {
+        let output_path = save(&output, "bash-output").await?;
         let command = truncate_chars(&command, MAX_FIELD_CHARS);
 
         return Ok(BashToolOutput::Succeeded {
-            summary: format!("Command {command:?} succeeded with exit code 0."),
+            summary: format!("Command {command:?} succeeded."),
             exit_code: 0,
-            stdout_path,
-            stderr_path,
+            output_path,
         });
     }
 
-    let (stdout_limits, stderr_limits) = Limits::split(&stdout, &stderr);
-    let (stdout, stderr) = tokio::try_join!(
-        save_and_preview(&stdout, "bash-stdout", stdout_limits),
-        save_and_preview(&stderr, "bash-stderr", stderr_limits),
-    )?;
+    let output = save_and_preview(&output, "bash-output", Limits::DEFAULT).await?;
 
     Ok(BashToolOutput::RanBlocking {
-        stdout: stdout.content,
-        stderr: stderr.content,
+        output: output.content,
         exit_code,
         signal,
     })
+}
+
+async fn capture_output(command: &str) -> anyhow::Result<(ExitStatus, String)> {
+    let (writer, mut reader) = pipe::pipe()?;
+    let writer = writer.into_blocking_fd()?;
+    let stderr = writer.try_clone()?;
+
+    let mut process = Command::new("bash");
+    process
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(true);
+
+    let mut child = process.spawn()?;
+    drop(process);
+
+    let mut output = Vec::new();
+    let (status, _) = tokio::try_join!(child.wait(), reader.read_to_end(&mut output))?;
+
+    Ok((status, String::from_utf8_lossy(&output).into_owned()))
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -1104,13 +1113,10 @@ pub enum BashToolOutput {
         summary: String,
         exit_code: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
-        stdout_path: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stderr_path: Option<String>,
+        output_path: Option<String>,
     },
     RanBlocking {
-        stdout: String,
-        stderr: String,
+        output: String,
         #[serde(default)]
         exit_code: Option<i32>,
         #[serde(default)]
@@ -1239,14 +1245,9 @@ impl BashPresenter {
         })
     }
 
-    fn command_blocks(
-        stdout: &str,
-        stderr: &str,
-        exit_code: Option<i32>,
-        signal: Option<i32>,
-    ) -> Vec<DisplayBlock> {
-        let (stdout, stderr) = (Self::terminal_block(stdout), Self::terminal_block(stderr));
-        let summary = if stdout.is_none() && stderr.is_none() {
+    fn command_blocks(output: &str, signal: Option<i32>) -> Vec<DisplayBlock> {
+        let output = Self::terminal_block(output);
+        let summary = if output.is_none() {
             "Command completed with no output"
         } else {
             "Command completed"
@@ -1254,12 +1255,6 @@ impl BashPresenter {
         let mut blocks = vec![DisplayBlock::Summary(summary.to_owned())];
         let mut status = Vec::new();
 
-        if let Some(exit_code) = exit_code {
-            status.push(KeyValueEntry {
-                key: "exit_code".to_owned(),
-                value: exit_code.to_string(),
-            });
-        }
         if let Some(signal) = signal {
             status.push(KeyValueEntry {
                 key: "signal".to_owned(),
@@ -1270,14 +1265,8 @@ impl BashPresenter {
             blocks.push(DisplayBlock::KeyValue { entries: status });
         }
 
-        if let Some(stdout) = stdout {
-            blocks.push(DisplayBlock::Summary("stdout".to_owned()));
-            blocks.push(stdout);
-        }
-
-        if let Some(stderr) = stderr {
-            blocks.push(DisplayBlock::Summary("stderr".to_owned()));
-            blocks.push(stderr);
+        if let Some(output) = output {
+            blocks.push(output);
         }
 
         blocks
@@ -1339,46 +1328,26 @@ impl BashPresenter {
             ),
             BashToolOutput::Succeeded {
                 summary,
-                exit_code,
-                stdout_path,
-                stderr_path,
+                output_path,
+                ..
             } => {
-                let mut entries = vec![KeyValueEntry {
-                    key: "exit_code".to_owned(),
-                    value: exit_code.to_string(),
-                }];
+                let mut blocks = vec![DisplayBlock::Summary(summary)];
 
-                if let Some(path) = stdout_path {
-                    entries.push(KeyValueEntry {
-                        key: "stdout_path".to_owned(),
-                        value: path,
-                    });
-                }
-                if let Some(path) = stderr_path {
-                    entries.push(KeyValueEntry {
-                        key: "stderr_path".to_owned(),
-                        value: path,
+                if let Some(path) = output_path {
+                    blocks.push(DisplayBlock::KeyValue {
+                        entries: vec![KeyValueEntry {
+                            key: "output_path".to_owned(),
+                            value: path,
+                        }],
                     });
                 }
 
-                Self::presentation(
-                    call,
-                    ToolCallStatus::Succeeded,
-                    vec![
-                        DisplayBlock::Summary(summary),
-                        DisplayBlock::KeyValue { entries },
-                    ],
-                )
+                Self::presentation(call, ToolCallStatus::Succeeded, blocks)
             }
-            BashToolOutput::RanBlocking {
-                stdout,
-                stderr,
-                exit_code,
-                signal,
-            } => Self::presentation(
+            BashToolOutput::RanBlocking { output, signal, .. } => Self::presentation(
                 call,
                 ToolCallStatus::Succeeded,
-                Self::command_blocks(&stdout, &stderr, exit_code, signal),
+                Self::command_blocks(&output, signal),
             ),
             BashToolOutput::Spawned { session_id } => Self::presentation(
                 call,
@@ -1467,14 +1436,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn brief_success_keeps_output_in_files() {
+    async fn brief_success_keeps_output_in_file() {
         let result = run_blocking("printf stdout; printf stderr >&2".to_owned(), true)
             .await
             .unwrap();
         let BashToolOutput::Succeeded {
             summary,
-            stdout_path: Some(stdout_path),
-            stderr_path: Some(stderr_path),
+            output_path: Some(output_path),
             ..
         } = result
         else {
@@ -1483,13 +1451,29 @@ mod tests {
 
         assert_eq!(
             summary,
-            "Command \"printf stdout; printf stderr >&2\" succeeded with exit code 0."
+            "Command \"printf stdout; printf stderr >&2\" succeeded."
         );
-        assert_eq!(fs::read_to_string(&stdout_path).await.unwrap(), "stdout");
-        assert_eq!(fs::read_to_string(&stderr_path).await.unwrap(), "stderr");
+        assert_eq!(
+            fs::read_to_string(&output_path).await.unwrap(),
+            "stdoutstderr"
+        );
 
-        fs::remove_file(stdout_path).await.unwrap();
-        fs::remove_file(stderr_path).await.unwrap();
+        fs::remove_file(output_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_preserves_output_order() {
+        let command = "printf out1; printf err1 >&2; printf out2; printf err2 >&2";
+        let result = run_blocking(command.to_owned(), false).await.unwrap();
+
+        assert!(matches!(
+            result,
+            BashToolOutput::RanBlocking {
+                ref output,
+                exit_code: Some(0),
+                signal: None,
+            } if output == "out1err1out2err2"
+        ));
     }
 
     #[tokio::test]
@@ -1501,10 +1485,10 @@ mod tests {
         assert!(matches!(
             result,
             BashToolOutput::RanBlocking {
-                ref stdout,
+                ref output,
                 exit_code: Some(7),
                 ..
-            } if stdout == "failure"
+            } if output == "failure"
         ));
     }
 
@@ -1513,21 +1497,19 @@ mod tests {
         let command = "i=0; while [ \"$i\" -lt 3000 ]; do printf x; i=$((i + 1)); done";
         let result = run_blocking(command.to_owned(), false).await.unwrap();
         let BashToolOutput::RanBlocking {
-            stdout,
-            stderr,
+            output,
             exit_code: Some(0),
             signal: None,
         } = result
         else {
             panic!("expected a successful blocking result");
         };
-        let output_path = stdout
+        let output_path = output
             .lines()
             .find_map(|line| line.strip_prefix("Full output: "))
             .unwrap();
 
-        assert!(stderr.is_empty());
-        assert!(stdout.contains("bytes omitted"));
+        assert!(output.contains("bytes omitted"));
         assert_eq!(
             fs::read_to_string(output_path).await.unwrap(),
             "x".repeat(3_000)
@@ -1543,18 +1525,16 @@ mod tests {
         assert!(matches!(
             result,
             BashToolOutput::RanBlocking {
-                ref stdout,
-                ref stderr,
+                ref output,
                 exit_code: Some(7),
                 signal: None,
-            } if stdout.is_empty() && stderr.is_empty()
+            } if output.is_empty()
         ));
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             serde_json::json!({
                 "RanBlocking": {
-                    "stdout": "",
-                    "stderr": "",
+                    "output": "",
                     "exit_code": 7,
                     "signal": null,
                 }
@@ -1571,18 +1551,16 @@ mod tests {
         assert!(matches!(
             result,
             BashToolOutput::RanBlocking {
-                ref stdout,
-                ref stderr,
+                ref output,
                 exit_code: None,
                 signal: Some(15),
-            } if stdout.is_empty() && stderr.is_empty()
+            } if output.is_empty()
         ));
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             serde_json::json!({
                 "RanBlocking": {
-                    "stdout": "",
-                    "stderr": "",
+                    "output": "",
                     "exit_code": null,
                     "signal": 15,
                 }
