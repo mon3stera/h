@@ -156,6 +156,7 @@ async fn build_agent(
         }
         None => {
             agent
+                .with_harness_prompt()
                 .with_global_prompts()
                 .await?
                 .with_skills()

@@ -24,10 +24,14 @@ use uuid::Uuid;
 
 use crate::{
     provider::Compaction,
-    tool::{Aggregator, Summary, ToolRegistry},
+    tool::{Summary, ToolRegistry},
 };
 
 pub const DEFAULT_TOOL_SUMMARY_TURN_INTERVAL: usize = 8;
+
+const HARNESS_PROMPT: &str = "You are h, a coding agent.\n\n\
+When multiple tool calls are independent, call them in parallel. Prefer parallel tool calls whenever \
+possible, but preserve sequential execution when one call depends on the result of another.";
 
 #[async_trait::async_trait]
 pub trait WorkspaceInfo: Send + Sync {
@@ -186,6 +190,9 @@ pub enum Message {
     System(String),
     User(String),
     Assistant(String),
+    /// Opaque provider-native reasoning item. Only the originating provider is
+    /// expected to deserialize and replay these bytes.
+    Reasoning(Vec<u8>),
     Compaction(Compaction),
     ToolCallResult {
         call_id: String,
@@ -214,15 +221,15 @@ pub struct Context {
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct ToolCompaction {
-    frozen_runs: Vec<FrozenToolRun>,
+    #[serde(default)]
+    frozen_outputs: Vec<FrozenOutput>,
     compacted_until: usize,
     completed_turns: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct FrozenToolRun {
-    start: usize,
-    end: usize,
+struct FrozenOutput {
+    index: usize,
     content: String,
 }
 
@@ -235,43 +242,6 @@ struct PersistHistories {
     token_count: Option<usize>,
     #[serde(default)]
     tool_compaction: ToolCompaction,
-}
-
-struct PendingToolRun {
-    start: usize,
-    end: usize,
-    aggregators: Vec<(String, Box<dyn Aggregator>)>,
-}
-
-impl PendingToolRun {
-    fn new(start: usize, end: usize, name: &str, aggregator: Box<dyn Aggregator>) -> Self {
-        Self {
-            start,
-            end,
-            aggregators: vec![(name.to_owned(), aggregator)],
-        }
-    }
-
-    fn aggregator_mut(&mut self, name: &str) -> Option<&mut Box<dyn Aggregator>> {
-        self.aggregators
-            .iter_mut()
-            .find(|(known, _)| known == name)
-            .map(|(_, aggregator)| aggregator)
-    }
-
-    fn finish(self) -> FrozenToolRun {
-        let mut content = "Tool summary:".to_owned();
-
-        for (_, aggregator) in self.aggregators {
-            aggregator.finish(&mut content);
-        }
-
-        FrozenToolRun {
-            start: self.start,
-            end: self.end,
-            content,
-        }
-    }
 }
 
 /// The listing view of an archived session, stored in its own file so a session
@@ -287,6 +257,12 @@ pub struct SessionMeta {
 }
 
 impl Context {
+    pub fn inject_harness_prompt(&mut self) -> &mut Self {
+        self.histories_mut()
+            .push(Message::System(HARNESS_PROMPT.to_owned()));
+        self
+    }
+
     pub async fn inject_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
         let mut prompts = Vec::new();
         let mut total_bytes = 0_usize;
@@ -403,28 +379,21 @@ impl Context {
         self.token_count = count;
     }
 
-    /// Provider-facing projection. Frozen tool runs become compact assistant
-    /// messages, and the latest provider compaction replaces everything before
-    /// it except the leading system prefix.
+    /// Provider-facing projection. Frozen tool results retain their call
+    /// structure but use compact outputs, and the latest provider compaction
+    /// replaces everything before it except the leading system prefix.
     pub fn provider_messages(&self) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(self.histories.len());
-        let mut index = 0;
+        let mut messages = self.histories.clone();
 
-        for run in &self.tool_compaction.frozen_runs {
-            debug_assert!(run.start >= index);
-            debug_assert!(run.end > run.start);
-            debug_assert!(run.end <= self.histories.len());
-
-            if run.start < index || run.end <= run.start || run.end > self.histories.len() {
+        for frozen in &self.tool_compaction.frozen_outputs {
+            let Some(Message::ToolCallResult { output, .. }) = messages.get_mut(frozen.index)
+            else {
+                debug_assert!(false, "frozen output must reference a tool result");
                 continue;
-            }
+            };
 
-            messages.extend(self.histories[index..run.start].iter().cloned());
-            messages.push(Message::Assistant(run.content.clone()));
-            index = run.end;
+            output.clone_from(&frozen.content);
         }
-
-        messages.extend(self.histories[index..].iter().cloned());
 
         let Some(boundary) = messages
             .iter()
@@ -478,7 +447,7 @@ impl Context {
         };
     }
 
-    /// Records one completed Agent turn and periodically freezes old tool runs.
+    /// Records one completed Agent turn and periodically freezes old tool outputs.
     pub fn complete_turn(&mut self, interval: NonZeroUsize, tools: &ToolRegistry) {
         self.tool_compaction.completed_turns =
             self.tool_compaction.completed_turns.saturating_add(1);
@@ -488,22 +457,21 @@ impl Context {
         }
 
         self.tool_compaction.completed_turns = 0;
-        self.freeze_tool_runs(tools);
+        self.freeze_tool_outputs(tools);
     }
 
-    /// Immediately freezes every tool run that can be summarized.
-    pub fn summarize_tools(&mut self, tools: &ToolRegistry) -> bool {
+    /// Immediately freezes every successful tool output that can be compacted.
+    pub fn compact_tool_outputs(&mut self, tools: &ToolRegistry) -> bool {
         self.tool_compaction.completed_turns = 0;
-        self.freeze_tool_runs(tools)
+        self.freeze_tool_outputs(tools)
     }
 
-    fn freeze_tool_runs(&mut self, tools: &ToolRegistry) -> bool {
+    fn freeze_tool_outputs(&mut self, tools: &ToolRegistry) -> bool {
         let start = self
             .tool_compaction
             .compacted_until
             .min(self.histories.len());
-        let frozen_before = self.tool_compaction.frozen_runs.len();
-        let mut run: Option<PendingToolRun> = None;
+        let frozen_before = self.tool_compaction.frozen_outputs.len();
         let mut index = start;
 
         while index < self.histories.len() {
@@ -520,77 +488,39 @@ impl Context {
             };
 
             let Some((name, summary)) = pair else {
-                Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
                 index += 1;
                 continue;
             };
 
-            let pushed = if let Some(active) = run.as_mut() {
-                if let Some(aggregator) = active.aggregator_mut(name) {
-                    aggregator.push(summary)
-                } else if let Some(mut aggregator) = tools.aggregator(name) {
-                    let pushed = aggregator.push(summary);
-
-                    if pushed.is_ok() {
-                        active.aggregators.push((name.to_owned(), aggregator));
-                    }
-
-                    pushed
-                } else {
-                    Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
-                    index += 2;
-                    continue;
-                }
-            } else if let Some(mut aggregator) = tools.aggregator(name) {
-                let pushed = aggregator.push(summary);
-
-                if pushed.is_ok() {
-                    run = Some(PendingToolRun::new(index, index + 2, name, aggregator));
-                }
-
-                pushed
-            } else {
-                index += 2;
-                continue;
-            };
-
-            match pushed {
-                Ok(()) => {
-                    if let Some(active) = run.as_mut() {
-                        active.end = index + 2;
-                    }
-                }
+            match tools.compact(name, summary) {
+                Ok(Some(content)) => self.tool_compaction.frozen_outputs.push(FrozenOutput {
+                    index: index + 1,
+                    content,
+                }),
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
-                        event = "context.tool_summary.rejected",
+                        event = "context.tool_output.compaction_rejected",
                         tool_name = name,
                         history_index = index,
                         error = error.to_string(),
                     );
-                    Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
                 }
             }
 
             index += 2;
         }
 
-        Self::finish_pending_run(&mut run, &mut self.tool_compaction.frozen_runs);
         self.tool_compaction.compacted_until = self.histories.len();
 
         tracing::info!(
-            event = "context.tool_summary.frozen",
+            event = "context.tool_output.compacted",
             scan_start = start,
             scan_end = self.tool_compaction.compacted_until,
-            frozen_run_count = self.tool_compaction.frozen_runs.len(),
+            frozen_output_count = self.tool_compaction.frozen_outputs.len(),
         );
 
-        self.tool_compaction.frozen_runs.len() > frozen_before
-    }
-
-    fn finish_pending_run(run: &mut Option<PendingToolRun>, frozen_runs: &mut Vec<FrozenToolRun>) {
-        if let Some(run) = run.take() {
-            frozen_runs.push(run.finish());
-        }
+        self.tool_compaction.frozen_outputs.len() > frozen_before
     }
 
     /// The prompts the user sent, oldest first.
@@ -928,6 +858,12 @@ mod tests {
         Summary::new(1, json!({"path": path, "lines": lines}))
     }
 
+    fn compacted_output(name: &str, detail: &str) -> String {
+        format!(
+            "<tool-summary>Older tool output truncated. Tool {name:?} succeeded. {detail}</tool-summary>"
+        )
+    }
+
     fn compaction(id: &str) -> Compaction {
         Compaction::new(
             serde_json::to_vec(&json!([{
@@ -1132,11 +1068,16 @@ mod tests {
     }
 
     #[test]
-    fn provider_projection_combines_tool_kinds_in_first_seen_order() {
+    fn provider_projection_preserves_reasoning_and_each_tool_call_shell() {
         let tools = exploratory_tools();
         let mut context = Context::new();
+        let reasoning =
+            br#"{"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque"}"#
+                .to_vec();
+
         *context.histories_mut() = vec![
             Message::User("inspect the project".to_owned()),
+            Message::Reasoning(reasoning.clone()),
             tool_call("read-1", "read_file"),
             tool_result("read-1", read_summary("a.rs", 10)),
             tool_call("grep-1", "grep"),
@@ -1179,21 +1120,40 @@ mod tests {
             context.provider_messages().as_slice(),
             [
                 Message::User(prompt),
-                Message::Assistant(summary),
+                Message::Reasoning(projected_reasoning),
+                Message::ToolCall { call_id: read_1_call, name: read_1_name, .. },
+                Message::ToolCallResult { call_id: read_1_result, output: read_1_output, .. },
+                Message::ToolCall { call_id: grep_call, name: grep_name, .. },
+                Message::ToolCallResult { call_id: grep_result, output: grep_output, .. },
+                Message::ToolCall { call_id: fetch_call, name: fetch_name, .. },
+                Message::ToolCallResult { call_id: fetch_result, output: fetch_output, .. },
+                Message::ToolCall { call_id: read_2_call, name: read_2_name, .. },
+                Message::ToolCallResult { call_id: read_2_result, output: read_2_output, .. },
                 Message::Assistant(answer),
             ] if prompt == "inspect the project"
-                && summary == concat!(
-                    "Tool summary:\n",
-                    "- Read files: a.rs, b.rs; total_lines: 15\n",
-                    "- Grep paths: src; patterns: parse; returned_lines: 2\n",
-                    "- Fetched URLs: https://example.com/docs; total_lines: 20",
-                )
+                && projected_reasoning == &reasoning
+                && read_1_call == "read-1"
+                && read_1_result == read_1_call
+                && read_1_name == "read_file"
+                && read_1_output == &compacted_output("read_file", "Read 10 lines from \"a.rs\".")
+                && grep_call == "grep-1"
+                && grep_result == grep_call
+                && grep_name == "grep"
+                && grep_output == &compacted_output("grep", "Matched 2 lines in \"src\" for pattern \"parse\".")
+                && fetch_call == "fetch-1"
+                && fetch_result == fetch_call
+                && fetch_name == "fetch"
+                && fetch_output == &compacted_output("fetch", "Fetched 20 lines from \"https://example.com/docs\".")
+                && read_2_call == "read-2"
+                && read_2_result == read_2_call
+                && read_2_name == "read_file"
+                && read_2_output == &compacted_output("read_file", "Read 5 lines from \"b.rs\".")
                 && answer == "done"
         ));
     }
 
     #[test]
-    fn a_tool_without_an_aggregator_splits_frozen_runs() {
+    fn a_tool_without_compaction_keeps_its_original_result() {
         let tools = exploratory_tools();
         let mut context = Context::new();
         *context.histories_mut() = vec![
@@ -1211,13 +1171,22 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
-                Message::Assistant(first),
-                Message::ToolCall { name, .. },
-                Message::ToolCallResult { .. },
-                Message::Assistant(second),
-            ] if first == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+                Message::ToolCall { call_id: first_call, .. },
+                Message::ToolCallResult { call_id: first_result, output: first_output, .. },
+                Message::ToolCall { call_id: write_call, name, .. },
+                Message::ToolCallResult { call_id: write_result, output: write_output, .. },
+                Message::ToolCall { call_id: second_call, .. },
+                Message::ToolCallResult { call_id: second_result, output: second_output, .. },
+            ] if first_call == "read-1"
+                && first_result == first_call
+                && first_output == &compacted_output("read_file", "Read 10 lines from \"a.rs\".")
+                && write_call == "write-1"
+                && write_result == write_call
                 && name == "write_file"
-                && second == "Tool summary:\n- Read files: b.rs; total_lines: 5"
+                && write_output == "{}"
+                && second_call == "read-2"
+                && second_result == second_call
+                && second_output == &compacted_output("read_file", "Read 5 lines from \"b.rs\".")
         ));
     }
 
@@ -1242,18 +1211,26 @@ mod tests {
         assert!(matches!(
             context.provider_messages().as_slice(),
             [
-                Message::Assistant(first),
-                Message::ToolCall { call_id, .. },
-                Message::ToolCallResult { .. },
-                Message::Assistant(second),
-            ] if first == "Tool summary:\n- Read files: a.rs; total_lines: 10"
-                && call_id == "read-old"
-                && second == "Tool summary:\n- Read files: b.rs; total_lines: 5"
+                Message::ToolCall { call_id: first_call, .. },
+                Message::ToolCallResult { call_id: first_result, output: first_output, .. },
+                Message::ToolCall { call_id: old_call, .. },
+                Message::ToolCallResult { call_id: old_result, output: old_output, .. },
+                Message::ToolCall { call_id: second_call, .. },
+                Message::ToolCallResult { call_id: second_result, output: second_output, .. },
+            ] if first_call == "read-1"
+                && first_result == first_call
+                && first_output == &compacted_output("read_file", "Read 10 lines from \"a.rs\".")
+                && old_call == "read-old"
+                && old_result == old_call
+                && old_output == "{}"
+                && second_call == "read-2"
+                && second_result == second_call
+                && second_output == &compacted_output("read_file", "Read 5 lines from \"b.rs\".")
         ));
     }
 
     #[tokio::test]
-    async fn frozen_runs_and_the_completed_turn_counter_survive_resume() {
+    async fn frozen_outputs_and_the_completed_turn_counter_survive_resume() {
         let (archive, tools) = (TempArchive::new(), exploratory_tools());
         let mut context = Context::new();
         context.id = "session-1".to_owned();
@@ -1273,8 +1250,12 @@ mod tests {
         assert_eq!(resumed.histories().len(), 2);
         assert!(matches!(
             resumed.provider_messages().as_slice(),
-            [Message::Assistant(summary)]
-                if summary == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+            [
+                Message::ToolCall { call_id: call, .. },
+                Message::ToolCallResult { call_id: result, output, .. },
+            ] if call == "read-1"
+                && result == call
+                && output == &compacted_output("read_file", "Read 10 lines from \"a.rs\".")
         ));
 
         resumed.archive_in(&archive.path).await.unwrap();
@@ -1284,8 +1265,39 @@ mod tests {
 
         assert!(matches!(
             resumed_again.provider_messages().as_slice(),
-            [Message::Assistant(summary)]
-                if summary == "Tool summary:\n- Read files: a.rs; total_lines: 10"
+            [
+                Message::ToolCall { call_id: call, .. },
+                Message::ToolCallResult { call_id: result, output, .. },
+            ] if call == "read-1"
+                && result == call
+                && output == &compacted_output("read_file", "Read 10 lines from \"a.rs\".")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reasoning_items_survive_archive_and_resume_byte_for_byte() {
+        let archive = TempArchive::new();
+        let reasoning =
+            br#"{"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque"}"#
+                .to_vec();
+        let mut context = context_with_prompt("session-1", "inspect the project");
+
+        context
+            .histories_mut()
+            .push(Message::Reasoning(reasoning.clone()));
+        context.archive_in(&archive.path).await.unwrap();
+
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            resumed.histories(),
+            [Message::User(_), Message::Reasoning(item)] if item == &reasoning
+        ));
+        assert!(matches!(
+            resumed.provider_messages().as_slice(),
+            [Message::User(_), Message::Reasoning(item)] if item == &reasoning
         ));
     }
 
@@ -1391,6 +1403,21 @@ mod tests {
             context.histories(),
             [Message::System(global), Message::System(skills)]
                 if global == "global prompts" && skills == "<available_skills />"
+        ));
+    }
+
+    #[test]
+    fn harness_prompt_identifies_h_and_encourages_parallel_calls() {
+        let mut context = Context::new();
+
+        context.inject_harness_prompt();
+
+        assert!(matches!(
+            context.histories(),
+            [Message::System(prompt)]
+                if prompt.contains("You are h, a coding agent.")
+                    && prompt.contains("call them in parallel")
+                    && prompt.contains("one call depends on the result of another")
         ));
     }
 

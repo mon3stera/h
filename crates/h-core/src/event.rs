@@ -19,6 +19,7 @@ pub enum CompletedReason {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TextDelta(String),
+    Reasoning,
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolCallResult),
     Completed,
@@ -49,7 +50,8 @@ pub enum AgentViewEvent {
     /// A slash command finished, whether successfully or with an error already
     /// reported through [`Self::Err`].
     CommandFinished(Command),
-    /// Tool call/result pairs were replaced by deterministic tool summaries.
+    /// Older successful tool outputs were compacted without removing their
+    /// call/result structure.
     ToolResultsCompacted,
     /// Context compaction completed and replaced the previous context window.
     ContextCompacted,
@@ -65,6 +67,7 @@ pub enum AgentViewEvent {
 #[derive(Debug, Clone)]
 pub enum ProviderSignal {
     TextDelta(String),
+    Reasoning(Vec<u8>),
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolCallResult),
     Completed { reason: CompletedReason },
@@ -75,6 +78,7 @@ impl From<ProviderSignal> for AgentEvent {
     fn from(value: ProviderSignal) -> Self {
         match value {
             ProviderSignal::TextDelta(delta) => AgentEvent::TextDelta(delta),
+            ProviderSignal::Reasoning(_) => AgentEvent::Reasoning,
             ProviderSignal::ToolCallStarted(call) => AgentEvent::ToolCallStarted(call),
             ProviderSignal::ToolCallCompleted(result) => AgentEvent::ToolCallCompleted(result),
             ProviderSignal::Completed { .. } => AgentEvent::Completed,

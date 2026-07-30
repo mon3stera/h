@@ -136,6 +136,7 @@ struct ResponseRequest {
     tools: Vec<OpenAITool>,
     stream: bool,
     reasoning: Reasoning,
+    include: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -185,6 +186,7 @@ impl OpenAIProvider {
                     let items = serde_json::from_slice::<Vec<Value>>(compaction.state())?;
                     input.extend(items);
                 }
+                Message::Reasoning(item) => input.push(serde_json::from_slice(item)?),
                 message => input.push(serde_json::to_value(Self::input_item(message.clone()))?),
             }
         }
@@ -209,6 +211,9 @@ impl OpenAIProvider {
                 phase: None,
             }
             .into(),
+            Message::Reasoning(_) => {
+                unreachable!("reasoning items are expanded before item conversion")
+            }
             Message::ToolCall {
                 call_id,
                 arguments,
@@ -258,6 +263,7 @@ impl OpenAIProvider {
             tools: self.tools.clone(),
             stream: true,
             reasoning: Reasoning::from(self.config.reasoning_effort.clone()),
+            include: vec!["reasoning.encrypted_content"],
         })
     }
 
@@ -942,6 +948,10 @@ impl TryFrom<OutputItem> for Message {
                     summary: None,
                 })
             }
+            OutputItem::Reasoning(reasoning) => {
+                let item = OutputItem::Reasoning(reasoning);
+                Ok(Message::Reasoning(serde_json::to_vec(&item)?))
+            }
             _ => anyhow::bail!("Unsupported Message"),
         }
     }
@@ -1116,6 +1126,9 @@ impl Provider for OpenAIProvider {
                         call.call_id.clone(),
                         output,
                     )))
+                }
+                OutputItem::Reasoning(_) => {
+                    Ok(ProviderSignal::Reasoning(serde_json::to_vec(&done.item)?))
                 }
                 _ => Ok(ProviderSignal::Unsupported),
             },
@@ -1355,6 +1368,7 @@ mod tests {
         assert_eq!(provider.thinking_effort(), Some("high"));
         assert_eq!(value["model"], "gpt-5.6-sol");
         assert_eq!(value["reasoning"]["effort"], "high");
+        assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
         assert!(!value.to_string().contains("secret"));
     }
 
@@ -1468,6 +1482,69 @@ mod tests {
         assert_eq!(input[2], compacted[1]);
         assert_eq!(input[3]["role"], "user");
         assert_eq!(input[3]["content"], "new prompt");
+    }
+
+    #[test]
+    fn reasoning_items_are_replayed_before_their_tool_call_and_result() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs-1",
+            "summary": [],
+            "encrypted_content": "opaque",
+            "status": "completed"
+        });
+        let messages = [
+            Message::Reasoning(serde_json::to_vec(&reasoning).unwrap()),
+            Message::ToolCall {
+                call_id: "call-1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
+            },
+            Message::ToolCallResult {
+                call_id: "call-1".to_owned(),
+                output: "{\"content\":\"fn main() {}\"}".to_owned(),
+                summary: None,
+            },
+        ];
+
+        let input = OpenAIProvider::input(&messages).unwrap();
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0], reasoning);
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call-1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call-1");
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_items_emit_an_opaque_reasoning_signal() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs-1",
+            "summary": [],
+            "encrypted_content": "opaque",
+            "status": "completed"
+        });
+        let event = serde_json::from_value::<ResponseStreamEvent>(json!({
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item": reasoning.clone()
+        }))
+        .unwrap();
+        let mut provider = provider(ReasoningEffort::High);
+
+        let signal = provider
+            .handle(StreamEvent::Response(Box::new(event)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            signal,
+            ProviderSignal::Reasoning(item)
+                if serde_json::from_slice::<Value>(&item).unwrap() == reasoning
+        ));
     }
 
     #[test]

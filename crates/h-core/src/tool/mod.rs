@@ -29,7 +29,7 @@ pub use presentation::{
 };
 pub use read::{ReadFilePresenter, ReadFileTool};
 pub use registry::ToolRegistry;
-pub use summary::{Aggregator, Summary};
+pub use summary::Summary;
 pub use write::{WriteFilePresenter, WriteFileTool};
 
 #[cfg(test)]
@@ -95,10 +95,10 @@ pub trait TypedTool: Send + Sync + 'static {
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>>;
 
-    /// Creates fresh aggregation state. `None` makes this tool a hard boundary
-    /// between aggregatable runs.
-    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
-        None
+    /// Renders the retained summary as a compact replacement for an older
+    /// successful result. `None` keeps the original result unchanged.
+    fn compact(&self, _summary: &Summary) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 
     /// Stops external work started by the current call. Most async tools need
@@ -122,7 +122,7 @@ pub trait DynTool: Send + Sync {
 
     async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput<Value>>;
 
-    fn aggregator(&self) -> Option<Box<dyn Aggregator>>;
+    fn compact(&self, summary: &Summary) -> anyhow::Result<Option<String>>;
 
     async fn cancel(&self, arguments: Value) -> anyhow::Result<()>;
 }
@@ -159,8 +159,8 @@ where
         })
     }
 
-    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
-        TypedTool::aggregator(self)
+    fn compact(&self, summary: &Summary) -> anyhow::Result<Option<String>> {
+        TypedTool::compact(self, summary)
     }
 
     async fn cancel(&self, arguments: Value) -> anyhow::Result<()> {

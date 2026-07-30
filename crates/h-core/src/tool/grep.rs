@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, SearcherBuilder, Sink};
 use ignore::WalkBuilder;
@@ -8,10 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
+    DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome, ToolCallResult,
+    ToolCallStatus, ToolOutput, TypedTool,
     output::{Limits, save_and_preview},
-    summary::Targets,
 };
 
 const DEFAULT_CONTEXT_LINES: usize = 0;
@@ -26,40 +23,6 @@ struct GrepSummary {
     returned_lines: usize,
     #[serde(default)]
     output_path: Option<String>,
-}
-
-#[derive(Default)]
-struct GrepAggregator {
-    paths: Targets,
-    patterns: Targets,
-    outputs: Targets,
-    returned_lines: usize,
-}
-
-impl Aggregator for GrepAggregator {
-    fn push(&mut self, summary: &Summary) -> anyhow::Result<()> {
-        let summary = summary.deserialize::<GrepSummary>(SUMMARY_VERSION)?;
-
-        self.paths.push(&summary.path);
-        self.patterns.push(&summary.pattern);
-        if let Some(path) = &summary.output_path {
-            self.outputs.push(path);
-        }
-        self.returned_lines = self.returned_lines.saturating_add(summary.returned_lines);
-        Ok(())
-    }
-
-    fn finish(self: Box<Self>, buf: &mut String) {
-        buf.push_str("\n- Grep paths: ");
-        self.paths.write_description(buf, "path");
-        buf.push_str("; patterns: ");
-        self.patterns.write_description(buf, "pattern");
-        let _ = write!(buf, "; returned_lines: {}", self.returned_lines);
-        if !self.outputs.is_empty() {
-            buf.push_str("; output_files: ");
-            self.outputs.write_values(buf);
-        }
-    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -195,8 +158,18 @@ impl TypedTool for GrepTool {
         Ok(ToolOutput::new(output).with_summary(summary))
     }
 
-    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
-        Some(Box::new(GrepAggregator::default()))
+    fn compact(&self, summary: &Summary) -> anyhow::Result<Option<String>> {
+        let summary = summary.deserialize::<GrepSummary>(SUMMARY_VERSION)?;
+        let mut detail = format!(
+            "Matched {} lines in {:?} for pattern {:?}.",
+            summary.returned_lines, summary.path, summary.pattern
+        );
+
+        if let Some(path) = summary.output_path {
+            detail.push_str(&format!(" Full output: {path}."));
+        }
+
+        Ok(Some(detail))
     }
 }
 

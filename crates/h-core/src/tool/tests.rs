@@ -980,12 +980,12 @@ async fn grep_saves_full_results_and_summarizes_before_truncation() {
     assert!(output.value().results.contains(":300:needle 300"));
     assert!(output.value().results.contains("bytes omitted"));
 
-    let mut aggregator = TypedTool::aggregator(&tool).unwrap();
-    aggregator.push(output.summary().unwrap()).unwrap();
-    let mut summary = "Tool summary:".to_owned();
-    aggregator.finish(&mut summary);
-    assert!(summary.contains("returned_lines: 300"));
-    assert!(summary.contains(output_path));
+    let compact = TypedTool::compact(&tool, output.summary().unwrap())
+        .unwrap()
+        .unwrap();
+
+    assert!(compact.contains("Matched 300 lines"));
+    assert!(compact.contains(output_path));
 
     fs::remove_file(output_path).await.unwrap();
     fs::remove_file(path).await.unwrap();
@@ -1038,12 +1038,12 @@ async fn fetch_saves_full_raw_output_when_the_preview_is_truncated() {
     assert!(output.value().result.contains("fetch line 300"));
     assert!(output.value().result.contains("bytes omitted"));
 
-    let mut aggregator = TypedTool::aggregator(&tool).unwrap();
-    aggregator.push(output.summary().unwrap()).unwrap();
-    let mut summary = "Tool summary:".to_owned();
-    aggregator.finish(&mut summary);
-    assert!(summary.contains("total_lines: 300"));
-    assert!(summary.contains(output_path));
+    let compact = TypedTool::compact(&tool, output.summary().unwrap())
+        .unwrap()
+        .unwrap();
+
+    assert!(compact.contains("Fetched 300 lines"));
+    assert!(compact.contains(output_path));
 
     fs::remove_file(output_path).await.unwrap();
 }
@@ -1058,7 +1058,7 @@ fn optional_fetch_and_grep_fields_are_not_required_by_their_schemas() {
 }
 
 #[test]
-fn exploratory_tool_aggregators_consume_versioned_summaries() {
+fn exploratory_tools_compact_versioned_summaries_individually() {
     let read = ReadFileTool::new(FileBufferStore::default());
     let read_summary = Summary::new(
         1,
@@ -1067,15 +1067,9 @@ fn exploratory_tool_aggregators_consume_versioned_summaries() {
             "lines": 3,
         }),
     );
-    let mut read_aggregator = TypedTool::aggregator(&read).unwrap();
-    read_aggregator.push(&read_summary).unwrap();
-    let mut read_output = "Tool summary:".to_owned();
-    read_aggregator.finish(&mut read_output);
+    let read_output = TypedTool::compact(&read, &read_summary).unwrap().unwrap();
 
-    assert_eq!(
-        read_output,
-        "Tool summary:\n- Read files: src/main.rs; total_lines: 3"
-    );
+    assert_eq!(read_output, "Read 3 lines from \"src/main.rs\".");
 
     let grep = GrepTool;
     let grep_summary = Summary::new(
@@ -1086,14 +1080,11 @@ fn exploratory_tool_aggregators_consume_versioned_summaries() {
             "returned_lines": 2,
         }),
     );
-    let mut grep_aggregator = TypedTool::aggregator(&grep).unwrap();
-    grep_aggregator.push(&grep_summary).unwrap();
-    let mut grep_output = "Tool summary:".to_owned();
-    grep_aggregator.finish(&mut grep_output);
+    let grep_output = TypedTool::compact(&grep, &grep_summary).unwrap().unwrap();
 
     assert_eq!(
         grep_output,
-        "Tool summary:\n- Grep paths: src; patterns: main; returned_lines: 2"
+        "Matched 2 lines in \"src\" for pattern \"main\"."
     );
 
     let fetch = FetchTool::new().unwrap();
@@ -1104,14 +1095,11 @@ fn exploratory_tool_aggregators_consume_versioned_summaries() {
             "lines": 3,
         }),
     );
-    let mut fetch_aggregator = TypedTool::aggregator(&fetch).unwrap();
-    fetch_aggregator.push(&fetch_summary).unwrap();
-    let mut fetch_output = "Tool summary:".to_owned();
-    fetch_aggregator.finish(&mut fetch_output);
+    let fetch_output = TypedTool::compact(&fetch, &fetch_summary).unwrap().unwrap();
 
     assert_eq!(
         fetch_output,
-        "Tool summary:\n- Fetched URLs: https://example.com; total_lines: 3"
+        "Fetched 3 lines from \"https://example.com\"."
     );
 }
 

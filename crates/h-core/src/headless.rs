@@ -28,7 +28,8 @@ fn final_response(events: &mut UnboundedReceiver<AgentEvent>) -> String {
         match events.try_recv() {
             Ok(AgentEvent::TextDelta(delta)) => current.push_str(&delta),
             Ok(AgentEvent::Completed) => final_text = std::mem::take(&mut current),
-            Ok(AgentEvent::ToolCallStarted(_))
+            Ok(AgentEvent::Reasoning)
+            | Ok(AgentEvent::ToolCallStarted(_))
             | Ok(AgentEvent::ToolCallCompleted(_))
             | Ok(AgentEvent::Unsupported) => {}
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,

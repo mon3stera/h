@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use readabilityrs::{Readability, ReadabilityOptions};
 use reqwest::header::{HeaderMap, HeaderValue};
 use schemars::JsonSchema;
@@ -7,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
+    DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome, ToolCallResult,
+    ToolCallStatus, ToolOutput, TypedTool,
     output::{Limits, save_and_preview},
-    summary::Targets,
 };
 
 const DEFAULT_RAW: bool = false;
@@ -26,36 +23,6 @@ struct FetchSummary {
     lines: usize,
     #[serde(default)]
     output_path: Option<String>,
-}
-
-#[derive(Default)]
-struct FetchAggregator {
-    urls: Targets,
-    outputs: Targets,
-    lines: usize,
-}
-
-impl Aggregator for FetchAggregator {
-    fn push(&mut self, summary: &Summary) -> anyhow::Result<()> {
-        let summary = summary.deserialize::<FetchSummary>(SUMMARY_VERSION)?;
-
-        self.urls.push(&summary.url);
-        if let Some(path) = &summary.output_path {
-            self.outputs.push(path);
-        }
-        self.lines = self.lines.saturating_add(summary.lines);
-        Ok(())
-    }
-
-    fn finish(self: Box<Self>, buf: &mut String) {
-        buf.push_str("\n- Fetched URLs: ");
-        self.urls.write_description(buf, "url");
-        let _ = write!(buf, "; total_lines: {}", self.lines);
-        if !self.outputs.is_empty() {
-            buf.push_str("; output_files: ");
-            self.outputs.write_values(buf);
-        }
-    }
 }
 
 impl FetchTool {
@@ -138,8 +105,15 @@ impl TypedTool for FetchTool {
         Ok(ToolOutput::new(output).with_summary(summary))
     }
 
-    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
-        Some(Box::new(FetchAggregator::default()))
+    fn compact(&self, summary: &Summary) -> anyhow::Result<Option<String>> {
+        let summary = summary.deserialize::<FetchSummary>(SUMMARY_VERSION)?;
+        let mut detail = format!("Fetched {} lines from {:?}.", summary.lines, summary.url);
+
+        if let Some(path) = summary.output_path {
+            detail.push_str(&format!(" Full output: {path}."));
+        }
+
+        Ok(Some(detail))
     }
 }
 

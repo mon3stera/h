@@ -1,9 +1,5 @@
-use std::fmt::Write as _;
-
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-
-const NAMED_TARGET_LIMIT: usize = 3;
 
 /// Structured information retained after a tool's full output is compacted.
 ///
@@ -31,46 +27,5 @@ impl Summary {
         );
 
         Ok(serde_json::from_value(self.value.clone())?)
-    }
-}
-
-/// Stateful, streaming reducer for summaries produced by one tool kind.
-pub trait Aggregator: Send {
-    /// Implementations must validate before mutating, so an error leaves the
-    /// summaries already accepted into this aggregation run intact.
-    fn push(&mut self, summary: &Summary) -> anyhow::Result<()>;
-
-    fn finish(self: Box<Self>, buf: &mut String);
-}
-
-/// Distinct targets in first-seen order, rendered compactly for long runs.
-#[derive(Default)]
-pub(super) struct Targets {
-    values: Vec<String>,
-}
-
-impl Targets {
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    pub fn push(&mut self, value: &str) {
-        if !self.values.iter().any(|known| known == value) {
-            self.values.push(value.to_owned());
-        }
-    }
-
-    pub fn write_description(&self, buf: &mut String, singular: &str) {
-        if self.values.len() <= NAMED_TARGET_LIMIT && !self.values.is_empty() {
-            let _ = write!(buf, "{}", self.values.join(", "));
-            return;
-        }
-
-        let suffix = if self.values.len() == 1 { "" } else { "s" };
-        let _ = write!(buf, "{} {singular}{suffix}", self.values.len());
-    }
-
-    pub fn write_values(&self, buf: &mut String) {
-        let _ = write!(buf, "{}", self.values.join(", "));
     }
 }

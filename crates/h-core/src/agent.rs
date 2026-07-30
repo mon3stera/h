@@ -289,6 +289,11 @@ where
         Ok(self)
     }
 
+    pub fn with_harness_prompt(&mut self) -> &mut Self {
+        self.context.inject_harness_prompt();
+        self
+    }
+
     pub async fn with_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
         self.context.inject_global_prompts().await?;
         Ok(self)
@@ -515,9 +520,9 @@ where
             return Some(before);
         }
 
-        let tools_compacted = self.context.summarize_tools(&self.tool);
-        let after_summary = self.count_context_tokens();
-        self.context.set_token_count(after_summary);
+        let tools_compacted = self.context.compact_tool_outputs(&self.tool);
+        let after_tool_compaction = self.count_context_tokens();
+        self.context.set_token_count(after_tool_compaction);
 
         if tools_compacted {
             self.view_bus
@@ -525,17 +530,17 @@ where
 
             tracing::info!(
                 event = "context.auto_compact.completed",
-                method = "tool_summary",
+                method = "tool_output",
                 before_tokens = before,
-                after_tokens = after_summary,
+                after_tokens = after_tool_compaction,
             );
         }
 
-        let Some(after_summary) = after_summary else {
+        let Some(after_tool_compaction) = after_tool_compaction else {
             return None;
         };
-        if after_summary < self.auto_compact_token_limit {
-            return Some(after_summary);
+        if after_tool_compaction < self.auto_compact_token_limit {
+            return Some(after_tool_compaction);
         }
 
         match self.compact_context().await {
@@ -558,30 +563,30 @@ where
                 tracing::info!(
                     event = "context.auto_compact.skipped",
                     reason = "empty_history",
-                    context_tokens = after_summary,
+                    context_tokens = after_tool_compaction,
                 );
 
-                Some(after_summary)
+                Some(after_tool_compaction)
             }
             Ok(CompactOutcome::Unsupported) => {
                 self.compact_available = false;
                 tracing::warn!(
                     event = "context.auto_compact.disabled",
                     reason = "provider_unsupported",
-                    context_tokens = after_summary,
+                    context_tokens = after_tool_compaction,
                 );
 
-                Some(after_summary)
+                Some(after_tool_compaction)
             }
             Err(error) => {
                 tracing::warn!(
                     event = "context.auto_compact.failed",
                     error_class = "provider_compact_error",
                     error = error.to_string(),
-                    context_tokens = after_summary,
+                    context_tokens = after_tool_compaction,
                 );
 
-                Some(after_summary)
+                Some(after_tool_compaction)
             }
         }
     }
@@ -619,6 +624,14 @@ where
                 self.context.append_buf(delta);
                 self.view_bus
                     .broadcast(AgentViewEvent::TextDelta(delta.clone()));
+                self.refresh_usage(metrics);
+            }
+            ProviderSignal::Reasoning(item) => {
+                self.merge_text_delta();
+
+                let message = Message::Reasoning(item.clone());
+                metrics.push_output(message.clone());
+                self.context.histories_mut().push(message);
                 self.refresh_usage(metrics);
             }
             ProviderSignal::ToolCallStarted(call) => {
@@ -873,7 +886,7 @@ where
         let result = match command {
             Command::Clear => self.start_session().await,
             Command::Compact => {
-                if self.context.summarize_tools(&self.tool) {
+                if self.context.compact_tool_outputs(&self.tool) {
                     self.view_bus
                         .broadcast(AgentViewEvent::ToolResultsCompacted);
                 }
@@ -963,9 +976,10 @@ where
             match message {
                 // Global prompts, workspace info, and results already folded
                 // into the call above them were never on screen.
-                Message::System(_) | Message::Compaction(_) | Message::ToolCallResult { .. } => {
-                    continue;
-                }
+                Message::System(_)
+                | Message::Reasoning(_)
+                | Message::Compaction(_)
+                | Message::ToolCallResult { .. } => continue,
                 Message::User(prompt) => {
                     self.view_bus
                         .broadcast(AgentViewEvent::Prompt(prompt.clone()));
@@ -2049,12 +2063,55 @@ mod tests {
         agent
     }
 
-    fn has_frozen_tool_summary<P: Provider>(agent: &Agent<P>) -> bool {
+    fn compacted_read_output(lines: usize) -> String {
+        format!(
+            "<tool-summary>Older tool output truncated. Tool \"read_file\" succeeded. Read {lines} lines from \"src/main.rs\".</tool-summary>"
+        )
+    }
+
+    fn has_compacted_tool_output<P: Provider>(agent: &Agent<P>) -> bool {
         matches!(
             agent.context.provider_messages().as_slice(),
-            [Message::Assistant(summary)]
-                if summary == "Tool summary:\n- Read files: src/main.rs; total_lines: 1"
+            [
+                Message::ToolCall { call_id: call, .. },
+                Message::ToolCallResult { call_id: result, output, .. },
+            ] if call == "read-1"
+                && result == call
+                && output == &compacted_read_output(1)
         )
+    }
+
+    #[tokio::test]
+    async fn reasoning_signals_are_stored_without_view_content() {
+        let reasoning =
+            br#"{"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque"}"#
+                .to_vec();
+        let mut agent = Agent::new(TestProvider);
+        let mut events = agent.subscribe_view();
+        let mut metrics = TurnMetrics::new();
+
+        agent
+            .handle_signal(
+                &ProviderSignal::Reasoning(reasoning.clone()),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            agent.context.histories(),
+            [Message::Reasoning(item)] if item == &reasoning
+        ));
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            emitted
+                .iter()
+                .all(|event| matches!(event, AgentViewEvent::TokenUsage { .. }))
+        );
+
+        agent.rebroadcast_all_view();
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2072,7 +2129,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!has_frozen_tool_summary(&agent));
+        assert!(!has_compacted_tool_output(&agent));
 
         agent
             .handle_signal(
@@ -2083,7 +2140,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_frozen_tool_summary(&agent));
+        assert!(has_compacted_tool_output(&agent));
     }
 
     #[tokio::test]
@@ -2102,7 +2159,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(!has_frozen_tool_summary(&agent));
+        assert!(!has_compacted_tool_output(&agent));
 
         agent
             .handle_signal(
@@ -2113,7 +2170,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_frozen_tool_summary(&agent));
+        assert!(has_compacted_tool_output(&agent));
     }
 
     #[tokio::test]
@@ -2132,13 +2189,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_frozen_tool_summary(&agent));
-        assert_eq!(agent.context.token_count(), Some(1));
+        assert!(has_compacted_tool_output(&agent));
+        assert_eq!(agent.context.token_count(), Some(2));
         assert_eq!(metrics.total_tokens, Some(7));
     }
 
     #[tokio::test]
-    async fn compact_command_summarizes_tools_before_provider_compaction() {
+    async fn compact_command_compacts_tool_outputs_before_provider_compaction() {
         let input = Arc::new(Mutex::new(Vec::new()));
         let mut agent = Agent::new(CompactingProvider {
             input: input.clone(),
@@ -2151,8 +2208,12 @@ mod tests {
 
         assert!(matches!(
             input.lock().unwrap().as_slice(),
-            [Message::Assistant(summary)]
-                if summary == "Tool summary:\n- Read files: src/main.rs; total_lines: 1"
+            [
+                Message::ToolCall { call_id: call, .. },
+                Message::ToolCallResult { call_id: result, output, .. },
+            ] if call == "read-1"
+                && result == call
+                && output == &compacted_read_output(1)
         ));
         assert!(matches!(
             agent.context.provider_messages().as_slice(),
@@ -2164,7 +2225,7 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, AgentViewEvent::ToolResultsCompacted)),
-            "manual compaction identifies the tool-result aggregation"
+            "manual compaction identifies compacted tool outputs"
         );
         assert!(
             events
@@ -2181,7 +2242,7 @@ mod tests {
         let mut metrics = TurnMetrics::new();
 
         agent.with_auto_compact_token_limit(2);
-        assert_eq!(agent.auto_compact(&mut metrics).await, Some(1));
+        assert_eq!(agent.auto_compact(&mut metrics).await, Some(2));
 
         let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
 
@@ -2423,8 +2484,12 @@ mod tests {
 
         assert!(matches!(
             input.lock().unwrap().as_slice(),
-            [Message::Assistant(summary)]
-                if summary == "Tool summary:\n- Read files: src/main.rs; total_lines: 200"
+            [
+                Message::ToolCall { call_id: call, .. },
+                Message::ToolCallResult { call_id: result, output, .. },
+            ] if call == "read-1"
+                && result == call
+                && output == &compacted_read_output(200)
         ));
         assert_eq!(agent.context.histories().len(), 2);
     }

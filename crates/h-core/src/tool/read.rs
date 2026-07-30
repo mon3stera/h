@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, path::Path};
+use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,10 +9,9 @@ use tokio::{
 };
 
 use super::{
-    Aggregator, DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome,
-    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool,
+    DisplayBlock, Presentation, Presenter, Summary, ToolCall, ToolCallOutcome, ToolCallResult,
+    ToolCallStatus, ToolOutput, TypedTool,
     file_buffer::{FileBufferStore, FileFingerprint, IndexedFile, is_cacheable},
-    summary::Targets,
 };
 
 pub(super) const MAX_READ_LINES: usize = 500;
@@ -53,28 +52,6 @@ pub struct ReadFileTool {
 struct ReadSummary {
     path: String,
     lines: usize,
-}
-
-#[derive(Default)]
-struct ReadAggregator {
-    paths: Targets,
-    lines: usize,
-}
-
-impl Aggregator for ReadAggregator {
-    fn push(&mut self, summary: &Summary) -> anyhow::Result<()> {
-        let summary = summary.deserialize::<ReadSummary>(SUMMARY_VERSION)?;
-
-        self.paths.push(&summary.path);
-        self.lines = self.lines.saturating_add(summary.lines);
-        Ok(())
-    }
-
-    fn finish(self: Box<Self>, buf: &mut String) {
-        buf.push_str("\n- Read files: ");
-        self.paths.write_description(buf, "file");
-        let _ = write!(buf, "; total_lines: {}", self.lines);
-    }
 }
 
 impl ReadFileTool {
@@ -354,8 +331,13 @@ impl TypedTool for ReadFileTool {
         Ok(ToolOutput::new(output).with_summary(summary))
     }
 
-    fn aggregator(&self) -> Option<Box<dyn Aggregator>> {
-        Some(Box::new(ReadAggregator::default()))
+    fn compact(&self, summary: &Summary) -> anyhow::Result<Option<String>> {
+        let summary = summary.deserialize::<ReadSummary>(SUMMARY_VERSION)?;
+
+        Ok(Some(format!(
+            "Read {} lines from {:?}.",
+            summary.lines, summary.path
+        )))
     }
 }
 

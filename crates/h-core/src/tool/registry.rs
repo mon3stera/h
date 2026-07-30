@@ -1,7 +1,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use super::{
-    Aggregator, DefaultPresenter, DynTool, Presentation, Presenter, ToolCall, ToolCallResult,
+    DefaultPresenter, DynTool, Presentation, Presenter, Summary, ToolCall, ToolCallResult,
     ToolDefinition, TypedTool,
 };
 
@@ -79,10 +79,18 @@ impl ToolRegistry {
             .unwrap_or_else(|| DefaultPresenter.completed(call, result))
     }
 
-    pub fn aggregator(&self, name: &str) -> Option<Box<dyn Aggregator>> {
-        self.tools
-            .get(name)
-            .and_then(|registered| registered.tool.aggregator())
+    pub fn compact(&self, name: &str, summary: &Summary) -> anyhow::Result<Option<String>> {
+        let Some(registered) = self.tools.get(name) else {
+            return Ok(None);
+        };
+
+        let Some(detail) = registered.tool.compact(summary)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(format!(
+            "<tool-summary>Older tool output truncated. Tool {name:?} succeeded. {detail}</tool-summary>"
+        )))
     }
 
     pub async fn call(&self, call: &ToolCall) -> ToolCallResult {
