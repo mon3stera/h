@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/h-core", "crates/h-memory", "crates/h-tui"]
-default-members = [".", "crates/h-core", "crates/h-memory", "crates/h-tui"]
+members = ["crates/h-core", "crates/h-mcp", "crates/h-memory", "crates/h-tui"]
+default-members = [".", "crates/h-core", "crates/h-mcp", "crates/h-memory", "crates/h-tui"]
 resolver = "2"
 
 [package]

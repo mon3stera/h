@@ -1,0 +1,17 @@
+[package]
+name = "h-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+rmcp = { version = "3.0.1", default-features = false, features = ["client", "transport-child-process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.0", features = ["io-util", "process", "rt", "sync"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+rmcp = { version = "3.0.1", features = ["client", "macros", "schemars", "server"] }
+schemars = "1.2.1"
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread"] }
