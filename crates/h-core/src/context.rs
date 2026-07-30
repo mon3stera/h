@@ -259,10 +259,14 @@ pub struct SessionMeta {
 }
 
 impl Context {
-    pub fn inject_harness_prompt(&mut self) -> &mut Self {
-        self.histories_mut()
-            .push(Message::System(HARNESS_PROMPT.to_owned()));
+    pub fn inject_system_prompt(&mut self, prompt: String) -> &mut Self {
+        debug_assert!(!prompt.trim().is_empty());
+        self.histories_mut().push(Message::System(prompt));
         self
+    }
+
+    pub fn inject_harness_prompt(&mut self) -> &mut Self {
+        self.inject_system_prompt(HARNESS_PROMPT.to_owned())
     }
 
     pub async fn inject_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
@@ -296,9 +300,7 @@ impl Context {
     }
 
     pub fn inject_skill_catalog(&mut self, catalog: String) -> &mut Self {
-        debug_assert!(!catalog.trim().is_empty());
-        self.histories_mut().push(Message::System(catalog));
-        self
+        self.inject_system_prompt(catalog)
     }
 
     pub async fn inject_workspace_info(

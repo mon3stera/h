@@ -8,6 +8,10 @@ use h_core::{
     interaction::Bridge,
     provider::openai::{OpenAIProvider, OpenAIProviderConfig},
 };
+use h_memory::{
+    Store as MemoryStore,
+    tool::{ReadPresenter, ReadTool, SearchPresenter, SearchTool, WritePresenter, WriteTool},
+};
 use tokio::sync::mpsc;
 
 mod cli;
@@ -148,6 +152,12 @@ async fn build_agent(
         .with_tool_summary_turn_interval(tool_summary_turn_interval);
     agent.with_internal_tools(bridge)?;
 
+    let memory = MemoryStore::discover().await?;
+    agent
+        .register_tool_with_presenter(ReadTool::new(memory.clone()), ReadPresenter)
+        .register_tool_with_presenter(SearchTool::new(memory.clone()), SearchPresenter)
+        .register_tool_with_presenter(WriteTool::new(memory.clone()), WritePresenter);
+
     match id {
         // A resumed context already carries the system messages the original
         // session was built with, so injecting them again would duplicate them.
@@ -155,12 +165,16 @@ async fn build_agent(
             agent.resume(id).await?;
         }
         None => {
+            let memory = memory.snapshot().await?;
+
             agent
                 .with_harness_prompt()
                 .with_global_prompts()
                 .await?
                 .with_skills()
-                .await?
+                .await?;
+            agent
+                .with_system_prompt(memory.content)
                 .with_workspace_info()
                 .await?;
         }

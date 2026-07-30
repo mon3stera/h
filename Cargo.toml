@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/h-core", "crates/h-tui"]
-default-members = [".", "crates/h-core", "crates/h-tui"]
+members = ["crates/h-core", "crates/h-memory", "crates/h-tui"]
+default-members = [".", "crates/h-core", "crates/h-memory", "crates/h-tui"]
 resolver = "2"
 
 [package]
@@ -13,6 +13,7 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.3", features = ["derive"] }
 h-core = { path = "crates/h-core" }
+h-memory = { path = "crates/h-memory" }
 h-tui = { path = "crates/h-tui" }
 tokio = { version = "1.53.0", features = ["full"] }
 tracing = "0.1.44"

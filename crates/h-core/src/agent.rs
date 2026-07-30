@@ -16,8 +16,8 @@ use crate::{
     provider::{Provider, ProviderEventStream},
     skill::Registry as SkillRegistry,
     tool::{
-        AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, ReadFileTool, ToolCall,
-        ToolCallResult, ToolRegistry, WriteFileTool,
+        AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, Presenter, ReadFileTool,
+        ToolCall, ToolCallResult, ToolRegistry, TypedTool, WriteFileTool,
     },
 };
 use futures::StreamExt;
@@ -246,6 +246,28 @@ where
 
     pub fn with_tool_summary_turn_interval(&mut self, interval: NonZeroUsize) -> &mut Self {
         self.tool_summary_turn_interval = interval;
+        self
+    }
+
+    pub fn register_tool<T>(&mut self, tool: T) -> &mut Self
+    where
+        T: TypedTool,
+    {
+        self.tool.register(tool);
+        self
+    }
+
+    pub fn register_tool_with_presenter<T, R>(&mut self, tool: T, presenter: R) -> &mut Self
+    where
+        T: TypedTool,
+        R: Presenter + 'static,
+    {
+        self.tool.register_with_presenter(tool, presenter);
+        self
+    }
+
+    pub fn with_system_prompt(&mut self, prompt: impl Into<String>) -> &mut Self {
+        self.context.inject_system_prompt(prompt.into());
         self
     }
 

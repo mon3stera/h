@@ -25,6 +25,8 @@ may still change.
 - Slash commands with prefix completion: `/clear` and `/compact`.
 - Local Skill discovery compatible with h, Codex, Claude Code, and the common
   `.agents/skills` layout.
+- Persistent user and project memory with bounded startup indexes and on-demand
+  search, read, and write tools.
 - Project and user instruction files for persistent guidance.
 
 ## What It Can Do
@@ -146,11 +148,20 @@ Persistent instructions can be placed in `.h/AGENTS.md`, `~/.h/AGENTS.md`, or
 .
 ├── src/             CLI entry point, configuration wiring, and logging
 ├── crates/h-core/   Agent runtime, context, providers, tools, and Skills
+├── crates/h-memory/ Persistent user and project memory
 └── crates/h-tui/    Terminal UI and rendering
 ```
 
 `h-core` is independent of the terminal UI so other frontends can reuse the
 agent runtime in the future.
+
+## Memory
+
+`h` stores persistent memory under `~/.h/memory`. User memory applies across
+repositories, while project memory is isolated by the current Git repository.
+Only bounded index snapshots are injected at startup; the agent can search and
+read every stored topic on demand. Memory topics are plain Markdown, and their
+generated `INDEX.md` files can be rebuilt from topic metadata.
 
 ## Safety
 
