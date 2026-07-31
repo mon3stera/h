@@ -11,9 +11,26 @@ pub struct Args {
     #[arg(short, long, value_name = "TEXT", conflicts_with = "resume")]
     pub prompt: Option<String>,
 
+    /// Replace every default system prompt for this new session.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        conflicts_with = "resume",
+        value_parser = non_blank
+    )]
+    pub instruction: Option<String>,
+
     /// Resume a previous session. Omit the id to pick one interactively.
     #[arg(short, long, value_name = "SESSION_ID", num_args = 0..=1)]
     pub resume: Option<Option<String>>,
+}
+
+fn non_blank(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err("value cannot be blank".to_owned());
+    }
+
+    Ok(value.to_owned())
 }
 
 /// The archived sessions, most recently modified first, each carrying how long
@@ -105,6 +122,42 @@ mod tests {
     #[test]
     fn prompt_and_resume_are_mutually_exclusive() {
         assert!(Args::try_parse_from(["h", "-p", "hello", "-r", "01JQ2X"]).is_err());
+    }
+
+    #[test]
+    fn instruction_can_override_a_headless_session() {
+        let args = parse(&[
+            "h",
+            "--instruction",
+            "You are a focused reviewer.",
+            "-p",
+            "Review src/main.rs",
+        ]);
+
+        assert_eq!(
+            args.instruction.as_deref(),
+            Some("You are a focused reviewer.")
+        );
+        assert_eq!(args.prompt.as_deref(), Some("Review src/main.rs"));
+    }
+
+    #[test]
+    fn instruction_cannot_replace_a_resumed_sessions_history() {
+        assert!(
+            Args::try_parse_from([
+                "h",
+                "--instruction",
+                "You are a focused reviewer.",
+                "--resume",
+                "01JQ2X",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn instruction_rejects_blank_values() {
+        assert!(Args::try_parse_from(["h", "--instruction", "  \n  "]).is_err());
     }
 
     #[test]

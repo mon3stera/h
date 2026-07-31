@@ -136,6 +136,16 @@ h -p "Explain the architecture of this repository"
 
 Headless sessions print only the final response and are not archived.
 
+Replace all default system prompt injection for a new session:
+
+```bash
+h --instruction "You are a focused Rust reviewer." -p "Review src/main.rs"
+```
+
+`--instruction` skips the harness prompt, persistent instruction files, Skill
+catalog, Memory snapshot, and workspace information. Built-in and MCP tools
+remain available. It cannot be combined with `--resume`.
+
 Choose an archived session to resume:
 
 ```bash

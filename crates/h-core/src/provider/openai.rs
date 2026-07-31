@@ -9,7 +9,8 @@ use async_openai::{
         FunctionTool, FunctionToolCall, FunctionToolCallOutputResource, ImageDetail, InputContent,
         InputImageContent, InputItem, InputTextContent, Item, MessageType, OutputItem,
         OutputMessageContent, OutputStatus, Reasoning, ReasoningEffort as OpenAIReasoningEffort,
-        ResponseStreamEvent, Role, Tool as OpenAITool, WebSearchTool,
+        ResponseStreamEvent, Role, Tool as OpenAITool, WebSearchTool, WebSearchToolCall,
+        WebSearchToolCallAction, WebSearchToolCallStatus,
     },
 };
 use futures::StreamExt;
@@ -20,7 +21,7 @@ use tiktoken_rs::{bpe_for_model, o200k_base_singleton};
 
 use crate::{
     config::ReasoningEffort,
-    context::Message,
+    context::{Message, Search, SearchAction, SearchSource, SearchStatus},
     event::{CompletedReason, ProviderSignal},
     input::{InputPart, UserInput},
     provider::{Compaction, Provider, ProviderEventStream},
@@ -200,6 +201,7 @@ impl OpenAIProvider {
                     input.extend(items);
                 }
                 Message::Reasoning(item) => input.push(serde_json::from_slice(item)?),
+                Message::Search(search) => input.push(serde_json::from_slice(search.state())?),
                 message => input.push(serde_json::to_value(Self::input_item(message.clone()))?),
             }
         }
@@ -226,6 +228,9 @@ impl OpenAIProvider {
             .into(),
             Message::Reasoning(_) => {
                 unreachable!("reasoning items are expanded before item conversion")
+            }
+            Message::Search(_) => {
+                unreachable!("search items are expanded before item conversion")
             }
             Message::ToolCall {
                 call_id,
@@ -336,7 +341,10 @@ impl OpenAIProvider {
             tools: self.tools.clone(),
             stream: true,
             reasoning: Reasoning::from(self.config.reasoning_effort.clone()),
-            include: vec!["reasoning.encrypted_content"],
+            include: vec![
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+            ],
         })
     }
 
@@ -1085,9 +1093,47 @@ impl TryFrom<OutputItem> for Message {
                 let item = OutputItem::Reasoning(reasoning);
                 Ok(Message::Reasoning(serde_json::to_vec(&item)?))
             }
+            OutputItem::WebSearchCall(call) => Ok(Message::Search(search(call)?)),
             _ => anyhow::bail!("Unsupported Message"),
         }
     }
+}
+
+fn search(call: WebSearchToolCall) -> anyhow::Result<Search> {
+    let status = match call.status {
+        WebSearchToolCallStatus::InProgress | WebSearchToolCallStatus::Searching => {
+            SearchStatus::Running
+        }
+        WebSearchToolCallStatus::Completed => SearchStatus::Succeeded,
+        WebSearchToolCallStatus::Failed => SearchStatus::Failed,
+    };
+    let action = call.action.as_ref().map(|action| match action {
+        WebSearchToolCallAction::Search(search) => SearchAction::Query {
+            query: search.query.clone(),
+            sources: search
+                .sources
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|source| SearchSource::new(source.url.clone(), None))
+                .collect(),
+        },
+        WebSearchToolCallAction::OpenPage(open) => SearchAction::Open {
+            url: open.url.clone(),
+        },
+        WebSearchToolCallAction::Find(find) | WebSearchToolCallAction::FindInPage(find) => {
+            SearchAction::Find {
+                url: find.url.clone(),
+                pattern: find.pattern.clone(),
+            }
+        }
+    });
+    let (id, state) = (
+        call.id.clone(),
+        serde_json::to_vec(&OutputItem::WebSearchCall(call))?,
+    );
+
+    Ok(Search::new(id, status, action, state))
 }
 
 fn patch(v: &mut Value) {
@@ -1239,6 +1285,9 @@ impl Provider for OpenAIProvider {
                 }
                 OutputItem::Reasoning(_) => {
                     Ok(ProviderSignal::Reasoning(serde_json::to_vec(&done.item)?))
+                }
+                OutputItem::WebSearchCall(call) => {
+                    Ok(ProviderSignal::Search(search(call.clone())?))
                 }
                 _ => Ok(ProviderSignal::Unsupported),
             },
@@ -1452,7 +1501,13 @@ mod tests {
         assert_eq!(provider.thinking_effort(), Some("high"));
         assert_eq!(value["model"], "gpt-5.6-sol");
         assert_eq!(value["reasoning"]["effort"], "high");
-        assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            value["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
         assert!(!value.to_string().contains("secret"));
     }
 
@@ -1615,6 +1670,28 @@ mod tests {
         assert_eq!(input[2]["call_id"], "call-1");
     }
 
+    #[test]
+    fn search_items_are_replayed_with_their_provider_state() {
+        let item = json!({
+            "type": "web_search_call",
+            "id": "ws-1",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "Rust async runtimes",
+                "sources": [
+                    { "type": "url", "url": "https://tokio.rs" }
+                ]
+            }
+        });
+        let output = serde_json::from_value::<OutputItem>(item.clone()).unwrap();
+        let message = Message::try_from(output).unwrap();
+
+        let input = OpenAIProvider::input(&[message]).unwrap();
+
+        assert_eq!(input, [item]);
+    }
+
     #[tokio::test]
     async fn completed_reasoning_items_emit_an_opaque_reasoning_signal() {
         let reasoning = json!({
@@ -1639,6 +1716,50 @@ mod tests {
             signal,
             ProviderSignal::Reasoning(item)
                 if serde_json::from_slice::<Value>(&item).unwrap() == reasoning
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_search_items_emit_a_search_signal_with_sources() {
+        let item = json!({
+            "type": "web_search_call",
+            "id": "ws-1",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "Rust async runtimes",
+                "sources": [
+                    { "type": "url", "url": "https://tokio.rs" },
+                    { "type": "url", "url": "https://async.rs" }
+                ]
+            }
+        });
+        let event = serde_json::from_value::<ResponseStreamEvent>(json!({
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item": item.clone()
+        }))
+        .unwrap();
+        let mut provider = provider(ReasoningEffort::High);
+
+        let signal = provider.handle(event).await.unwrap();
+
+        let ProviderSignal::Search(search) = signal else {
+            panic!("expected a search signal");
+        };
+        assert_eq!(search.id(), "ws-1");
+        assert_eq!(search.status(), SearchStatus::Succeeded);
+        assert_eq!(
+            serde_json::from_slice::<Value>(search.state()).unwrap(),
+            item
+        );
+        assert!(matches!(
+            search.action(),
+            Some(SearchAction::Query { query, sources })
+                if query == "Rust async runtimes"
+                    && sources.iter().map(SearchSource::url).collect::<Vec<_>>()
+                        == ["https://tokio.rs", "https://async.rs"]
         ));
     }
 

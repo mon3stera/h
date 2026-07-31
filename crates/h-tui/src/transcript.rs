@@ -3,6 +3,8 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use h_core::context::{Search, SearchAction, SearchStatus};
+
 use crate::{
     banner, format_tokens, markdown, text, tool,
     ui::markdown::parse_markdown,
@@ -114,6 +116,7 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
                 RenderUnit::Text(text) => response(&parse_markdown(text), width),
                 RenderUnit::ParsedMarkdown(blocks) => response(blocks, width),
                 RenderUnit::Prompt(text) => prompt(text, width),
+                RenderUnit::Search(search) => render_search(search, width),
                 RenderUnit::Done(elapsed, tokens) => {
                     let tokens = tokens
                         .map(|tokens| format!(" ↓ {}", format_tokens(tokens)))
@@ -148,6 +151,71 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
         }
 
         lines.extend(rendered);
+    }
+
+    lines
+}
+
+const SEARCH_SOURCE_LIMIT: usize = 5;
+
+fn render_search(search: &Search, width: usize) -> Vec<Line<'static>> {
+    let (indicator, indicator_style) = match search.status() {
+        SearchStatus::Running => ("⟳ ", Style::default().fg(Color::Yellow)),
+        SearchStatus::Succeeded => ("● ", Style::default().fg(Color::Cyan)),
+        SearchStatus::Failed => ("✗ ", Style::default().fg(Color::Red)),
+    };
+    let (label, sources) = match search.action() {
+        Some(SearchAction::Query { query, sources }) => (
+            format!("Searched the web for {query:?}"),
+            sources.as_slice(),
+        ),
+        Some(SearchAction::Open { url: Some(url) }) => (format!("Opened {url}"), &[][..]),
+        Some(SearchAction::Open { url: None }) => ("Opened a web page".to_owned(), &[][..]),
+        Some(SearchAction::Find { url, pattern }) => {
+            (format!("Found {pattern:?} in {url}"), &[][..])
+        }
+        None => ("Searching the web".to_owned(), &[][..]),
+    };
+    let inner = width.saturating_sub(indicator.chars().count()).max(1);
+    let mut lines = text::wrap(&crate::rainbow_spans(&label, Style::default()), inner)
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let lead = if offset == 0 {
+                Span::styled(indicator, indicator_style)
+            } else {
+                Span::raw("  ")
+            };
+            let mut spans = vec![lead];
+            spans.extend(line.spans);
+
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+
+    for source in sources.iter().take(SEARCH_SOURCE_LIMIT) {
+        let label = source
+            .title()
+            .map(|title| format!("{title} — {}", source.url()))
+            .unwrap_or_else(|| source.url().to_owned());
+        let source_lines = text::wrap(
+            &[Span::styled(label, Style::default().fg(Color::DarkGray))],
+            width.saturating_sub(4).max(1),
+        );
+
+        lines.extend(source_lines.into_iter().enumerate().map(|(offset, line)| {
+            let mut spans = vec![Span::raw(if offset == 0 { "  └ " } else { "    " })];
+            spans.extend(line.spans);
+
+            Line::from(spans)
+        }));
+    }
+
+    if sources.len() > SEARCH_SOURCE_LIMIT {
+        lines.push(Line::from(Span::styled(
+            format!("    ... +{} sources", sources.len() - SEARCH_SOURCE_LIMIT),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     lines
@@ -228,6 +296,7 @@ fn response(blocks: &[crate::ui::markdown::MarkdownBlock], width: usize) -> Vec<
 mod tests {
     use super::*;
     use crate::ui::StartupInfo;
+    use h_core::context::SearchSource;
 
     fn state(units: Vec<RenderUnit>) -> ViewState {
         ViewState {
@@ -306,6 +375,44 @@ mod tests {
             texts(transcript.visible(10)),
             ["❯ prompt 0", "", "❯ prompt 1"]
         );
+    }
+
+    #[test]
+    fn search_results_show_the_query_and_a_bounded_source_preview() {
+        let sources = (1..=7)
+            .map(|index| SearchSource::new(format!("https://example.com/{index}"), None))
+            .collect();
+        let search = Search::new(
+            "ws-1",
+            SearchStatus::Succeeded,
+            Some(SearchAction::Query {
+                query: "Rust async runtimes".to_owned(),
+                sources,
+            }),
+            Vec::new(),
+        );
+        let mut transcript = Transcript::default();
+
+        transcript.sync(&state(vec![RenderUnit::Search(search)]), 80);
+
+        assert_eq!(
+            texts(transcript.visible(20)),
+            [
+                "● Searched the web for \"Rust async runtimes\"",
+                "  └ https://example.com/1",
+                "  └ https://example.com/2",
+                "  └ https://example.com/3",
+                "  └ https://example.com/4",
+                "  └ https://example.com/5",
+                "    ... +2 sources",
+            ]
+        );
+
+        let lines = transcript.visible(20);
+        let label = &lines[0].spans[1..];
+        assert!(label.iter().all(|span| span.style.fg.is_some()));
+        assert_ne!(label[0].style.fg, label[label.len() - 1].style.fg);
+        assert_eq!(lines[1].spans[1].style.fg, Some(Color::DarkGray));
     }
 
     #[test]

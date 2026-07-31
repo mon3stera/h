@@ -1,5 +1,6 @@
 use crate::{
     command::Command,
+    context::Search,
     input::UserInput,
     tool::{Presentation, ToolCall, ToolCallResult},
 };
@@ -21,6 +22,7 @@ pub enum CompletedReason {
 pub enum AgentEvent {
     TextDelta(String),
     Reasoning,
+    Search(Search),
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolCallResult),
     Completed,
@@ -38,6 +40,7 @@ pub enum AgentViewEvent {
     /// session has no other way to put the user's own turns back on screen.
     Prompt(String),
     TextDelta(String),
+    Search(Search),
     Tool(Presentation),
     TurnStart,
     /// Both values are local estimates. `context` is the next request size,
@@ -66,6 +69,7 @@ pub enum AgentViewEvent {
 pub enum ProviderSignal {
     TextDelta(String),
     Reasoning(Vec<u8>),
+    Search(Search),
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolCallResult),
     Completed { reason: CompletedReason },
@@ -77,6 +81,7 @@ impl From<ProviderSignal> for AgentEvent {
         match value {
             ProviderSignal::TextDelta(delta) => AgentEvent::TextDelta(delta),
             ProviderSignal::Reasoning(_) => AgentEvent::Reasoning,
+            ProviderSignal::Search(search) => AgentEvent::Search(search),
             ProviderSignal::ToolCallStarted(call) => AgentEvent::ToolCallStarted(call),
             ProviderSignal::ToolCallCompleted(result) => AgentEvent::ToolCallCompleted(result),
             ProviderSignal::Completed { .. } => AgentEvent::Completed,

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     num::NonZeroUsize,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -9,7 +9,8 @@ use crate::{
     bus::EventBus,
     command::Command,
     context::{
-        Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, archive_dir, built_in_workspace_info,
+        Context, DEFAULT_TOOL_SUMMARY_TURN_INTERVAL, Message, SearchStatus, archive_dir,
+        built_in_workspace_info,
     },
     event::{AgentCommand, AgentEvent, AgentViewEvent, CompletedReason, ProviderSignal},
     input::UserInput,
@@ -312,8 +313,8 @@ where
         Ok(self)
     }
 
-    pub fn with_harness_prompt(&mut self) -> &mut Self {
-        self.context.inject_harness_prompt();
+    pub fn with_harness_prompt(&mut self, executable: &Path) -> &mut Self {
+        self.context.inject_harness_prompt(executable);
         self
     }
 
@@ -651,6 +652,19 @@ where
                 metrics.push_output(message.clone());
                 self.context.histories_mut().push(message);
                 self.refresh_usage(metrics);
+            }
+            ProviderSignal::Search(search) => {
+                self.merge_text_delta();
+
+                if search.status() != SearchStatus::Running {
+                    let message = Message::Search(search.clone());
+                    metrics.push_output(message.clone());
+                    self.context.histories_mut().push(message);
+                    self.refresh_usage(metrics);
+                }
+
+                self.view_bus
+                    .broadcast(AgentViewEvent::Search(search.clone()));
             }
             ProviderSignal::ToolCallStarted(call) => {
                 metrics.tool_call_count += 1;
@@ -991,6 +1005,10 @@ where
                 | Message::Reasoning(_)
                 | Message::Compaction(_)
                 | Message::ToolCallResult { .. } => continue,
+                Message::Search(search) => {
+                    self.view_bus
+                        .broadcast(AgentViewEvent::Search(search.clone()));
+                }
                 Message::User(prompt) => {
                     self.view_bus
                         .broadcast(AgentViewEvent::Prompt(prompt.display()));
@@ -1259,6 +1277,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        context::{Search, SearchAction},
         provider::Compaction,
         tool::{
             FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition,
@@ -2123,6 +2142,46 @@ mod tests {
 
         agent.rebroadcast_all_view();
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn search_signals_are_stored_and_sent_to_the_view() {
+        let search = Search::new(
+            "ws-1",
+            SearchStatus::Succeeded,
+            Some(SearchAction::Query {
+                query: "Rust async runtimes".to_owned(),
+                sources: Vec::new(),
+            }),
+            br#"{"type":"web_search_call","id":"ws-1"}"#.to_vec(),
+        );
+        let mut agent = Agent::new(TestProvider);
+        let mut events = agent.subscribe_view();
+        let mut metrics = TurnMetrics::new();
+
+        agent
+            .handle_signal(
+                &ProviderSignal::Search(search.clone()),
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            agent.context.histories(),
+            [Message::Search(item)] if item == &search
+        ));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, AgentViewEvent::Search(item) if item == search))
+        );
+
+        agent.rebroadcast_all_view();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentViewEvent::Search(item)) if item == search
+        ));
     }
 
     #[tokio::test]

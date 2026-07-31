@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use h_core::{
+    context::Search,
     event::AgentViewEvent,
     tool::{DisplayBlock, Presentation, ToolCallId, ToolCallStatus},
 };
@@ -34,6 +35,7 @@ impl TryFrom<AgentViewEvent> for RenderUnit {
                 Ok(RenderUnit::Notice("context compacted".to_owned()))
             }
             AgentViewEvent::Prompt(prompt) => Ok(RenderUnit::Prompt(prompt)),
+            AgentViewEvent::Search(search) => Ok(RenderUnit::Search(search)),
             AgentViewEvent::Tool(presentation) => Ok(RenderUnit::Tool(presentation)),
             AgentViewEvent::Completed => Ok(RenderUnit::Separator),
             AgentViewEvent::Err(e) => Ok(RenderUnit::Err(e)),
@@ -76,6 +78,17 @@ fn parse_units(
                 match current {
                     Some(current) => *current = presentation,
                     None => units.push(RenderUnit::Tool(presentation)),
+                }
+            }
+            RenderUnit::Search(search) => {
+                let current = units.iter_mut().find_map(|unit| match unit {
+                    RenderUnit::Search(current) if current.id() == search.id() => Some(current),
+                    _ => None,
+                });
+
+                match current {
+                    Some(current) => *current = search,
+                    None => units.push(RenderUnit::Search(search)),
                 }
             }
             unit => units.push(unit),
@@ -131,6 +144,7 @@ pub enum RenderUnit {
     /// turn summary survives scrolling away from it.
     Done(Duration, Option<usize>),
     ParsedMarkdown(Vec<MarkdownBlock>),
+    Search(Search),
     Tool(Presentation),
     Prompt(String),
     Notice(String),
@@ -330,7 +344,10 @@ pub fn group_units(units: &[RenderUnit]) -> Vec<RenderGroup<'_>> {
 #[cfg(test)]
 mod view_event_tests {
     use super::*;
-    use h_core::tool::{ToolCallId, ToolCallStatus};
+    use h_core::{
+        context::{SearchAction, SearchStatus},
+        tool::{ToolCallId, ToolCallStatus},
+    };
 
     fn explored(name: &str, target: &str) -> RenderUnit {
         tool_unit(name, target, ToolCallStatus::Succeeded)
@@ -688,6 +705,30 @@ mod view_event_tests {
         assert!(matches!(
             &units[1],
             RenderUnit::Tool(tool) if matches!(tool.status, ToolCallStatus::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn search_events_replace_an_existing_search_with_the_same_id() {
+        let running = Search::new("ws-1", SearchStatus::Running, None, Vec::new());
+        let completed = Search::new(
+            "ws-1",
+            SearchStatus::Succeeded,
+            Some(SearchAction::Query {
+                query: "Rust async runtimes".to_owned(),
+                sources: Vec::new(),
+            }),
+            Vec::new(),
+        );
+        let mut state = ViewState::default();
+
+        reduce_view_event(&mut state, AgentViewEvent::Search(running)).unwrap();
+        reduce_view_event(&mut state, AgentViewEvent::Search(completed)).unwrap();
+
+        assert!(matches!(
+            state.units.as_slice(),
+            [RenderUnit::Search(search)]
+                if search.id() == "ws-1" && search.status() == SearchStatus::Succeeded
         ));
     }
 

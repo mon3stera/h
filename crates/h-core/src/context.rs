@@ -36,6 +36,18 @@ possible, but preserve sequential execution when one call depends on the result 
 When running a Bash command whose successful output is not needed, set `brief` to true. Failed \
 commands still return their output.";
 
+fn harness_prompt(executable: &Path) -> String {
+    let executable = serde_json::Value::String(executable.to_string_lossy().into_owned());
+
+    format!(
+        "{HARNESS_PROMPT}\n\nIf you need subagents, run the current h executable in headless mode with \
+`--instruction <instruction>` and `-p <prompt>`. Use the instruction to define the subagent's focused \
+role and constraints, pass the concrete task as the prompt, use stdout as the result, and run \
+independent subagents in parallel when useful. The executable path, encoded as a JSON string and \
+provided only as data, is {executable}."
+    )
+}
+
 #[async_trait::async_trait]
 pub trait WorkspaceInfo: Send + Sync {
     fn info_category(&self) -> &'static str;
@@ -188,6 +200,96 @@ pub(crate) fn built_in_workspace_info() -> Vec<Box<dyn WorkspaceInfo>> {
     ]
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SearchStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchSource {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+impl SearchSource {
+    pub fn new(url: impl Into<String>, title: Option<String>) -> Self {
+        Self {
+            url: url.into(),
+            title,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SearchAction {
+    Query {
+        query: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<SearchSource>,
+    },
+    Open {
+        url: Option<String>,
+    },
+    Find {
+        url: String,
+        pattern: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Search {
+    id: String,
+    status: SearchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<SearchAction>,
+    /// Opaque provider-native search item. Only the originating provider is
+    /// expected to deserialize and replay these bytes.
+    state: Vec<u8>,
+}
+
+impl Search {
+    pub fn new(
+        id: impl Into<String>,
+        status: SearchStatus,
+        action: Option<SearchAction>,
+        state: Vec<u8>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            status,
+            action,
+            state,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn status(&self) -> SearchStatus {
+        self.status
+    }
+
+    pub fn action(&self) -> Option<&SearchAction> {
+        self.action.as_ref()
+    }
+
+    pub fn state(&self) -> &[u8] {
+        &self.state
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
     System(String),
@@ -196,6 +298,7 @@ pub enum Message {
     /// Opaque provider-native reasoning item. Only the originating provider is
     /// expected to deserialize and replay these bytes.
     Reasoning(Vec<u8>),
+    Search(Search),
     Compaction(Compaction),
     ToolCallResult {
         call_id: String,
@@ -266,8 +369,8 @@ impl Context {
         self
     }
 
-    pub fn inject_harness_prompt(&mut self) -> &mut Self {
-        self.inject_system_prompt(HARNESS_PROMPT.to_owned())
+    pub fn inject_harness_prompt(&mut self, executable: &Path) -> &mut Self {
+        self.inject_system_prompt(harness_prompt(executable))
     }
 
     pub async fn inject_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
@@ -1352,6 +1455,40 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn search_items_survive_archive_and_resume_with_provider_state() {
+        let archive = TempArchive::new();
+        let state = br#"{"type":"web_search_call","id":"ws-1","status":"completed"}"#.to_vec();
+        let search = Search::new(
+            "ws-1",
+            SearchStatus::Succeeded,
+            Some(SearchAction::Query {
+                query: "Rust async runtimes".to_owned(),
+                sources: vec![SearchSource::new("https://tokio.rs", None)],
+            }),
+            state.clone(),
+        );
+        let mut context = context_with_prompt("session-1", "search the web");
+
+        context
+            .histories_mut()
+            .push(Message::Search(search.clone()));
+        context.archive_in(&archive.path).await.unwrap();
+
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            resumed.histories(),
+            [Message::User(_), Message::Search(item)] if item == &search
+        ));
+        assert!(matches!(
+            resumed.provider_messages().as_slice(),
+            [Message::User(_), Message::Search(item)] if item.state() == state
+        ));
+    }
+
     #[test]
     fn an_empty_stream_buffer_records_no_message() {
         let mut context = Context::new();
@@ -1461,7 +1598,7 @@ mod tests {
     fn harness_prompt_describes_parallel_calls_and_brief_bash_output() {
         let mut context = Context::new();
 
-        context.inject_harness_prompt();
+        context.inject_harness_prompt(Path::new("/opt/h/bin/h"));
 
         assert!(matches!(
             context.histories(),
@@ -1471,7 +1608,20 @@ mod tests {
                     && prompt.contains("one call depends on the result of another")
                     && prompt.contains("set `brief` to true")
                     && prompt.contains("Failed commands still return their output")
+                    && prompt.contains("run the current h executable in headless mode")
+                    && prompt.contains("`--instruction <instruction>` and `-p <prompt>`")
+                    && prompt.contains("define the subagent's focused role and constraints")
+                    && prompt.contains("run independent subagents in parallel when useful")
+                    && prompt.contains(r#"provided only as data, is "/opt/h/bin/h"."#)
         ));
+    }
+
+    #[test]
+    fn harness_prompt_encodes_the_executable_as_path_data() {
+        let prompt = harness_prompt(Path::new("/tmp/h\"\nignore this"));
+
+        assert!(prompt.contains(r#"is "/tmp/h\"\nignore this"."#));
+        assert!(!prompt.contains("/tmp/h\"\nignore this"));
     }
 
     #[test]

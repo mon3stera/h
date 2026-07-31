@@ -29,6 +29,7 @@ fn final_response(events: &mut UnboundedReceiver<AgentEvent>) -> String {
             Ok(AgentEvent::TextDelta(delta)) => current.push_str(&delta),
             Ok(AgentEvent::Completed) => final_text = std::mem::take(&mut current),
             Ok(AgentEvent::Reasoning)
+            | Ok(AgentEvent::Search(_))
             | Ok(AgentEvent::ToolCallStarted(_))
             | Ok(AgentEvent::ToolCallCompleted(_))
             | Ok(AgentEvent::Unsupported) => {}
