@@ -10,7 +10,7 @@ use h_core::tool::{
 use crate::{Draft, Scope, Store};
 
 const MAX_READ_LINES: usize = 500;
-const MAX_READ_CHARS: usize = 2_048;
+const MAX_READ_CHARS: usize = 16_384;
 const DEFAULT_SEARCH_RESULTS: usize = 10;
 const SUMMARY_VERSION: u32 = 1;
 
@@ -76,7 +76,7 @@ impl TypedTool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read one persistent memory topic by scope and id. Output is limited to 500 lines and 2048 characters; use next_start_line and next_offset to continue. Read an existing topic before replacing it with write_memory."
+        "Read one persistent memory topic by scope and id. Output is limited to 500 lines and 16384 characters; use next_start_line and next_offset to continue. Read an existing topic before replacing it with write_memory."
     }
 
     async fn call(&self, args: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
