@@ -57,6 +57,13 @@ struct GrepSink {
     returned_lines: usize,
 }
 
+struct Matches {
+    path: String,
+    pattern: String,
+    results: String,
+    returned_lines: usize,
+}
+
 impl Sink for GrepSink {
     type Error = std::io::Error;
 
@@ -92,6 +99,58 @@ impl Sink for GrepSink {
     }
 }
 
+fn search(arguments: GrepToolArgs) -> anyhow::Result<Matches> {
+    let (before, after) = (arguments.before(), arguments.after());
+    let matcher = RegexMatcher::new(&arguments.pattern)?;
+
+    let mut searcher = SearcherBuilder::new()
+        .before_context(before)
+        .after_context(after)
+        .passthru(false)
+        .build();
+
+    let (mut results, mut returned_lines) = (String::new(), 0);
+    for result in WalkBuilder::new(&arguments.path).build() {
+        let entry = result?;
+
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            let path = entry.path();
+            let mut sink = GrepSink {
+                output: String::new(),
+                returned_lines: 0,
+            };
+
+            searcher.search_path(&matcher, path, &mut sink)?;
+
+            if sink.output.is_empty() {
+                continue;
+            }
+            if !results.is_empty() {
+                if !results.ends_with('\n') {
+                    results.push('\n');
+                }
+
+                results.push('\n');
+            }
+
+            results.push_str(&path.display().to_string());
+            results.push('\n');
+            results.push_str(&sink.output);
+            returned_lines += sink.returned_lines;
+        }
+    }
+
+    Ok(Matches {
+        path: arguments.path,
+        pattern: arguments.pattern,
+        results,
+        returned_lines,
+    })
+}
+
 #[async_trait::async_trait]
 impl TypedTool for GrepTool {
     type Arguments = GrepToolArgs;
@@ -106,49 +165,8 @@ impl TypedTool for GrepTool {
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
-        let matcher = RegexMatcher::new(&arguments.pattern)?;
-
-        let mut searcher = SearcherBuilder::new()
-            .before_context(arguments.before())
-            .after_context(arguments.after())
-            .passthru(false)
-            .build();
-
-        let (mut results, mut returned_lines) = (String::new(), 0);
-        for result in WalkBuilder::new(&arguments.path).build() {
-            let entry = result?;
-
-            if entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
-                let path = entry.path();
-                let mut sink = GrepSink {
-                    output: String::new(),
-                    returned_lines: 0,
-                };
-
-                searcher.search_path(&matcher, path, &mut sink)?;
-
-                if sink.output.is_empty() {
-                    continue;
-                }
-                if !results.is_empty() {
-                    if !results.ends_with('\n') {
-                        results.push('\n');
-                    }
-
-                    results.push('\n');
-                }
-
-                results.push_str(&path.display().to_string());
-                results.push('\n');
-                results.push_str(&sink.output);
-                returned_lines += sink.returned_lines;
-            }
-        }
-
-        let preview = save_and_preview(&results, "grep", Limits::DEFAULT).await?;
+        let matches = tokio::task::spawn_blocking(move || search(arguments)).await??;
+        let preview = save_and_preview(&matches.results, "grep", Limits::DEFAULT).await?;
         let output_path = preview.path.clone();
         let output = GrepToolOutput {
             results: preview.content,
@@ -156,9 +174,9 @@ impl TypedTool for GrepTool {
         let summary = Summary::new(
             SUMMARY_VERSION,
             serde_json::json!({
-                "path": arguments.path,
-                "pattern": arguments.pattern,
-                "returned_lines": returned_lines,
+                "path": matches.path,
+                "pattern": matches.pattern,
+                "returned_lines": matches.returned_lines,
                 "output_path": output_path,
             }),
         );

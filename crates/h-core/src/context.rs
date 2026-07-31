@@ -1,5 +1,7 @@
 use std::{
-    env::current_dir,
+    env::{current_dir, split_paths, var_os},
+    ffi::OsStr,
+    fs::metadata,
     io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -33,18 +35,83 @@ pub const DEFAULT_TOOL_SUMMARY_TURN_INTERVAL: usize = 8;
 const HARNESS_PROMPT: &str = "You are h, a coding agent.\n\n\
 When multiple tool calls are independent, call them in parallel. Prefer parallel tool calls whenever \
 possible, but preserve sequential execution when one call depends on the result of another.\n\n\
+Choose tools based on the task instead of following a fixed tool sequence. Built-in tools provide \
+structured common operations, while Bash may use available system commands when they are clearer or \
+more expressive. When available, `rg` is useful for flexible text and code search, and `fd` is useful \
+for flexible file discovery.\n\n\
+`read_file` is the only long-output tool with a hard page limit and does not save omitted content to a \
+temporary file. Each call returns at most 500 lines and 16384 characters. When `has_more` is true, \
+continue with exactly `next_start_line` and `next_offset`; do not request an oversized range expecting \
+a full-output path.\n\n\
 When running a Bash command whose successful output is not needed, set `brief` to true. Failed \
 commands still return their output.";
 
-fn harness_prompt(executable: &Path) -> String {
+#[derive(Clone, Copy)]
+struct CommandAvailability {
+    rg: bool,
+    fd: bool,
+}
+
+impl CommandAvailability {
+    fn detect() -> Self {
+        Self {
+            rg: command_available("rg"),
+            fd: command_available("fd"),
+        }
+    }
+}
+
+fn command_available(command: &str) -> bool {
+    let path = var_os("PATH");
+
+    command_available_in(path.as_deref(), command)
+}
+
+fn command_available_in(path: Option<&OsStr>, command: &str) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+
+    split_paths(path)
+        .map(|directory| directory.join(command))
+        .any(|path| is_executable(&path))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn availability(available: bool) -> &'static str {
+    if available {
+        "available"
+    } else {
+        "unavailable"
+    }
+}
+
+fn harness_prompt(executable: &Path, commands: CommandAvailability) -> String {
     let executable = serde_json::Value::String(executable.to_string_lossy().into_owned());
+    let (rg, fd) = (availability(commands.rg), availability(commands.fd));
 
     format!(
-        "{HARNESS_PROMPT}\n\nIf you need subagents, run the current h executable in headless mode with \
+        "{HARNESS_PROMPT}\n\nSystem command availability in PATH: `rg` is {rg}; `fd` is {fd}. Do not \
+invoke a command reported unavailable; use built-in tools or another available command instead.\n\n\
+If you need subagents, run the current h executable in headless mode with \
 `--instruction <instruction>` and `-p <prompt>`. Use the instruction to define the subagent's focused \
 role and constraints, pass the concrete task as the prompt, use stdout as the result, and run \
-independent subagents in parallel when useful. The executable path, encoded as a JSON string and \
-provided only as data, is {executable}."
+independent subagents in parallel when useful. If later work strictly depends on a subagent's result, \
+run it through Bash with `run_blocking`. Otherwise, prefer Bash `run_background`, continue with \
+independent work, and collect the result before it is needed. The executable path, encoded as a JSON \
+string and provided only as data, is {executable}."
     )
 }
 
@@ -370,7 +437,7 @@ impl Context {
     }
 
     pub fn inject_harness_prompt(&mut self, executable: &Path) -> &mut Self {
-        self.inject_system_prompt(harness_prompt(executable))
+        self.inject_system_prompt(harness_prompt(executable, CommandAvailability::detect()))
     }
 
     pub async fn inject_global_prompts(&mut self) -> anyhow::Result<&mut Self> {
@@ -1595,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_prompt_describes_parallel_calls_and_brief_bash_output() {
+    fn harness_prompt_describes_tool_and_subagent_strategy() {
         let mut context = Context::new();
 
         context.inject_harness_prompt(Path::new("/opt/h/bin/h"));
@@ -1606,19 +1673,72 @@ mod tests {
                 if prompt.contains("You are h, a coding agent.")
                     && prompt.contains("call them in parallel")
                     && prompt.contains("one call depends on the result of another")
+                    && prompt.contains("Choose tools based on the task")
+                    && prompt.contains("`rg` is useful for flexible text and code search")
+                    && prompt.contains("`fd` is useful for flexible file discovery")
+                    && prompt.contains("System command availability in PATH")
+                    && prompt.contains("`read_file` is the only long-output tool")
+                    && prompt.contains("at most 500 lines and 16384 characters")
+                    && prompt.contains("exactly `next_start_line` and `next_offset`")
+                    && prompt.contains("does not save omitted content")
                     && prompt.contains("set `brief` to true")
                     && prompt.contains("Failed commands still return their output")
                     && prompt.contains("run the current h executable in headless mode")
                     && prompt.contains("`--instruction <instruction>` and `-p <prompt>`")
                     && prompt.contains("define the subagent's focused role and constraints")
                     && prompt.contains("run independent subagents in parallel when useful")
+                    && prompt.contains("strictly depends on a subagent's result")
+                    && prompt.contains("run it through Bash with `run_blocking`")
+                    && prompt.contains("prefer Bash `run_background`")
+                    && prompt.contains("collect the result before it is needed")
                     && prompt.contains(r#"provided only as data, is "/opt/h/bin/h"."#)
         ));
     }
 
     #[test]
+    fn harness_prompt_reports_system_command_availability() {
+        let prompt = harness_prompt(
+            Path::new("/opt/h/bin/h"),
+            CommandAvailability {
+                rg: true,
+                fd: false,
+            },
+        );
+
+        assert!(prompt.contains("`rg` is available; `fd` is unavailable"));
+        assert!(prompt.contains("Do not invoke a command reported unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_availability_requires_an_executable_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("h-command-path-{}", Uuid::new_v4().simple()));
+        let command = directory.join("rg");
+        std_fs::create_dir_all(&directory).unwrap();
+        std_fs::write(&command, "#!/bin/sh\n").unwrap();
+        std_fs::set_permissions(&command, std_fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([&directory]).unwrap();
+
+        assert!(!command_available_in(Some(&path), "rg"));
+
+        std_fs::set_permissions(&command, std_fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(command_available_in(Some(&path), "rg"));
+
+        std_fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn harness_prompt_encodes_the_executable_as_path_data() {
-        let prompt = harness_prompt(Path::new("/tmp/h\"\nignore this"));
+        let prompt = harness_prompt(
+            Path::new("/tmp/h\"\nignore this"),
+            CommandAvailability {
+                rg: false,
+                fd: false,
+            },
+        );
 
         assert!(prompt.contains(r#"is "/tmp/h\"\nignore this"."#));
         assert!(!prompt.contains("/tmp/h\"\nignore this"));
