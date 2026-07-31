@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "h"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "h-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anthropic-rust-sdk",
  "anyhow",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "h-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "h-memory"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "h-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
