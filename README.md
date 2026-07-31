@@ -1,9 +1,9 @@
 # h
 
 `h` is a small agentic coding CLI written in Rust. It connects an OpenAI
-Responses-compatible model to a local coding environment, where the model can
-inspect a repository, edit files, run commands, search code, fetch web pages,
-and ask the user for decisions.
+Responses-compatible or Anthropic-compatible model to a local coding
+environment, where the model can inspect a repository, edit files, run
+commands, search code, fetch web pages, and ask the user for decisions.
 
 The project is under active development, so its configuration and internal APIs
 may still change.
@@ -48,7 +48,8 @@ You can ask `h` to perform tasks such as:
 ## Requirements
 
 - A recent stable Rust toolchain with Rust 2024 edition support.
-- An OpenAI Responses-compatible API endpoint and model.
+- An OpenAI Responses-compatible or Anthropic-compatible API endpoint and
+  model.
 - A Unix-like operating system. The current Bash implementation uses Unix PTYs.
 - `tmux` is optional, but enables the more capable persistent Bash backend.
 
