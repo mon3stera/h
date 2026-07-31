@@ -59,12 +59,13 @@ fn rule(width: usize) -> Line<'static> {
 }
 
 fn render_heading(level: u8, content: &[Inline], width: usize) -> Vec<Line<'static>> {
+    let level = level.clamp(1, 6);
     let style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let mut heading = vec![Span::styled(
-        format!("{} ", "#".repeat(level.clamp(1, 6).into())),
-        style,
+        format!("h{level} "),
+        Style::default().fg(MUTED),
     )];
 
     heading.extend(spans(content, style));
@@ -444,8 +445,24 @@ mod tests {
     }
 
     #[test]
-    fn a_heading_keeps_its_hashes() {
-        assert_eq!(render_text("## Title", 20), ["## Title"]);
+    fn headings_use_compact_level_indicators() {
+        assert_eq!(
+            render_text("# First\n\n###### Sixth", 20),
+            ["h1 First", "", "h6 Sixth"]
+        );
+    }
+
+    #[test]
+    fn a_heading_mutes_only_its_indicator() {
+        let rendered = render(&parse_markdown("# Title"), 20);
+        let spans = &rendered[0].spans;
+
+        assert_eq!(spans[0].content, "h1");
+        assert_eq!(spans[0].style.fg, Some(Color::DarkGray));
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].content, "Title");
+        assert_eq!(spans[2].style.fg, Some(Color::Cyan));
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
