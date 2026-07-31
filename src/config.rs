@@ -226,6 +226,7 @@ bearer_token = "secret"
              command = \"node\"\n\
              args = [\"server.mjs\"]\n\
              cwd = \"/srv/search\"\n\
+             tools = [\"query\", \"fetch\"]\n\
              enabled = false\n\
              [mcp.servers.search.env]\n\
              API_KEY = \"secret\"\n"
@@ -236,6 +237,7 @@ bearer_token = "secret"
         assert_eq!(server.command(), "node");
         assert_eq!(server.args(), ["server.mjs"]);
         assert_eq!(server.current_dir(), Some(Path::new("/srv/search")));
+        assert_eq!(server.tools().unwrap(), ["query", "fetch"]);
         assert_eq!(server.env()["API_KEY"], "secret");
         assert!(!server.enabled());
     }

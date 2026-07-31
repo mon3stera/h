@@ -102,15 +102,19 @@ Add stdio MCP servers under `[mcp.servers.<id>]`:
 command = "node"
 args = ["/path/to/search-server.mjs"]
 cwd = "/path/to/server"
+tools = ["query", "fetch"]
 
 [mcp.servers.search.env]
 API_KEY = "YOUR_API_KEY"
 ```
 
 Configured servers are enabled by default. Set `enabled = false` in a server
-table to keep its configuration without starting it. Discovered tools are
-registered as `<server>__<tool>`, such as `search__query`. Server and tool names
-must therefore contain only ASCII letters, digits, underscores, and hyphens.
+table to keep its configuration without starting it. By default, every
+discovered tool is exposed. Set `tools` to an allowlist of remote tool names to
+expose only that subset; startup fails if a configured name is not provided by
+the server. Exposed tools are registered as `<server>__<tool>`, such as
+`search__query`. Server and tool names must therefore contain only ASCII
+letters, digits, underscores, and hyphens.
 
 `h` fails startup when an enabled MCP server cannot start or list its tools,
 rather than silently ignoring a configured integration. MCP subprocesses are

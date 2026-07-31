@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -38,6 +38,7 @@ pub struct Server {
     #[serde(default)]
     env: BTreeMap<String, String>,
     cwd: Option<PathBuf>,
+    tools: Option<Vec<String>>,
     #[serde(default = "enabled")]
     enabled: bool,
 }
@@ -57,6 +58,10 @@ impl Server {
 
     pub fn current_dir(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    pub fn tools(&self) -> Option<&[String]> {
+        self.tools.as_deref()
     }
 
     pub fn enabled(&self) -> bool {
@@ -89,6 +94,18 @@ impl Server {
 
         for key in self.env.keys() {
             require_text(&format!("mcp.servers.{id}.env key"), key)?;
+        }
+
+        if let Some(tools) = &self.tools {
+            let mut names = BTreeSet::new();
+
+            for tool in tools {
+                require_name(&format!("mcp.servers.{id}.tools entry"), tool)?;
+                anyhow::ensure!(
+                    names.insert(tool),
+                    "mcp.servers.{id}.tools contains duplicate tool {tool:?}"
+                );
+            }
         }
 
         Ok(())

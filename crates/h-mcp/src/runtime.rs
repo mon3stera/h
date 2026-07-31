@@ -102,15 +102,19 @@ impl Connection {
                     .with_context(|| format!("failed to discover tools from MCP server {id:?}"));
             }
         };
-
-        if let Err(error) = validate_tools(id, &tools) {
-            close_client(id, &client).await;
-            return Err(error);
-        }
+        let discovered_tool_count = tools.len();
+        let tools = match select_tools(id, config.tools(), tools) {
+            Ok(tools) => tools,
+            Err(error) => {
+                close_client(id, &client).await;
+                return Err(error);
+            }
+        };
 
         tracing::info!(
             event = "mcp.server.started",
             server_id = id,
+            discovered_tool_count,
             tool_count = tools.len(),
         );
 
@@ -120,6 +124,40 @@ impl Connection {
             tools,
         })
     }
+}
+
+fn select_tools(
+    server: &str,
+    selected: Option<&[String]>,
+    tools: Vec<RemoteTool>,
+) -> anyhow::Result<Vec<RemoteTool>> {
+    validate_tools(server, &tools)?;
+
+    let Some(selected) = selected else {
+        return Ok(tools);
+    };
+
+    let available = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let missing = selected
+        .iter()
+        .filter(|name| !available.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    anyhow::ensure!(
+        missing.is_empty(),
+        "MCP server {server:?} did not provide configured tools: {}",
+        missing.join(", ")
+    );
+
+    let selected = selected.iter().map(String::as_str).collect::<HashSet<_>>();
+    Ok(tools
+        .into_iter()
+        .filter(|tool| selected.contains(tool.name.as_str()))
+        .collect())
 }
 
 struct Tool {
@@ -236,6 +274,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn remote_tool(name: &str) -> RemoteTool {
+        serde_json::from_value(json!({
+            "name": name,
+            "inputSchema": { "type": "object" }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn namespaces_tools_by_server() {
         assert_eq!(exposed_name("search", "query").unwrap(), "search__query");
@@ -253,6 +299,38 @@ mod tests {
         let error = exposed_name("search", "").unwrap_err();
 
         assert_eq!(error.to_string(), "MCP tool name must not be empty");
+    }
+
+    #[test]
+    fn selects_only_configured_tools() {
+        let selected = vec!["alpha".to_owned(), "charlie".to_owned()];
+        let tools = vec![
+            remote_tool("alpha"),
+            remote_tool("bravo"),
+            remote_tool("charlie"),
+        ];
+
+        let tools = select_tools("search", Some(&selected), tools).unwrap();
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "charlie"]
+        );
+    }
+
+    #[test]
+    fn rejects_configured_tools_missing_from_the_server() {
+        let selected = vec!["missing".to_owned()];
+        let error =
+            select_tools("search", Some(&selected), vec![remote_tool("available")]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "MCP server \"search\" did not provide configured tools: missing"
+        );
     }
 
     #[tokio::test]

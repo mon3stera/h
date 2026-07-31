@@ -259,7 +259,8 @@ fn parses_server_configuration_and_builds_stdio() {
                 "command": "node",
                 "args": ["server.mjs", "--stdio"],
                 "env": { "API_KEY": "secret" },
-                "cwd": "/srv/search"
+                "cwd": "/srv/search",
+                "tools": ["query", "fetch"]
             },
             "disabled": {
                 "command": "false",
@@ -285,7 +286,28 @@ fn parses_server_configuration_and_builds_stdio() {
         stdio.cwd.as_deref(),
         Some(std::path::Path::new("/srv/search"))
     );
+    assert_eq!(search.tools().unwrap(), ["query", "fetch"]);
     assert!(!config.servers()["disabled"].enabled());
+}
+
+#[test]
+fn rejects_duplicate_configured_tools() {
+    let config = serde_json::from_value::<Config>(json!({
+        "servers": {
+            "search": {
+                "command": "node",
+                "tools": ["query", "query"]
+            }
+        }
+    }))
+    .unwrap();
+
+    let error = config.validate().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "mcp.servers.search.tools contains duplicate tool \"query\""
+    );
 }
 
 #[test]
