@@ -745,12 +745,15 @@ impl App {
 
         match remaining {
             Some(fraction) => {
+                let bar = context_bar(fraction);
+                // The bar and the percentage share one rainbow run so the hue
+                // ramp flows on; the closing bracket is inserted after the bar
+                // instead of wrapping the percentage too.
+                let mut inner = rainbow_spans(&format!("{bar} {percent}"), Style::default());
+                inner.insert(bar.chars().count(), Span::styled("]", muted));
+
                 spans.push(Span::styled("[", muted));
-                spans.extend(rainbow_spans(
-                    &format!("{} {percent}", context_bar(fraction)),
-                    Style::default(),
-                ));
-                spans.push(Span::styled("]", muted));
+                spans.extend(inner);
             }
             None => spans.extend(rainbow_spans(&percent, Style::default())),
         }
@@ -1571,7 +1574,7 @@ mod tests {
 
         assert!(
             rows.last().is_some_and(|row| {
-                row.ends_with("context 2.4K/200K ([██████████ 98.8% left])")
+                row.ends_with("context 2.4K/200K ([██████████] 98.8% left)")
             }),
             "the status belongs on the bottom row: {rows:?}"
         );
@@ -1639,7 +1642,7 @@ mod tests {
             .filter_map(|span| span.style.fg)
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(text, "context 45K/100K ([██████░░░░ 55.0% left])");
+        assert_eq!(text, "context 45K/100K ([██████░░░░] 55.0% left)");
         assert!(
             colors.len() > 1,
             "the percentage should use the rainbow ramp"
@@ -1661,7 +1664,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(text, "context 120K/100K ([░░░░░░░░░░ 0.0% left])");
+        assert_eq!(text, "context 120K/100K ([░░░░░░░░░░] 0.0% left)");
     }
 
     #[test]
@@ -1678,10 +1681,10 @@ mod tests {
         };
 
         app.state.context_tokens = Some(0);
-        assert_eq!(text(&app), "context 0/100K ([██████████ 100.0% left])");
+        assert_eq!(text(&app), "context 0/100K ([██████████] 100.0% left)");
 
         app.state.context_tokens = Some(45_000);
-        assert_eq!(text(&app), "context 45K/100K ([██████░░░░ 55.0% left])");
+        assert_eq!(text(&app), "context 45K/100K ([██████░░░░] 55.0% left)");
         assert!(
             app.context_spans()
                 .iter()
@@ -1694,7 +1697,7 @@ mod tests {
         );
 
         app.state.context_tokens = Some(100_000);
-        assert_eq!(text(&app), "context 100K/100K ([░░░░░░░░░░ 0.0% left])");
+        assert_eq!(text(&app), "context 100K/100K ([░░░░░░░░░░] 0.0% left)");
 
         app.state.context_tokens = None;
         assert_eq!(text(&app), "context ?/100K (?% left)");
