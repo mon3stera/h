@@ -44,18 +44,18 @@ use crate::{
     ui::{RenderUnit, ViewState, reduce_view_event},
 };
 
-const SPINNER: [(&str, &str); 4] = [
-    ("◜", "h-..."),
-    ("◝", "h-i..."),
-    ("◞", "h-in..."),
-    ("◟", "h-ing..."),
-];
+/// The rotating glyphs. The word itself stays still; its colors chase instead.
+const SPINNER: [&str; 4] = ["◜", "◝", "◟", "◞"];
 
 const SPINNER_PERIOD: Duration = Duration::from_millis(200);
 
-/// The widest spinner word. Padding to it keeps the elapsed time from shuffling
-/// left and right as the animation cycles.
-const SPINNER_WIDTH: usize = 8;
+/// The spinner word, always shown whole.
+const SPINNER_WORD: &str = "h-ing...";
+
+/// One chase step per character of [`SPINNER_WORD`] (ASCII, so byte length
+/// equals character count), plus a rest frame where the whole word is back in
+/// the primary color before the gray wave restarts.
+const SPINNER_CHASE_PERIOD: usize = SPINNER_WORD.len() + 1;
 
 /// How far the transcript moves for one page key.
 const PAGE: isize = 10;
@@ -219,6 +219,9 @@ struct App {
     /// for it, because nothing else can move until the question is settled.
     asking: Option<Asking>,
     spinner: usize,
+    /// Where the gray wave sits in the spinner word: one character turns gray
+    /// at a time, left to right, then the whole word is primary again.
+    chase: usize,
     /// The transcript's height on the last draw, so scroll keys know the page
     /// size before the next one.
     viewport: u16,
@@ -231,7 +234,12 @@ struct App {
 impl App {
     fn handle_agent_event(&mut self, event: AgentViewEvent) {
         match &event {
-            AgentViewEvent::TurnStart => self.started = Some(Instant::now()),
+            AgentViewEvent::TurnStart => {
+                self.started = Some(Instant::now());
+                // Each turn opens with the whole word primary before the gray
+                // wave starts moving through it.
+                self.chase = 0;
+            }
             AgentViewEvent::TurnFinished { completed } => {
                 // A cancelled `ask` keeps its reply sender alive until the
                 // agent has observed cancellation and written the interrupted
@@ -530,6 +538,7 @@ impl App {
 
     fn advance_spinner(&mut self) {
         self.spinner = (self.spinner + 1) % SPINNER.len();
+        self.chase = (self.chase + 1) % SPINNER_CHASE_PERIOD;
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -609,7 +618,7 @@ impl App {
     }
 
     fn spinner_line(&self) -> Line<'static> {
-        let (glyph, word) = SPINNER[self.spinner];
+        let glyph = SPINNER[self.spinner];
         let elapsed = self
             .started
             .map(|started| {
@@ -623,14 +632,41 @@ impl App {
             })
             .unwrap_or_default();
 
-        Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("{word:<SPINNER_WIDTH$}{elapsed}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("  Esc to cancel", Style::default().fg(Color::DarkGray)),
-        ])
+        let mut spans = vec![Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(Color::Cyan),
+        )];
+        spans.extend(self.chase_word());
+        spans.push(Span::styled(elapsed, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "  Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        ));
+
+        Line::from(spans)
+    }
+
+    /// The spinner word with one character grayed out at a time, moving left
+    /// to right. The first step of each cycle shows the whole word in the
+    /// primary color.
+    fn chase_word(&self) -> Vec<Span<'static>> {
+        let primary = Style::default().fg(Color::Cyan);
+        let gray = Style::default().fg(Color::DarkGray);
+        let gray_position = self.chase.checked_sub(1);
+
+        SPINNER_WORD
+            .chars()
+            .enumerate()
+            .map(|(position, character)| {
+                let style = if gray_position == Some(position) {
+                    gray
+                } else {
+                    primary
+                };
+
+                Span::styled(character.to_string(), style)
+            })
+            .collect()
     }
 
     fn indicator_lines(&self) -> Vec<Line<'static>> {
@@ -649,7 +685,7 @@ impl App {
 
     fn command_line(&self, command: Command) -> Line<'static> {
         let (glyph, label) = (
-            SPINNER[self.spinner].0,
+            SPINNER[self.spinner],
             match command {
                 Command::Clear => "starting session...",
                 Command::Compact => "compacting...",
@@ -1305,7 +1341,7 @@ mod tests {
         app.state.turn_in_progress = true;
         let busy = drawn(&mut app, &mut terminal);
 
-        assert!(busy.iter().any(|row| row.contains("h-...")), "{busy:?}");
+        assert!(busy.iter().any(|row| row.contains("h-ing...")), "{busy:?}");
         assert!(
             busy.iter().any(|row| row.contains("Esc to cancel")),
             "{busy:?}"
@@ -1320,7 +1356,7 @@ mod tests {
         let rows = drawn(&mut app, &mut terminal);
         let spinner = rows
             .iter()
-            .position(|row| row.contains("h-..."))
+            .position(|row| row.contains("h-ing..."))
             .expect("the spinner should be visible");
 
         assert!(
@@ -1334,12 +1370,66 @@ mod tests {
         assert!(rows[spinner + 2].contains('─'), "{rows:?}");
     }
 
+    /// The word spans of the spinner line, skipping the leading glyph.
+    fn spinner_word(app: &App) -> Vec<Span<'static>> {
+        app.spinner_line().spans[1..1 + SPINNER_WORD.len()].to_vec()
+    }
+
     #[test]
-    fn the_padding_matches_the_widest_spinner_word() {
-        assert_eq!(
-            SPINNER.iter().map(|(_, word)| word.len()).max().unwrap(),
-            SPINNER_WIDTH,
-            "a wider word would push the elapsed time out of its column"
+    fn the_chase_starts_with_the_whole_word_primary() {
+        let (mut app, _) = app_with_size(40, 8);
+        app.state.turn_in_progress = true;
+
+        let word = spinner_word(&app);
+
+        assert_eq!(word.len(), SPINNER_WORD.len());
+        assert!(
+            word.iter().all(|span| span.style.fg == Some(Color::Cyan)),
+            "the rest frame shows no gray: {word:?}"
+        );
+    }
+
+    #[test]
+    fn the_gray_moves_through_the_word_one_character_at_a_time() {
+        let (mut app, _) = app_with_size(40, 8);
+        app.state.turn_in_progress = true;
+
+        app.advance_spinner();
+        let word = spinner_word(&app);
+        assert_eq!(word[0].content.as_ref(), "h");
+        assert_eq!(word[0].style.fg, Some(Color::DarkGray));
+        assert!(
+            word[1..]
+                .iter()
+                .all(|span| span.style.fg == Some(Color::Cyan)),
+            "only the first character is gray: {word:?}"
+        );
+
+        app.advance_spinner();
+        let word = spinner_word(&app);
+        assert_eq!(word[0].style.fg, Some(Color::Cyan), "the gray moves on");
+        assert_eq!(word[1].content.as_ref(), "-");
+        assert_eq!(word[1].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn the_chase_restarts_with_the_whole_word_primary() {
+        let (mut app, _) = app_with_size(40, 8);
+        app.state.turn_in_progress = true;
+
+        // The last character of the word turns gray...
+        for _ in 0..SPINNER_WORD.len() {
+            app.advance_spinner();
+        }
+        let word = spinner_word(&app);
+        assert_eq!(word[SPINNER_WORD.len() - 1].style.fg, Some(Color::DarkGray));
+
+        // ...and the next tick returns to the whole word primary again.
+        app.advance_spinner();
+        let word = spinner_word(&app);
+        assert!(
+            word.iter().all(|span| span.style.fg == Some(Color::Cyan)),
+            "the cycle restarts from the rest frame: {word:?}"
         );
     }
 
@@ -1520,14 +1610,14 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_advances_through_its_frames() {
+    fn the_spinner_word_stays_whole_as_the_glyphs_rotate() {
         let (mut app, mut terminal) = app_with_size(40, 8);
         app.state.turn_in_progress = true;
 
         app.advance_spinner();
         let rows = drawn(&mut app, &mut terminal);
 
-        assert!(rows.iter().any(|row| row.contains("h-i...")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("h-ing...")), "{rows:?}");
     }
 
     #[test]
