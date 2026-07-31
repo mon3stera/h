@@ -723,7 +723,7 @@ impl App {
     }
 
     fn context_spans(&self) -> Vec<Span<'static>> {
-        let (current, percent) = match self.state.context_tokens {
+        let (current, percent, remaining) = match self.state.context_tokens {
             Some(current) if self.context_window > 0 => {
                 let remaining = self.context_window.saturating_sub(current);
 
@@ -733,10 +733,11 @@ impl App {
                         "{:.1}% left",
                         remaining as f64 / self.context_window as f64 * 100.0
                     ),
+                    Some(remaining as f64 / self.context_window as f64),
                 )
             }
-            Some(current) => (format_tokens(current), "?% left".to_owned()),
-            None => ("?".to_owned(), "?% left".to_owned()),
+            Some(current) => (format_tokens(current), "?% left".to_owned(), None),
+            None => ("?".to_owned(), "?% left".to_owned(), None),
         };
         let limit = format_tokens(self.context_window);
         let muted = Style::default().fg(Color::DarkGray);
@@ -745,12 +746,34 @@ impl App {
         spans.extend(rainbow_spans(&percent, Style::default()));
         spans.push(Span::styled(")", muted));
 
+        if let Some(fraction) = remaining {
+            spans.push(Span::raw(" "));
+            spans.extend(context_bar(fraction, muted));
+        }
+
         spans
     }
 
     fn context_line(&self) -> Line<'static> {
         Line::from(self.context_spans()).alignment(Alignment::Right)
     }
+}
+
+/// The remaining-context bar: ten cells, the filled share in the default color
+/// and the rest in muted gray, bracketed.
+fn context_bar(fraction: f64, muted: Style) -> Vec<Span<'static>> {
+    let filled = (fraction * 10.0).round() as usize;
+    let mut spans = vec![Span::styled("[", muted)];
+
+    if filled > 0 {
+        spans.push(Span::raw("█".repeat(filled)));
+    }
+    if filled < 10 {
+        spans.push(Span::styled("░".repeat(10 - filled), muted));
+    }
+
+    spans.push(Span::styled("]", muted));
+    spans
 }
 
 impl Asking {
@@ -1539,7 +1562,7 @@ mod tests {
 
     #[test]
     fn context_usage_sits_below_the_input_and_uses_the_configured_limit() {
-        let (mut app, mut terminal) = app_with_size(40, 8);
+        let (mut app, mut terminal) = app_with_size(80, 8);
 
         app.handle_agent_event(AgentViewEvent::TokenUsage {
             context: Some(2_400),
@@ -1549,8 +1572,9 @@ mod tests {
         let rows = drawn(&mut app, &mut terminal);
 
         assert!(
-            rows.last()
-                .is_some_and(|row| row.ends_with("context 2.4K/200K (98.8% left)")),
+            rows.last().is_some_and(|row| {
+                row.ends_with("context 2.4K/200K (98.8% left) [██████████]")
+            }),
             "the status belongs on the bottom row: {rows:?}"
         );
     }
@@ -1609,11 +1633,15 @@ mod tests {
         let colors = line
             .spans
             .iter()
-            .filter(|span| span.content != "context 45K/100K (" && span.content != ")")
+            .filter(|span| {
+                span.content != "context 45K/100K ("
+                    && span.content != ")"
+                    && !["[", "]", "█", "░"].contains(&span.content.as_ref())
+            })
             .filter_map(|span| span.style.fg)
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(text, "context 45K/100K (55.0% left)");
+        assert_eq!(text, "context 45K/100K (55.0% left) [██████░░░░]");
         assert!(
             colors.len() > 1,
             "the percentage should use the rainbow ramp"
@@ -1635,7 +1663,33 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(text, "context 120K/100K (0.0% left)");
+        assert_eq!(text, "context 120K/100K (0.0% left) [░░░░░░░░░░]");
+    }
+
+    #[test]
+    fn the_context_bar_tracks_the_remaining_share() {
+        let text = |app: &App| {
+            app.context_spans()
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let mut app = App {
+            context_window: 100_000,
+            ..App::default()
+        };
+
+        app.state.context_tokens = Some(0);
+        assert_eq!(text(&app), "context 0/100K (100.0% left) [██████████]");
+
+        app.state.context_tokens = Some(45_000);
+        assert_eq!(text(&app), "context 45K/100K (55.0% left) [██████░░░░]");
+
+        app.state.context_tokens = Some(100_000);
+        assert_eq!(text(&app), "context 100K/100K (0.0% left) [░░░░░░░░░░]");
+
+        app.state.context_tokens = None;
+        assert_eq!(text(&app), "context ?/100K (?% left)");
     }
 
     #[tokio::test]
