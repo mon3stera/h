@@ -743,13 +743,13 @@ impl App {
         let muted = Style::default().fg(Color::DarkGray);
         let mut spans = vec![Span::styled(format!("context {current}/{limit} ("), muted)];
 
+        if let Some(fraction) = remaining {
+            spans.extend(context_bar(fraction, muted));
+            spans.push(Span::raw(" "));
+        }
+
         spans.extend(rainbow_spans(&percent, Style::default()));
         spans.push(Span::styled(")", muted));
-
-        if let Some(fraction) = remaining {
-            spans.push(Span::raw(" "));
-            spans.extend(context_bar(fraction, muted));
-        }
 
         spans
     }
@@ -759,14 +759,14 @@ impl App {
     }
 }
 
-/// The remaining-context bar: ten cells, the filled share in the default color
-/// and the rest in muted gray, bracketed.
+/// The remaining-context bar: ten cells, the filled share along the rainbow
+/// ramp and the rest in muted gray, bracketed.
 fn context_bar(fraction: f64, muted: Style) -> Vec<Span<'static>> {
     let filled = (fraction * 10.0).round() as usize;
     let mut spans = vec![Span::styled("[", muted)];
 
     if filled > 0 {
-        spans.push(Span::raw("█".repeat(filled)));
+        spans.extend(rainbow_spans(&"█".repeat(filled), Style::default()));
     }
     if filled < 10 {
         spans.push(Span::styled("░".repeat(10 - filled), muted));
@@ -1573,7 +1573,7 @@ mod tests {
 
         assert!(
             rows.last().is_some_and(|row| {
-                row.ends_with("context 2.4K/200K (98.8% left) [██████████]")
+                row.ends_with("context 2.4K/200K ([██████████] 98.8% left)")
             }),
             "the status belongs on the bottom row: {rows:?}"
         );
@@ -1641,7 +1641,7 @@ mod tests {
             .filter_map(|span| span.style.fg)
             .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(text, "context 45K/100K (55.0% left) [██████░░░░]");
+        assert_eq!(text, "context 45K/100K ([██████░░░░] 55.0% left)");
         assert!(
             colors.len() > 1,
             "the percentage should use the rainbow ramp"
@@ -1663,7 +1663,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(text, "context 120K/100K (0.0% left) [░░░░░░░░░░]");
+        assert_eq!(text, "context 120K/100K ([░░░░░░░░░░] 0.0% left)");
     }
 
     #[test]
@@ -1680,13 +1680,23 @@ mod tests {
         };
 
         app.state.context_tokens = Some(0);
-        assert_eq!(text(&app), "context 0/100K (100.0% left) [██████████]");
+        assert_eq!(text(&app), "context 0/100K ([██████████] 100.0% left)");
 
         app.state.context_tokens = Some(45_000);
-        assert_eq!(text(&app), "context 45K/100K (55.0% left) [██████░░░░]");
+        assert_eq!(text(&app), "context 45K/100K ([██████░░░░] 55.0% left)");
+        assert!(
+            app.context_spans()
+                .iter()
+                .filter(|span| span.content.contains('█'))
+                .filter_map(|span| span.style.fg)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
+            "the filled bar should ride the rainbow ramp"
+        );
 
         app.state.context_tokens = Some(100_000);
-        assert_eq!(text(&app), "context 100K/100K (0.0% left) [░░░░░░░░░░]");
+        assert_eq!(text(&app), "context 100K/100K ([░░░░░░░░░░] 0.0% left)");
 
         app.state.context_tokens = None;
         assert_eq!(text(&app), "context ?/100K (?% left)");
