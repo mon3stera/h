@@ -54,7 +54,7 @@ const SPINNER_WORD: &str = "h-ing...";
 
 /// One chase step per character of [`SPINNER_WORD`] (ASCII, so byte length
 /// equals character count), plus a rest frame where the whole word is back in
-/// the primary color before the gray wave restarts.
+/// the default color before the gray wave restarts.
 const SPINNER_CHASE_PERIOD: usize = SPINNER_WORD.len() + 1;
 
 /// How far the transcript moves for one page key.
@@ -220,7 +220,7 @@ struct App {
     asking: Option<Asking>,
     spinner: usize,
     /// Where the gray wave sits in the spinner word: one character turns gray
-    /// at a time, left to right, then the whole word is primary again.
+    /// at a time, left to right, then the whole word is plain again.
     chase: usize,
     /// The transcript's height on the last draw, so scroll keys know the page
     /// size before the next one.
@@ -236,7 +236,7 @@ impl App {
         match &event {
             AgentViewEvent::TurnStart => {
                 self.started = Some(Instant::now());
-                // Each turn opens with the whole word primary before the gray
+                // Each turn opens with the whole word plain before the gray
                 // wave starts moving through it.
                 self.chase = 0;
             }
@@ -648,9 +648,8 @@ impl App {
 
     /// The spinner word with one character grayed out at a time, moving left
     /// to right. The first step of each cycle shows the whole word in the
-    /// primary color.
+    /// default color.
     fn chase_word(&self) -> Vec<Span<'static>> {
-        let primary = Style::default().fg(Color::Cyan);
         let gray = Style::default().fg(Color::DarkGray);
         let gray_position = self.chase.checked_sub(1);
 
@@ -658,13 +657,11 @@ impl App {
             .chars()
             .enumerate()
             .map(|(position, character)| {
-                let style = if gray_position == Some(position) {
-                    gray
+                if gray_position == Some(position) {
+                    Span::styled(character.to_string(), gray)
                 } else {
-                    primary
-                };
-
-                Span::styled(character.to_string(), style)
+                    Span::raw(character.to_string())
+                }
             })
             .collect()
     }
@@ -1376,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn the_chase_starts_with_the_whole_word_primary() {
+    fn the_chase_starts_with_the_whole_word_plain() {
         let (mut app, _) = app_with_size(40, 8);
         app.state.turn_in_progress = true;
 
@@ -1384,7 +1381,7 @@ mod tests {
 
         assert_eq!(word.len(), SPINNER_WORD.len());
         assert!(
-            word.iter().all(|span| span.style.fg == Some(Color::Cyan)),
+            word.iter().all(|span| span.style.fg.is_none()),
             "the rest frame shows no gray: {word:?}"
         );
     }
@@ -1399,21 +1396,19 @@ mod tests {
         assert_eq!(word[0].content.as_ref(), "h");
         assert_eq!(word[0].style.fg, Some(Color::DarkGray));
         assert!(
-            word[1..]
-                .iter()
-                .all(|span| span.style.fg == Some(Color::Cyan)),
+            word[1..].iter().all(|span| span.style.fg.is_none()),
             "only the first character is gray: {word:?}"
         );
 
         app.advance_spinner();
         let word = spinner_word(&app);
-        assert_eq!(word[0].style.fg, Some(Color::Cyan), "the gray moves on");
+        assert_eq!(word[0].style.fg, None, "the gray moves on");
         assert_eq!(word[1].content.as_ref(), "-");
         assert_eq!(word[1].style.fg, Some(Color::DarkGray));
     }
 
     #[test]
-    fn the_chase_restarts_with_the_whole_word_primary() {
+    fn the_chase_restarts_with_the_whole_word_plain() {
         let (mut app, _) = app_with_size(40, 8);
         app.state.turn_in_progress = true;
 
@@ -1424,11 +1419,11 @@ mod tests {
         let word = spinner_word(&app);
         assert_eq!(word[SPINNER_WORD.len() - 1].style.fg, Some(Color::DarkGray));
 
-        // ...and the next tick returns to the whole word primary again.
+        // ...and the next tick returns to the whole word plain again.
         app.advance_spinner();
         let word = spinner_word(&app);
         assert!(
-            word.iter().all(|span| span.style.fg == Some(Color::Cyan)),
+            word.iter().all(|span| span.style.fg.is_none()),
             "the cycle restarts from the rest frame: {word:?}"
         );
     }
