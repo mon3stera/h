@@ -1,4 +1,5 @@
 use ratatui::text::{Line, Span};
+use unicode_linebreak::linebreaks;
 use unicode_width::UnicodeWidthStr;
 
 /// Wraps styled text to `width`, keeping each fragment's styling across the
@@ -8,8 +9,9 @@ use unicode_width::UnicodeWidthStr;
 /// know how tall every entry is before it draws: that is what lets it skip the
 /// entries that are scrolled out of sight.
 ///
-/// Breaks are taken at whitespace where possible, and inside a word only when
-/// the word cannot fit a line of its own. A `\n` always breaks.
+/// Breaks are taken at whitespace where possible. Unicode line-break
+/// opportunities are used inside non-whitespace text, while an unbreakable word
+/// is cut only when it cannot fit a line of its own. A `\n` always breaks.
 pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
 
@@ -176,7 +178,17 @@ impl Wrapped {
 
         let token_width = token.width();
 
-        if self.used > 0 && self.used + token_width > self.width {
+        if self.used + token_width <= self.width {
+            self.append(token, style);
+            return;
+        }
+
+        if has_internal_break(token) {
+            self.push_breakable(token, style);
+            return;
+        }
+
+        if self.used > 0 {
             self.trim_trailing_space();
             self.break_line();
         }
@@ -195,6 +207,45 @@ impl Wrapped {
         }
 
         self.append(token, style);
+    }
+
+    fn push_breakable(&mut self, mut token: &str, style: ratatui::style::Style) {
+        while !token.is_empty() {
+            let room = self.width.saturating_sub(self.used);
+
+            if token.width() <= room {
+                self.append(token, style);
+                return;
+            }
+
+            if let Some(end) = fitting_break(token, room) {
+                let (head, tail) = token.split_at(end);
+                self.append(head, style);
+                token = tail;
+                self.break_line();
+                continue;
+            }
+
+            if self.used > 0 {
+                self.trim_trailing_space();
+                self.break_line();
+                continue;
+            }
+
+            let prefix = fitting_prefix(token, self.width);
+            let end = if prefix.is_empty() {
+                first_character(token)
+            } else {
+                prefix.len()
+            };
+            let (head, tail) = token.split_at(end);
+            self.append(head, style);
+            token = tail;
+
+            if !token.is_empty() {
+                self.break_line();
+            }
+        }
     }
 
     fn append(&mut self, token: &str, style: ratatui::style::Style) {
@@ -222,6 +273,28 @@ impl Wrapped {
 
         self.lines
     }
+}
+
+fn has_internal_break(text: &str) -> bool {
+    linebreaks(text).any(|(index, _)| index < text.len())
+}
+
+fn fitting_break(text: &str, width: usize) -> Option<usize> {
+    let (mut previous, mut used, mut fitting) = (0, 0, None);
+
+    for (index, _) in linebreaks(text) {
+        used += text[previous..index].width();
+        if used > width {
+            break;
+        }
+
+        if index < text.len() {
+            fitting = Some(index);
+        }
+        previous = index;
+    }
+
+    fitting
 }
 
 /// Cuts a word into pieces that each fit `width`, respecting character
@@ -437,6 +510,49 @@ mod tests {
     fn double_width_characters_are_measured_by_display_width() {
         // Four CJK characters are eight columns wide.
         assert_eq!(texts(&wrap(&[plain("中文测试")], 4)), ["中文", "测试"]);
+    }
+
+    #[test]
+    fn cjk_text_uses_the_space_remaining_after_an_english_word() {
+        assert_eq!(
+            texts(&wrap(&[plain("官方 README 目前提供的是环境安装")], 20)),
+            ["官方 README 目前提供", "的是环境安装"]
+        );
+    }
+
+    #[test]
+    fn cjk_punctuation_does_not_begin_a_wrapped_line() {
+        assert_eq!(texts(&wrap(&[plain("甲乙，丙")], 4)), ["甲", "乙，", "丙"]);
+    }
+
+    #[test]
+    fn an_unbreakable_english_word_still_moves_to_a_fresh_line() {
+        assert_eq!(
+            texts(&wrap(&[plain("hi supercalifragilistic")], 8)),
+            ["hi", "supercal", "ifragili", "stic"]
+        );
+    }
+
+    #[test]
+    fn unicode_breaks_preserve_the_fragment_style() {
+        let style = Style::default().fg(Color::Green);
+        let lines = wrap(&[Span::styled("中文测试".to_owned(), style)], 4);
+
+        assert_eq!(texts(&lines), ["中文", "测试"]);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style == style)
+        );
+    }
+
+    #[test]
+    fn unicode_breaks_do_not_drop_or_duplicate_characters() {
+        let source = "中文（测试）与English混排，继续。";
+        let wrapped = texts(&wrap(&[plain(source)], 7));
+
+        assert_eq!(wrapped.concat(), source);
     }
 
     #[test]
