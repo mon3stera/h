@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 
-use h_core::input::{Image, UserInput};
+use h_core::input::{Image as InputImage, UserInput};
 
 use ratatui::{
     Frame,
@@ -8,11 +8,12 @@ use ratatui::{
     crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect, Size},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
+use ratatui_image::{Image as ImageWidget, Resize, picker::Picker, protocol::Protocol};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_width::UnicodeWidthStr;
 
@@ -29,6 +30,9 @@ const MAX_HEIGHT: u16 = 10;
 /// The top and bottom rules.
 const BORDER_HEIGHT: u16 = 2;
 const ATTACHMENT_GAP: u16 = 2;
+const THUMBNAIL_WIDTH: u16 = 12;
+const THUMBNAIL_HEIGHT: u16 = 5;
+const ATTACHMENT_HEIGHT: u16 = THUMBNAIL_HEIGHT + 1;
 
 use Direction::{Newer, Older};
 
@@ -46,12 +50,15 @@ enum Focus {
     Image(usize),
 }
 
-struct Chip {
+struct Tile {
     index: usize,
     x: u16,
-    row: u16,
     width: u16,
-    label: String,
+}
+
+struct Attachment {
+    image: InputImage,
+    thumbnail: Option<Protocol>,
 }
 
 /// The prompt box.
@@ -62,7 +69,8 @@ struct Chip {
 /// arrives as an ESC-prefixed return, which nearly every terminal sends.
 pub struct Input {
     area: TextArea<'static>,
-    images: Vec<Image>,
+    images: Vec<Attachment>,
+    picker: Picker,
     focus: Focus,
     /// Prompts already sent, oldest first.
     history: Vec<String>,
@@ -81,6 +89,12 @@ pub struct Input {
 
 impl Default for Input {
     fn default() -> Self {
+        Self::new(Picker::halfblocks())
+    }
+}
+
+impl Input {
+    pub(crate) fn new(picker: Picker) -> Self {
         let mut area = TextArea::default();
 
         area.set_cursor_line_style(Style::default());
@@ -89,6 +103,7 @@ impl Default for Input {
         Self {
             area,
             images: Vec::new(),
+            picker,
             focus: Focus::Text,
             history: Vec::new(),
             recalled: None,
@@ -98,9 +113,7 @@ impl Default for Input {
             close_areas: RefCell::new(Vec::new()),
         }
     }
-}
 
-impl Input {
     /// Takes a key. A submitted prompt is handed back and the box is cleared.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UserInput> {
         if key.kind == KeyEventKind::Release {
@@ -179,7 +192,10 @@ impl Input {
     pub(crate) fn take(&mut self) -> Option<UserInput> {
         let (text, images) = (
             self.area.lines().join("\n"),
-            std::mem::take(&mut self.images),
+            std::mem::take(&mut self.images)
+                .into_iter()
+                .map(|attachment| attachment.image)
+                .collect(),
         );
         let input = UserInput::from_text_and_images(text.clone(), images);
 
@@ -273,8 +289,23 @@ impl Input {
         self.wrapped.set(None);
     }
 
-    pub(crate) fn add_image(&mut self, image: Image) {
-        self.images.push(image);
+    pub(crate) fn add_image(&mut self, image: InputImage) {
+        let thumbnail = match thumbnail(&self.picker, &image) {
+            Ok(thumbnail) => Some(thumbnail),
+            Err(error) => {
+                tracing::warn!(
+                    event = "ui.image_thumbnail.prepare_failed",
+                    media_type = image.media_type(),
+                    width = image.width(),
+                    height = image.height(),
+                    error = error.to_string(),
+                );
+
+                None
+            }
+        };
+
+        self.images.push(Attachment { image, thumbnail });
     }
 
     pub(crate) fn has_images(&self) -> bool {
@@ -350,13 +381,12 @@ impl Input {
             .clamp(MIN_HEIGHT, MAX_HEIGHT)
     }
 
-    fn attachment_rows(&self, width: u16) -> u16 {
-        let width = field_width(width);
-
-        chips(width, self.images.len())
-            .last()
-            .map(|chip| chip.row.saturating_add(1))
-            .unwrap_or(0)
+    fn attachment_rows(&self, _width: u16) -> u16 {
+        if self.images.is_empty() {
+            0
+        } else {
+            ATTACHMENT_HEIGHT
+        }
     }
 
     fn wrapped_rows(&self, width: u16) -> u16 {
@@ -447,33 +477,90 @@ impl Input {
         ])
         .areas(area);
 
-        for chip in chips(field.width, self.images.len()) {
-            if chip.row >= field.height {
-                continue;
-            }
+        let focus = match self.focus {
+            Focus::Image(index) => index,
+            Focus::Text => self.images.len().saturating_sub(1),
+        };
 
-            let rect = Rect::new(
-                field.x.saturating_add(chip.x),
-                field.y.saturating_add(chip.row),
-                chip.width.min(field.width.saturating_sub(chip.x)),
-                1,
+        for tile in tiles(field.width, self.images.len(), focus) {
+            let area = Rect::new(
+                field.x.saturating_add(tile.x),
+                field.y,
+                tile.width.min(field.width.saturating_sub(tile.x)),
+                field.height.min(ATTACHMENT_HEIGHT),
             );
-            let selected = self.focus == Focus::Image(chip.index);
+            let [preview, label] =
+                Layout::vertical([Constraint::Length(THUMBNAIL_HEIGHT), Constraint::Length(1)])
+                    .areas(area);
+
+            self.render_thumbnail(frame, preview, &self.images[tile.index]);
+
+            let selected = self.focus == Focus::Image(tile.index);
             let style = if selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
                 Style::default().fg(Color::Cyan)
             };
+            let text = format!("[Image {} ×]", tile.index + 1);
+            let text_width = UnicodeWidthStr::width(text.as_str())
+                .try_into()
+                .unwrap_or(u16::MAX);
 
-            frame.render_widget(Paragraph::new(Span::styled(chip.label, style)), rect);
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, style)).alignment(Alignment::Center),
+                label,
+            );
 
-            let close_x = rect.x.saturating_add(chip.width.saturating_sub(2));
-            if close_x < rect.x.saturating_add(rect.width) {
+            let text_x = label
+                .x
+                .saturating_add(label.width.saturating_sub(text_width) / 2);
+            let close_x = text_x.saturating_add(text_width.saturating_sub(2));
+            if close_x < label.x.saturating_add(label.width) {
                 self.close_areas
                     .borrow_mut()
-                    .push((Rect::new(close_x, rect.y, 1, 1), chip.index));
+                    .push((Rect::new(close_x, label.y, 1, 1), tile.index));
             }
         }
+    }
+
+    fn render_thumbnail(&self, frame: &mut Frame, area: Rect, attachment: &Attachment) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(24, 24, 24))),
+            area,
+        );
+
+        let Some(thumbnail) = &attachment.thumbnail else {
+            frame.render_widget(
+                Paragraph::new("preview unavailable")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                area,
+            );
+
+            return;
+        };
+        let size = thumbnail.size();
+        let image = Rect::new(
+            area.x
+                .saturating_add(area.width.saturating_sub(size.width) / 2),
+            area.y
+                .saturating_add(area.height.saturating_sub(size.height) / 2),
+            size.width.min(area.width),
+            size.height.min(area.height),
+        );
+
+        if thumbnail.needs_placeholder(image).is_some() {
+            frame.render_widget(
+                Paragraph::new("[Image]")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                area,
+            );
+
+            return;
+        }
+
+        frame.render_widget(ImageWidget::new(thumbnail), image);
     }
 
     /// Draws the synthetic end-of-line cursor that the textarea clips when it
@@ -502,38 +589,48 @@ impl Input {
     }
 }
 
-fn field_width(width: u16) -> u16 {
-    width
-        .saturating_sub(MARKER_WIDTH + CURSOR_GUTTER_WIDTH)
-        .max(1)
-}
-
-fn chips(width: u16, count: usize) -> Vec<Chip> {
-    let (mut x, mut row) = (0_u16, 0_u16);
-    let mut chips = Vec::with_capacity(count);
-
-    for index in 0..count {
-        let label = format!("[Image {} ×]", index + 1);
-        let chip_width = UnicodeWidthStr::width(label.as_str())
-            .try_into()
-            .unwrap_or(u16::MAX);
-
-        if x > 0 && x.saturating_add(chip_width) > width {
-            x = 0;
-            row = row.saturating_add(1);
-        }
-
-        chips.push(Chip {
-            index,
-            x,
-            row,
-            width: chip_width,
-            label,
-        });
-        x = x.saturating_add(chip_width).saturating_add(ATTACHMENT_GAP);
+fn tiles(width: u16, count: usize, focus: usize) -> Vec<Tile> {
+    if width == 0 || count == 0 {
+        return Vec::new();
     }
 
-    chips
+    let stride = THUMBNAIL_WIDTH.saturating_add(ATTACHMENT_GAP);
+    let capacity = usize::from(
+        width
+            .saturating_add(ATTACHMENT_GAP)
+            .checked_div(stride)
+            .unwrap_or(0)
+            .max(1),
+    );
+    let visible = count.min(capacity);
+    let focus = focus.min(count - 1);
+    let start = focus.saturating_sub(visible / 2).min(count - visible);
+
+    (start..start + visible)
+        .enumerate()
+        .map(|(offset, index)| {
+            let x = u16::try_from(offset)
+                .unwrap_or(u16::MAX)
+                .saturating_mul(stride);
+
+            Tile {
+                index,
+                x,
+                width: THUMBNAIL_WIDTH.min(width.saturating_sub(x)),
+            }
+        })
+        .collect()
+}
+
+fn thumbnail(picker: &Picker, image: &InputImage) -> anyhow::Result<Protocol> {
+    let image = image::load_from_memory(&image.bytes())?;
+    let thumbnail = picker.new_protocol(
+        image,
+        Size::new(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT),
+        Resize::Fit(None),
+    )?;
+
+    Ok(thumbnail)
 }
 
 /// Mirrors the textarea's viewport rule to place a cursor in the gutter.
@@ -563,8 +660,35 @@ mod tests {
         }
     }
 
-    fn image() -> Image {
-        Image::new("image/png", [1, 2, 3], 32, 32).unwrap()
+    fn image() -> InputImage {
+        InputImage::new("image/png", [1, 2, 3], 32, 32).unwrap()
+    }
+
+    fn renderable_image() -> InputImage {
+        use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+        const WIDTH: u32 = 120;
+        const HEIGHT: u32 = 100;
+
+        let mut rgba = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+        for y in 0..HEIGHT {
+            let color = if y < HEIGHT / 2 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+
+            for _ in 0..WIDTH {
+                rgba.extend_from_slice(&color);
+            }
+        }
+
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, WIDTH, HEIGHT, ExtendedColorType::Rgba8)
+            .unwrap();
+
+        InputImage::new("image/png", png, WIDTH, HEIGHT).unwrap()
     }
 
     #[test]
@@ -706,6 +830,81 @@ mod tests {
 
         assert!(removed);
         assert_eq!(input.take().unwrap().image_count(), 1);
+    }
+
+    #[test]
+    fn attachment_bar_renders_a_thumbnail_and_label() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut input = Input::default();
+        input.add_image(renderable_image());
+        let height = input.height(TEST_WIDTH);
+        let mut terminal = Terminal::new(TestBackend::new(TEST_WIDTH, height)).unwrap();
+
+        terminal
+            .draw(|frame| input.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered_image = buffer.content().iter().any(|cell| {
+            matches!(
+                (cell.fg, cell.bg),
+                (
+                    Color::Rgb(255, 0, 0) | Color::Rgb(0, 0, 255),
+                    Color::Rgb(255, 0, 0) | Color::Rgb(0, 0, 255)
+                )
+            )
+        });
+        let rendered_label = buffer
+            .content()
+            .chunks(TEST_WIDTH as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .any(|row| row.contains("[Image 1 ×]"));
+
+        assert!(rendered_image);
+        assert!(rendered_label);
+        assert_eq!(height, 1 + ATTACHMENT_HEIGHT + BORDER_HEIGHT);
+    }
+
+    #[test]
+    fn attachment_tiles_window_around_the_focus() {
+        assert_eq!(
+            tiles(THUMBNAIL_WIDTH * 2 + ATTACHMENT_GAP, 4, 0)
+                .iter()
+                .map(|tile| tile.index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            tiles(THUMBNAIL_WIDTH * 2 + ATTACHMENT_GAP, 4, 3)
+                .iter()
+                .map(|tile| tile.index)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(
+            tiles(THUMBNAIL_WIDTH * 3 + ATTACHMENT_GAP * 2, 5, 2)
+                .iter()
+                .map(|tile| tile.index)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn attachment_bar_survives_a_terminal_narrower_than_a_thumbnail() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut input = Input::default();
+        input.add_image(renderable_image());
+        let height = input.height(6);
+        let mut terminal = Terminal::new(TestBackend::new(6, height)).unwrap();
+
+        terminal
+            .draw(|frame| input.render(frame, frame.area()))
+            .unwrap();
+
+        assert_eq!(tiles(3, 1, 0)[0].width, 3);
     }
 
     #[test]

@@ -70,6 +70,12 @@ impl Image {
         &self.data
     }
 
+    pub fn bytes(&self) -> Vec<u8> {
+        STANDARD
+            .decode(self.data.as_bytes())
+            .expect("stored image data was validated before construction")
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -295,6 +301,7 @@ mod tests {
         let restored = serde_json::from_str::<UserInput>(&stored).unwrap();
 
         assert_eq!(restored, input);
+        assert_eq!(restored.images().next().unwrap().bytes(), [1, 2, 3]);
         assert_eq!(restored.display(), "inspect\n\n[Image 1]");
     }
 

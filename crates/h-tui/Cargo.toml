@@ -12,6 +12,7 @@ h-core = { path = "../h-core" }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 pulldown-cmark = "0.13.4"
 ratatui = "0.30.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 ratatui-textarea = "0.9.2"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1.53.0", features = ["full"] }

@@ -152,8 +152,10 @@ Inside the TUI:
 
 - `Alt+Enter` submits the prompt; `Ctrl+Enter` also works in terminals that
   support an enhanced keyboard protocol. Plain Enter inserts a newline.
-- Paste an image with `Ctrl+V`. Attached images appear below the prompt and can
-  be removed with their `×` button or with Backspace while the text is empty.
+- Paste an image with `Ctrl+V`. Attached images appear below the prompt as
+  thumbnails with `[Image N ×]` labels and can be removed with their `×` button
+  or with Backspace while the text is empty. Kitty, Sixel, and iTerm2 graphics
+  are detected automatically, with Unicode half-blocks as the fallback.
 - `Shift+Tab` focuses image attachments; Left/Right selects one, Backspace or
   Delete removes it, and Esc or Tab returns to text input.
 - `Esc` cancels the active turn.

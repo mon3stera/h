@@ -20,6 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
+use ratatui_image::picker::Picker;
 use tokio::sync::{
     mpsc::{Receiver, Sender, UnboundedReceiver},
     oneshot,
@@ -80,9 +81,10 @@ pub async fn run(
     history: Vec<String>,
     context_window: usize,
 ) -> anyhow::Result<()> {
-    let mut terminal = enter()?;
+    let (mut terminal, picker) = enter()?;
     let outcome = drive(
         &mut terminal,
+        picker,
         commands,
         &mut events,
         &mut requests,
@@ -99,8 +101,24 @@ pub async fn run(
 ///
 /// Capturing the mouse also takes the terminal's own selection, which most
 /// terminals hand back while Shift is held.
-fn enter() -> anyhow::Result<DefaultTerminal> {
+fn enter() -> anyhow::Result<(DefaultTerminal, Picker)> {
     let terminal = ratatui::init();
+    let picker = match Picker::from_query_stdio() {
+        Ok(picker) => picker,
+        Err(error) => {
+            tracing::warn!(
+                event = "ui.image_protocol.detect_failed",
+                error = error.to_string(),
+            );
+
+            Picker::halfblocks()
+        }
+    };
+
+    tracing::info!(
+        event = "ui.image_protocol.selected",
+        protocol = ?picker.protocol_type(),
+    );
 
     execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
 
@@ -113,7 +131,7 @@ fn enter() -> anyhow::Result<DefaultTerminal> {
         previous(info);
     }));
 
-    Ok(terminal)
+    Ok((terminal, picker))
 }
 
 fn leave() {
@@ -123,6 +141,7 @@ fn leave() {
 
 async fn drive(
     terminal: &mut DefaultTerminal,
+    picker: Picker,
     commands: Sender<AgentCommand>,
     events: &mut UnboundedReceiver<AgentViewEvent>,
     requests: &mut Receiver<Request>,
@@ -131,6 +150,7 @@ async fn drive(
 ) -> anyhow::Result<()> {
     let mut app = App {
         context_window,
+        input: Input::new(picker),
         ..App::default()
     };
 
