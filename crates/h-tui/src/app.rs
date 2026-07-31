@@ -239,12 +239,12 @@ impl App {
                 // "question dismissed" result instead.
                 self.asking = None;
 
-                if let Some(started) = self.started.take() {
-                    if *completed {
-                        self.state
-                            .units
-                            .push(RenderUnit::Done(started.elapsed(), self.state.turn_tokens));
-                    }
+                if let Some(started) = self.started.take()
+                    && *completed
+                {
+                    self.state
+                        .units
+                        .push(RenderUnit::Done(started.elapsed(), self.state.turn_tokens));
                 }
             }
             AgentViewEvent::SessionStarted => {
@@ -255,10 +255,8 @@ impl App {
                 self.command_menu.reset();
                 self.transcript.pin();
             }
-            AgentViewEvent::CommandFinished(command) => {
-                if self.pending_command == Some(*command) {
-                    self.pending_command = None;
-                }
+            AgentViewEvent::CommandFinished(command) if self.pending_command == Some(*command) => {
+                self.pending_command = None;
             }
             _ => {}
         }

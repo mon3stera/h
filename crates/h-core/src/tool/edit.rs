@@ -473,10 +473,9 @@ impl Presenter for EditPresenter {
                 } else {
                     // The call itself succeeded while the edit did not land;
                     // presenting that as a success would mislead.
-                    let message = output.get("status").map_or_else(
-                        || "Edit was not applied".to_owned(),
-                        |status| rejection(status),
-                    );
+                    let message = output
+                        .get("status")
+                        .map_or_else(|| "Edit was not applied".to_owned(), rejection);
 
                     (
                         ToolCallStatus::Failed {

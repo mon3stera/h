@@ -153,3 +153,9 @@ impl ToolRegistry {
         Ok(())
     }
 }
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}

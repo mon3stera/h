@@ -195,6 +195,21 @@ enum RequestAttempt {
     },
 }
 
+#[derive(Default)]
+struct ResponseBatch {
+    tool_calls: Vec<ToolCall>,
+}
+
+impl ResponseBatch {
+    fn push(&mut self, call: ToolCall) {
+        self.tool_calls.push(call);
+    }
+
+    fn take(&mut self) -> Vec<ToolCall> {
+        std::mem::take(&mut self.tool_calls)
+    }
+}
+
 enum CompactOutcome {
     Applied { total_tokens: Option<usize> },
     Empty,
@@ -288,8 +303,8 @@ where
     }
 
     /// Registers the built-in tools. `bridge` is handed to the tools that need
-    /// an answer from the user; note that [`Self::handle_signal`] awaits each
-    /// tool call in turn, so at most one such request is outstanding at a time.
+    /// an answer from the user; tool batches are executed sequentially, so at
+    /// most one such request is outstanding at a time.
     pub fn with_internal_tools(&mut self, bridge: Bridge) -> anyhow::Result<&mut Self> {
         let file_buffers = FileBufferStore::default();
 
@@ -535,9 +550,7 @@ where
             return before;
         }
 
-        let Some(before) = before else {
-            return None;
-        };
+        let before = before?;
         if before < self.auto_compact_token_limit {
             return Some(before);
         }
@@ -555,9 +568,7 @@ where
             );
         }
 
-        let Some(after_tool_compaction) = after_tool_compaction else {
-            return None;
-        };
+        let after_tool_compaction = after_tool_compaction?;
         if after_tool_compaction < self.auto_compact_token_limit {
             return Some(after_tool_compaction);
         }
@@ -629,9 +640,96 @@ where
         self.tool.call(call).await
     }
 
+    fn record_tool_result(&mut self, call: &ToolCall, result: ToolCallResult) {
+        let output = result.clone().into_provider_output();
+
+        self.context.histories_mut().push(Message::ToolCallResult {
+            call_id: call.id().as_str().to_owned(),
+            output,
+            summary: result.summary().cloned(),
+        });
+
+        self.event_bus
+            .broadcast(AgentEvent::ToolCallCompleted(result.clone()));
+        self.view_bus.broadcast(AgentViewEvent::Tool(
+            self.tool.present_completed(call, &result),
+        ));
+    }
+
+    fn interrupt_tool_calls(&mut self, calls: impl IntoIterator<Item = ToolCall>) {
+        for call in calls {
+            let result = ToolCallResult::failure(call.id().clone(), INTERRUPTED_BY_USER);
+            self.record_tool_result(&call, result);
+        }
+    }
+
+    async fn execute_response_batch(
+        &mut self,
+        batch: &mut ResponseBatch,
+        metrics: &mut TurnMetrics,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let calls = batch.take();
+        if calls.is_empty() {
+            return true;
+        }
+
+        // Provider output must remain contiguous. Finalize any trailing text
+        // before local function outputs are appended to the context.
+        self.merge_text_delta();
+
+        let mut calls = calls.into_iter();
+        while let Some(call) = calls.next() {
+            if cancellation.is_cancelled() {
+                self.interrupt_tool_calls(std::iter::once(call).chain(calls));
+                return false;
+            }
+
+            // Keep the call future in its own scope so cancellation drops it
+            // before the explicit tool hook runs. This releases any locks or
+            // request handles the hook may need to terminate work.
+            let result = {
+                let call = self.handle_tool_call(&call);
+                tokio::pin!(call);
+
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    result = &mut call => Some(result),
+                }
+            };
+            let result = match result {
+                Some(result) => result,
+                None => {
+                    if let Err(error) = self.tool.cancel(&call).await {
+                        tracing::warn!(
+                            event = "tool.cancel.failed",
+                            tool_name = call.name(),
+                            error_class = "tool_cancel_error",
+                            error = error.to_string(),
+                        );
+                    }
+
+                    ToolCallResult::failure(call.id().clone(), INTERRUPTED_BY_USER)
+                }
+            };
+            let interrupted = cancellation.is_cancelled();
+
+            self.record_tool_result(&call, result);
+
+            if interrupted {
+                self.interrupt_tool_calls(calls);
+                return false;
+            }
+        }
+
+        self.prepare_provider_context(metrics, cancellation).await
+    }
+
     async fn handle_signal(
         &mut self,
         signal: &ProviderSignal,
+        batch: &mut ResponseBatch,
         metrics: &mut TurnMetrics,
         cancellation: &CancellationToken,
     ) -> anyhow::Result<()> {
@@ -683,50 +781,7 @@ where
 
                 self.view_bus
                     .broadcast(AgentViewEvent::Tool(self.tool.present_running(call)));
-
-                // Keep the call future in its own scope so cancellation drops
-                // it before the explicit tool hook runs. This releases any
-                // locks or request handles the hook may need to terminate work.
-                let result = {
-                    let call = self.handle_tool_call(call);
-                    tokio::pin!(call);
-
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => None,
-                        result = &mut call => Some(result),
-                    }
-                };
-                let result = match result {
-                    Some(result) => result,
-                    None => {
-                        if let Err(error) = self.tool.cancel(call).await {
-                            tracing::warn!(
-                                event = "tool.cancel.failed",
-                                tool_name = call.name(),
-                                error_class = "tool_cancel_error",
-                                error = error.to_string(),
-                            );
-                        }
-
-                        ToolCallResult::failure(call.id().clone(), INTERRUPTED_BY_USER)
-                    }
-                };
-                let output = result.clone().into_provider_output();
-
-                self.context.histories_mut().push(Message::ToolCallResult {
-                    call_id: call.id().as_str().to_owned(),
-                    output,
-                    summary: result.summary().cloned(),
-                });
-
-                self.event_bus
-                    .broadcast(AgentEvent::ToolCallCompleted(result.clone()));
-                self.view_bus.broadcast(AgentViewEvent::Tool(
-                    self.tool.present_completed(call, &result),
-                ));
-
-                self.prepare_provider_context(metrics, cancellation).await;
+                batch.push(call.clone());
             }
             ProviderSignal::ToolCallCompleted(result) => {
                 self.merge_text_delta();
@@ -751,6 +806,14 @@ where
                     CompletedReason::Final => "final",
                 };
                 self.merge_text_delta();
+
+                if !self
+                    .execute_response_batch(batch, metrics, cancellation)
+                    .await
+                {
+                    return Ok(());
+                }
+
                 self.view_bus.broadcast(AgentViewEvent::Completed);
 
                 let final_answer = matches!(reason, CompletedReason::Final);
@@ -1058,7 +1121,7 @@ where
         &self,
         messages: &[Message],
         cancellation: &CancellationToken,
-    ) -> anyhow::Result<Option<ProviderEventStream<P::StreamEvent>>> {
+    ) -> anyhow::Result<Option<ProviderEventStream>> {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Ok(None),
@@ -1093,11 +1156,13 @@ where
         self.refresh_token_count(metrics.total_tokens);
 
         let mut had_output = false;
+        let mut batch = ResponseBatch::default();
 
         loop {
             let event = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
+                    self.execute_response_batch(&mut batch, metrics, cancellation).await;
                     self.settle_request(metrics);
                     return Ok(RequestAttempt::Interrupted);
                 }
@@ -1105,39 +1170,58 @@ where
             };
 
             match event {
-                Some(Ok(event)) => {
+                Some(Ok(signal)) => {
+                    if cancellation.is_cancelled() {
+                        self.execute_response_batch(&mut batch, metrics, cancellation)
+                            .await;
+                        self.settle_request(metrics);
+                        return Ok(RequestAttempt::Interrupted);
+                    }
+
+                    let completed = matches!(&signal, ProviderSignal::Completed { .. });
+                    had_output |= !matches!(&signal, ProviderSignal::Unsupported);
+
+                    let agent_event: AgentEvent = signal.clone().into();
+                    if !completed {
+                        self.event_bus.broadcast(agent_event.clone());
+                    }
+
+                    if let Err(error) = self
+                        .handle_signal(&signal, &mut batch, metrics, cancellation)
+                        .await
+                    {
+                        if !self
+                            .execute_response_batch(&mut batch, metrics, cancellation)
+                            .await
+                        {
+                            self.settle_request(metrics);
+                            return Ok(RequestAttempt::Interrupted);
+                        }
+
+                        self.settle_request(metrics);
+                        return Err(error);
+                    }
+
                     if cancellation.is_cancelled() {
                         self.settle_request(metrics);
                         return Ok(RequestAttempt::Interrupted);
                     }
 
-                    let signal = match self.provider.handle(event).await {
-                        Ok(signal) => signal,
-                        Err(error) => {
-                            self.settle_request(metrics);
-                            return Ok(RequestAttempt::Retry {
-                                error,
-                                error_class: "provider_event_error",
-                                had_output,
-                            });
-                        }
-                    };
-                    let completed = matches!(&signal, ProviderSignal::Completed { .. });
-                    had_output |= !matches!(&signal, ProviderSignal::Unsupported);
-
-                    let agent_event: AgentEvent = signal.clone().into();
-                    self.event_bus.broadcast(agent_event);
-                    if let Err(error) = self.handle_signal(&signal, metrics, cancellation).await {
-                        self.settle_request(metrics);
-                        return Err(error);
-                    }
-
                     if completed {
+                        self.event_bus.broadcast(agent_event);
                         self.settle_request(metrics);
                         return Ok(RequestAttempt::Completed);
                     }
                 }
                 Some(Err(error)) => {
+                    if !self
+                        .execute_response_batch(&mut batch, metrics, cancellation)
+                        .await
+                    {
+                        self.settle_request(metrics);
+                        return Ok(RequestAttempt::Interrupted);
+                    }
+
                     self.settle_request(metrics);
                     return Ok(RequestAttempt::Retry {
                         error,
@@ -1146,6 +1230,14 @@ where
                     });
                 }
                 None => {
+                    if !self
+                        .execute_response_batch(&mut batch, metrics, cancellation)
+                        .await
+                    {
+                        self.settle_request(metrics);
+                        return Ok(RequestAttempt::Interrupted);
+                    }
+
                     self.settle_request(metrics);
                     return Ok(RequestAttempt::Retry {
                         error: anyhow::anyhow!("provider stream ended before response.completed"),
@@ -1316,8 +1408,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for TestProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "test-model"
         }
@@ -1338,15 +1428,7 @@ mod tests {
             Ok(Some(output.len()))
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(ProviderSignal::Unsupported)
-        }
-
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
-        {
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             Ok(Box::pin(stream::empty()))
         }
     }
@@ -1358,8 +1440,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for CompactingProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "compacting-model"
         }
@@ -1401,14 +1481,7 @@ mod tests {
             Ok(Some(Compaction::new(state, Some(30))))
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(completed(CompletedReason::Final))
-        }
-
-        async fn stream(
-            &self,
-            input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+        async fn stream(&self, input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             if let Some(stream_saw_compaction) = &self.stream_saw_compaction {
                 let compacted = !self.input.lock().unwrap().is_empty()
                     && input
@@ -1418,7 +1491,9 @@ mod tests {
                 stream_saw_compaction.store(compacted, Ordering::SeqCst);
             }
 
-            Ok(Box::pin(stream::once(async { Ok(()) })))
+            Ok(Box::pin(stream::once(async {
+                Ok(completed(CompletedReason::Final))
+            })))
         }
     }
 
@@ -1428,8 +1503,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for CapturingProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "capturing-model"
         }
@@ -1442,14 +1515,7 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(ProviderSignal::Unsupported)
-        }
-
-        async fn stream(
-            &self,
-            input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+        async fn stream(&self, input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             *self.input.lock().unwrap() = input.to_vec();
             Ok(Box::pin(stream::empty()))
         }
@@ -1461,7 +1527,7 @@ mod tests {
     }
 
     impl Stream for PendingStream {
-        type Item = anyhow::Result<()>;
+        type Item = anyhow::Result<ProviderSignal>;
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
             self.polled.notify_one();
@@ -1482,8 +1548,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for PendingStreamProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "pending-model"
         }
@@ -1504,14 +1568,7 @@ mod tests {
             Ok(Some(text_bytes(output)))
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(ProviderSignal::Unsupported)
-        }
-
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             Ok(Box::pin(PendingStream {
                 polled: self.polled.clone(),
                 dropped: self.dropped.clone(),
@@ -1525,8 +1582,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for PartialProvider {
-        type StreamEvent = String;
-
         fn model(&self) -> &str {
             "partial-model"
         }
@@ -1547,30 +1602,22 @@ mod tests {
             Ok(Some(text_bytes(output)))
         }
 
-        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             self.handled.notify_one();
-            Ok(ProviderSignal::TextDelta(event))
-        }
-
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
             let events =
-                stream::once(async { Ok("partial answer".to_owned()) }).chain(stream::pending());
+                stream::once(async { Ok(ProviderSignal::TextDelta("partial answer".to_owned())) })
+                    .chain(stream::pending());
 
             Ok(Box::pin(events))
         }
     }
 
     struct ToolProvider {
-        call: ToolCall,
+        calls: Vec<ToolCall>,
     }
 
     #[async_trait::async_trait]
     impl Provider for ToolProvider {
-        type StreamEvent = ProviderSignal;
-
         fn model(&self) -> &str {
             "tool-model"
         }
@@ -1583,18 +1630,68 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(event)
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            let mut events = self
+                .calls
+                .iter()
+                .cloned()
+                .map(ProviderSignal::ToolCallStarted)
+                .collect::<Vec<_>>();
+            events.push(completed(CompletedReason::NeedCall));
+
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    struct CancelAfterToolCallStream {
+        cancellation: CancellationToken,
+        state: u8,
+    }
+
+    impl Stream for CancelAfterToolCallStream {
+        type Item = anyhow::Result<ProviderSignal>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            let event = match self.state {
+                0 => ProviderSignal::ToolCallStarted(ToolCall::new("call-1", "missing", json!({}))),
+                1 => {
+                    self.cancellation.cancel();
+                    ProviderSignal::Unsupported
+                }
+                _ => return Poll::Pending,
+            };
+            self.state += 1;
+
+            Poll::Ready(Some(Ok(event)))
+        }
+    }
+
+    struct CancelAfterToolCallProvider {
+        cancellation: CancellationToken,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CancelAfterToolCallProvider {
+        fn model(&self) -> &str {
+            "cancel-after-tool-call-model"
         }
 
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
-            let signal = ProviderSignal::ToolCallStarted(self.call.clone());
-            let events = stream::once(async move { Ok(signal) }).chain(stream::pending());
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
 
-            Ok(Box::pin(events))
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            Ok(Box::pin(CancelAfterToolCallStream {
+                cancellation: self.cancellation.clone(),
+                state: 0,
+            }))
         }
     }
 
@@ -1643,21 +1740,19 @@ mod tests {
     /// premature-EOF path. A provider that answered `NeedCall` forever would
     /// keep [`Agent::run_turn`] opening fresh requests and never return.
     struct ScriptedProvider {
-        reasons: std::collections::VecDeque<CompletedReason>,
+        reasons: Mutex<std::collections::VecDeque<CompletedReason>>,
     }
 
     impl ScriptedProvider {
         fn new(reasons: impl IntoIterator<Item = CompletedReason>) -> Self {
             Self {
-                reasons: reasons.into_iter().collect(),
+                reasons: Mutex::new(reasons.into_iter().collect()),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl Provider for ScriptedProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "scripted-model"
         }
@@ -1670,38 +1765,32 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(self
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            let signal = self
                 .reasons
+                .lock()
+                .unwrap()
                 .pop_front()
-                .map_or(ProviderSignal::Unsupported, completed))
-        }
+                .map_or(ProviderSignal::Unsupported, completed);
 
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
-        {
-            Ok(Box::pin(stream::once(async { Ok(()) })))
+            Ok(Box::pin(stream::once(async move { Ok(signal) })))
         }
     }
 
     struct EstimatingProvider {
-        completions: std::collections::VecDeque<CompletedReason>,
+        completions: Mutex<std::collections::VecDeque<CompletedReason>>,
     }
 
     impl EstimatingProvider {
         fn new(completions: impl IntoIterator<Item = CompletedReason>) -> Self {
             Self {
-                completions: completions.into_iter().collect(),
+                completions: Mutex::new(completions.into_iter().collect()),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl Provider for EstimatingProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "estimating-model"
         }
@@ -1722,25 +1811,22 @@ mod tests {
             Ok(Some(output.len()))
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(self
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            let signal = self
                 .completions
+                .lock()
+                .unwrap()
                 .pop_front()
-                .map_or(ProviderSignal::Unsupported, completed))
-        }
+                .map_or(ProviderSignal::Unsupported, completed);
 
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
-        {
-            Ok(Box::pin(stream::once(async { Ok(()) })))
+            Ok(Box::pin(stream::once(async move { Ok(signal) })))
         }
     }
 
     struct SignalProvider {
         streams: Mutex<std::collections::VecDeque<Vec<ProviderSignal>>>,
         estimate_output: fn(&[Message]) -> usize,
+        inputs: Option<Arc<Mutex<Vec<Vec<Message>>>>>,
     }
 
     impl SignalProvider {
@@ -1751,14 +1837,18 @@ mod tests {
             Self {
                 streams: Mutex::new(streams.into_iter().collect()),
                 estimate_output,
+                inputs: None,
             }
+        }
+
+        fn record_inputs(mut self, inputs: Arc<Mutex<Vec<Vec<Message>>>>) -> Self {
+            self.inputs = Some(inputs);
+            self
         }
     }
 
     #[async_trait::async_trait]
     impl Provider for SignalProvider {
-        type StreamEvent = ProviderSignal;
-
         fn model(&self) -> &str {
             "signal-model"
         }
@@ -1779,14 +1869,11 @@ mod tests {
             Ok(Some((self.estimate_output)(output)))
         }
 
-        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(event)
-        }
+        async fn stream(&self, input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            if let Some(inputs) = &self.inputs {
+                inputs.lock().unwrap().push(input.to_vec());
+            }
 
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
             let events = self.streams.lock().unwrap().pop_front().unwrap_or_default();
 
             Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
@@ -2119,10 +2206,12 @@ mod tests {
         let mut agent = Agent::new(TestProvider);
         let mut events = agent.subscribe_view();
         let mut metrics = TurnMetrics::new();
+        let mut batch = ResponseBatch::default();
 
         agent
             .handle_signal(
                 &ProviderSignal::Reasoning(reasoning.clone()),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2158,10 +2247,12 @@ mod tests {
         let mut agent = Agent::new(TestProvider);
         let mut events = agent.subscribe_view();
         let mut metrics = TurnMetrics::new();
+        let mut batch = ResponseBatch::default();
 
         agent
             .handle_signal(
                 &ProviderSignal::Search(search.clone()),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2189,10 +2280,12 @@ mod tests {
         let mut agent = agent_with_read_summary();
         agent.with_tool_summary_turn_interval(NonZeroUsize::new(1).unwrap());
         let mut metrics = TurnMetrics::default();
+        let mut batch = ResponseBatch::default();
 
         agent
             .handle_signal(
                 &completed(CompletedReason::NeedCall),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2204,6 +2297,7 @@ mod tests {
         agent
             .handle_signal(
                 &completed(CompletedReason::Final),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2217,11 +2311,13 @@ mod tests {
     async fn the_default_interval_freezes_on_the_eighth_final_turn() {
         let mut agent = agent_with_read_summary();
         let mut metrics = TurnMetrics::default();
+        let mut batch = ResponseBatch::default();
 
         for _ in 0..7 {
             agent
                 .handle_signal(
                     &completed(CompletedReason::Final),
+                    &mut batch,
                     &mut metrics,
                     &cancellation(),
                 )
@@ -2234,6 +2330,7 @@ mod tests {
         agent
             .handle_signal(
                 &completed(CompletedReason::Final),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2249,10 +2346,12 @@ mod tests {
         agent.with_tool_summary_turn_interval(NonZeroUsize::new(1).unwrap());
         let mut metrics = TurnMetrics::new();
         metrics.start_request(Some(7));
+        let mut batch = ResponseBatch::default();
 
         agent
             .handle_signal(
                 &completed(CompletedReason::Final),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2329,6 +2428,7 @@ mod tests {
         agent.with_auto_compact_token_limit(200);
         agent.append_prompt("inspect the project".into());
         let mut metrics = TurnMetrics::new();
+        let mut batch = ResponseBatch::default();
 
         agent
             .handle_signal(
@@ -2337,6 +2437,17 @@ mod tests {
                     "no_such_tool",
                     json!({}),
                 )),
+                &mut batch,
+                &mut metrics,
+                &cancellation(),
+            )
+            .await
+            .unwrap();
+
+        agent
+            .handle_signal(
+                &completed(CompletedReason::NeedCall),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -2374,15 +2485,6 @@ mod tests {
                 ..
             } if *count > 200
         )));
-
-        agent
-            .handle_signal(
-                &completed(CompletedReason::NeedCall),
-                &mut metrics,
-                &cancellation(),
-            )
-            .await
-            .unwrap();
 
         assert!(matches!(agent.turn, NextTurn::Continue));
         assert_eq!(agent.prompts(), ["inspect the project"]);
@@ -2429,7 +2531,7 @@ mod tests {
                     AgentViewEvent::TokenUsage { turn, .. } => *turn,
                     _ => None,
                 })
-                .last(),
+                .next_back(),
             Some(80),
             "the turn total includes local estimates for compaction and the normal request"
         );
@@ -2619,10 +2721,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_a_tool_calls_its_hook_and_records_an_interrupted_result() {
+    async fn cancelling_a_tool_batch_interrupts_the_active_and_queued_calls() {
         let (started, cancelled) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
-        let call = ToolCall::new("call-1", "blocking", json!({}));
-        let mut agent = Agent::new(ToolProvider { call });
+        let calls = vec![
+            ToolCall::new("call-1", "blocking", json!({})),
+            ToolCall::new("call-2", "missing", json!({})),
+        ];
+        let mut agent = Agent::new(ToolProvider { calls });
 
         agent.tool.register(BlockingTool {
             started: started.clone(),
@@ -2652,20 +2757,66 @@ mod tests {
             .iter()
             .filter(|message| matches!(message, Message::ToolCall { .. }))
             .count();
-        let result = histories.iter().find_map(|message| match message {
-            Message::ToolCallResult {
-                call_id, output, ..
-            } => Some((call_id, output)),
-            _ => None,
-        });
+        let results = histories
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolCallResult {
+                    call_id, output, ..
+                } => Some((call_id, output)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(call_count, 1);
-        assert!(matches!(
-            result,
-            Some((call_id, output))
-                if call_id == "call-1"
+        assert_eq!(call_count, 2);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().zip(["call-1", "call-2"]).all(
+            |((call_id, output), expected_id)| {
+                *call_id == expected_id
                     && serde_json::from_str::<Value>(output).unwrap()
                         == json!({"error": INTERRUPTED_BY_USER})
+            }
+        ));
+        assert!(matches!(
+            histories,
+            [
+                Message::User(_),
+                Message::ToolCall { call_id: call_1, .. },
+                Message::ToolCall { call_id: call_2, .. },
+                Message::ToolCallResult { call_id: result_1, .. },
+                Message::ToolCallResult { call_id: result_2, .. },
+            ] if call_1 == "call-1"
+                && call_2 == "call-2"
+                && result_1 == call_1
+                && result_2 == call_2
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_event_handling_interrupts_buffered_tool_calls() {
+        let cancellation = cancellation();
+        let mut agent = Agent::new(CancelAfterToolCallProvider {
+            cancellation: cancellation.clone(),
+        });
+
+        agent
+            .continue_turn("run a tool", cancellation)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            agent.context.histories(),
+            [
+                Message::User(_),
+                Message::ToolCall { call_id: call, .. },
+                Message::ToolCallResult {
+                    call_id: result,
+                    output,
+                    ..
+                },
+            ] if call == "call-1"
+                && result == call
+                && serde_json::from_str::<Value>(output).unwrap()
+                    == json!({"error": INTERRUPTED_BY_USER})
         ));
     }
 
@@ -2675,8 +2826,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for RunawayProvider {
-        type StreamEvent = ();
-
         fn model(&self) -> &str {
             "runaway-model"
         }
@@ -2689,16 +2838,10 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, _event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(completed(CompletedReason::NeedCall))
-        }
-
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
-        {
-            Ok(Box::pin(stream::once(async { Ok(()) })))
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            Ok(Box::pin(stream::once(async {
+                Ok(completed(CompletedReason::NeedCall))
+            })))
         }
     }
 
@@ -2768,6 +2911,59 @@ mod tests {
             Some(true),
             "the final answer came on the second request, and it still counts"
         );
+    }
+
+    #[tokio::test]
+    async fn every_call_precedes_every_result_from_the_same_response() {
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let reasoning =
+            br#"{"type":"reasoning","content":[{"type":"reasoning_text","text":"inspect"}]}"#
+                .to_vec();
+        let provider = SignalProvider::new(
+            [
+                vec![
+                    ProviderSignal::Reasoning(reasoning.clone()),
+                    ProviderSignal::TextDelta("I will inspect the environment.".to_owned()),
+                    ProviderSignal::ToolCallStarted(ToolCall::new("call-1", "missing", json!({}))),
+                    ProviderSignal::ToolCallStarted(ToolCall::new("call-2", "missing", json!({}))),
+                    ProviderSignal::ToolCallStarted(ToolCall::new("call-3", "missing", json!({}))),
+                    completed(CompletedReason::NeedCall),
+                ],
+                vec![completed(CompletedReason::Final)],
+            ],
+            text_bytes,
+        )
+        .record_inputs(inputs.clone());
+        let mut agent = Agent::new(provider);
+
+        agent
+            .continue_turn("inspect the environment", cancellation())
+            .await
+            .unwrap();
+
+        let inputs = inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(matches!(
+            inputs[1].as_slice(),
+            [
+                Message::User(_),
+                Message::Reasoning(stored_reasoning),
+                Message::Assistant(text),
+                Message::ToolCall { call_id: call_1, .. },
+                Message::ToolCall { call_id: call_2, .. },
+                Message::ToolCall { call_id: call_3, .. },
+                Message::ToolCallResult { call_id: result_1, .. },
+                Message::ToolCallResult { call_id: result_2, .. },
+                Message::ToolCallResult { call_id: result_3, .. },
+            ] if stored_reasoning == &reasoning
+                && text == "I will inspect the environment."
+                && call_1 == "call-1"
+                && call_2 == "call-2"
+                && call_3 == "call-3"
+                && result_1 == call_1
+                && result_2 == call_2
+                && result_3 == call_3
+        ));
     }
 
     #[tokio::test]
@@ -2980,7 +3176,7 @@ mod tests {
         Open,
         Stream,
         Eof,
-        Handle,
+        Decode,
     }
 
     /// Fails a provider request at one point a set number of times before
@@ -3007,8 +3203,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for FlakyProvider {
-        type StreamEvent = ProviderSignal;
-
         fn model(&self) -> &str {
             "flaky-model"
         }
@@ -3021,21 +3215,7 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            if matches!(self.point, FailurePoint::Handle)
-                && matches!(&event, ProviderSignal::Unsupported)
-            {
-                anyhow::bail!("provider response error");
-            }
-
-            Ok(event)
-        }
-
-        async fn stream(
-            &self,
-            _input: &[Message],
-        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
-        {
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
 
             let should_fail = self
@@ -3052,8 +3232,8 @@ mod tests {
                         Err(anyhow::anyhow!("stream reset by peer"))
                     }))),
                     FailurePoint::Eof => Ok(Box::pin(stream::empty())),
-                    FailurePoint::Handle => Ok(Box::pin(stream::once(async {
-                        Ok(ProviderSignal::Unsupported)
+                    FailurePoint::Decode => Ok(Box::pin(stream::once(async {
+                        Err(anyhow::anyhow!("provider response error"))
                     }))),
                 };
             }
@@ -3072,8 +3252,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for PartialRetryProvider {
-        type StreamEvent = ProviderSignal;
-
         fn model(&self) -> &str {
             "partial-retry-model"
         }
@@ -3086,18 +3264,23 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(event)
-        }
-
-        async fn stream(
-            &self,
-            input: &[Message],
-        ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+        async fn stream(&self, input: &[Message]) -> anyhow::Result<ProviderEventStream> {
             self.inputs.lock().unwrap().push(input.to_vec());
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             let events = if attempt == 0 {
-                let mut events = vec![Ok(ProviderSignal::TextDelta("partial answer".to_owned()))];
+                let mut events = vec![
+                    Ok(ProviderSignal::TextDelta("partial answer".to_owned())),
+                    Ok(ProviderSignal::ToolCallStarted(ToolCall::new(
+                        "call-1",
+                        "missing",
+                        json!({}),
+                    ))),
+                    Ok(ProviderSignal::ToolCallStarted(ToolCall::new(
+                        "call-2",
+                        "missing",
+                        json!({}),
+                    ))),
+                ];
 
                 if matches!(self.point, FailurePoint::Stream) {
                     events.push(Err(anyhow::anyhow!("stream reset by peer")));
@@ -3214,8 +3397,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_provider_event_error_is_broadcast_and_retried() {
-        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Handle, 1));
+    async fn a_provider_decode_error_is_broadcast_and_retried() {
+        let mut agent = Agent::new(FlakyProvider::new(FailurePoint::Decode, 1));
         let mut events = agent.subscribe_view();
         let started = tokio::time::Instant::now();
 
@@ -3230,7 +3413,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retries_continue_from_partial_text() {
+    async fn retries_continue_from_ordered_partial_output() {
         for point in [FailurePoint::Stream, FailurePoint::Eof] {
             let inputs = Arc::new(Mutex::new(Vec::new()));
             let mut agent = Agent::new(PartialRetryProvider {
@@ -3246,9 +3429,21 @@ mod tests {
 
             let inputs = inputs.lock().unwrap();
             assert_eq!(inputs.len(), 2);
-            assert!(inputs[1].iter().any(|message| {
-                matches!(message, Message::Assistant(text) if text == "partial answer")
-            }));
+            assert!(matches!(
+                inputs[1].as_slice(),
+                [
+                    Message::User(_),
+                    Message::Assistant(text),
+                    Message::ToolCall { call_id: call_1, .. },
+                    Message::ToolCall { call_id: call_2, .. },
+                    Message::ToolCallResult { call_id: result_1, .. },
+                    Message::ToolCallResult { call_id: result_2, .. },
+                ] if text == "partial answer"
+                    && call_1 == "call-1"
+                    && call_2 == "call-2"
+                    && result_1 == call_1
+                    && result_2 == call_2
+            ));
         }
     }
 
@@ -3290,6 +3485,7 @@ mod tests {
         let mut agent = Agent::new(TestProvider);
         agent.with_internal_tools(Bridge::new().0).unwrap();
         let mut metrics = TurnMetrics::default();
+        let mut batch = ResponseBatch::default();
 
         // An unregistered tool fails in the registry rather than running
         // anything, which is all this needs to reach both boundaries.
@@ -3300,6 +3496,7 @@ mod tests {
                     "no_such_tool",
                     json!({}),
                 )),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )
@@ -3308,6 +3505,7 @@ mod tests {
         agent
             .handle_signal(
                 &completed(CompletedReason::Final),
+                &mut batch,
                 &mut metrics,
                 &cancellation(),
             )

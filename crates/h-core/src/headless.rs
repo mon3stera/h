@@ -45,11 +45,10 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        pin::Pin,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use futures::{Stream, stream};
+    use futures::stream;
 
     use super::*;
     use crate::{
@@ -83,8 +82,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for TwoRoundProvider {
-        type StreamEvent = ProviderSignal;
-
         fn model(&self) -> &str {
             "test-model"
         }
@@ -97,15 +94,10 @@ mod tests {
             Ok(())
         }
 
-        async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-            Ok(event)
-        }
-
         async fn stream(
             &self,
             _input: &[Message],
-        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<Self::StreamEvent>> + Send>>>
-        {
+        ) -> anyhow::Result<crate::provider::ProviderEventStream> {
             let request = self.requests.fetch_add(1, Ordering::SeqCst);
             let signals = if request == 0 {
                 vec![

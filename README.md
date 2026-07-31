@@ -93,6 +93,27 @@ and endpoint.
 The bearer token is currently stored directly in the configuration file. Keep
 the file private and do not commit it to a repository.
 
+Anthropic-compatible endpoints use the same top-level settings with an
+`anthropic` provider. Set `base_url` to the prefix before `/v1/messages`:
+
+```toml
+provider = "deepseek"
+model = "deepseek-v4-flash"
+reasoning_effort = "medium"
+context_window = 128000
+auto_compact_token_limit = 100000
+tool_summary_turn_interval = 8
+
+[providers.deepseek]
+type = "anthropic"
+name = "DeepSeek"
+base_url = "https://api.deepseek.com/anthropic"
+auth_token = "YOUR_BEARER_TOKEN"
+```
+
+Use `api_key` instead of `auth_token` for endpoints that authenticate through
+the Anthropic `x-api-key` header.
+
 ### MCP servers
 
 Add stdio MCP servers under `[mcp.servers.<id>]`:

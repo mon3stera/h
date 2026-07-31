@@ -502,6 +502,12 @@ impl Context {
     }
 }
 
+impl Default for Context {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Context {
     pub fn new() -> Self {
         Self {
@@ -949,7 +955,7 @@ async fn list_sessions_in(dir: &Path) -> anyhow::Result<Vec<SessionMeta>> {
         .collect::<Vec<_>>()
         .await;
 
-    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.last_modified));
 
     tracing::info!(
         event = "context.sessions.listed",

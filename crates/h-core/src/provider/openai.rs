@@ -191,6 +191,96 @@ impl OpenAIProvider {
         }
     }
 
+    fn signal(event: ResponseStreamEvent) -> anyhow::Result<ProviderSignal> {
+        match event {
+            ResponseStreamEvent::ResponseOutputItemDone(done) => match done.item {
+                OutputItem::FunctionCall(call) => {
+                    tracing::info!(
+                        event = "provider.tool_call.requested",
+                        provider = "openai",
+                        tool_name = call.name
+                    );
+                    let arguments = serde_json::from_str(&call.arguments)?;
+
+                    Ok(ProviderSignal::ToolCallStarted(ToolCall::new(
+                        call.call_id,
+                        call.name,
+                        arguments,
+                    )))
+                }
+                OutputItem::FunctionCallOutput(call) => {
+                    let output = match call.output {
+                        FunctionCallOutput::Text(text) => {
+                            serde_json::from_str(&text).unwrap_or(Value::String(text))
+                        }
+                        FunctionCallOutput::Content(content) => serde_json::to_value(content)?,
+                    };
+
+                    Ok(ProviderSignal::ToolCallCompleted(ToolCallResult::success(
+                        call.call_id,
+                        output,
+                    )))
+                }
+                item @ OutputItem::Reasoning(_) => {
+                    Ok(ProviderSignal::Reasoning(serde_json::to_vec(&item)?))
+                }
+                OutputItem::WebSearchCall(call) => Ok(ProviderSignal::Search(search(call)?)),
+                _ => Ok(ProviderSignal::Unsupported),
+            },
+            ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
+                Ok(ProviderSignal::TextDelta(delta.delta))
+            }
+            ResponseStreamEvent::ResponseCompleted(completed) => {
+                let need_call = completed
+                    .response
+                    .output
+                    .iter()
+                    .any(|item| matches!(item, OutputItem::FunctionCall(_)));
+                tracing::info!(
+                    event = "provider.response.completed",
+                    provider = "openai",
+                    completion_reason = if need_call {
+                        "needs_tool_call"
+                    } else {
+                        "final"
+                    },
+                );
+
+                Ok(ProviderSignal::Completed {
+                    reason: if need_call {
+                        CompletedReason::NeedCall
+                    } else {
+                        CompletedReason::Final
+                    },
+                })
+            }
+            ResponseStreamEvent::ResponseFailed(failed) => {
+                let message = failed
+                    .response
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("provider response failed");
+
+                anyhow::bail!(message.to_owned())
+            }
+            ResponseStreamEvent::ResponseIncomplete(incomplete) => {
+                let reason = incomplete
+                    .response
+                    .incomplete_details
+                    .as_ref()
+                    .map(|details| details.reason.as_str())
+                    .unwrap_or("unknown reason");
+
+                anyhow::bail!("provider response incomplete: {reason}")
+            }
+            ResponseStreamEvent::ResponseError(error) => {
+                anyhow::bail!("provider stream error: {}", error.message)
+            }
+            _ => Ok(ProviderSignal::Unsupported),
+        }
+    }
+
     fn input(messages: &[Message]) -> anyhow::Result<Vec<Value>> {
         let mut input = Vec::with_capacity(messages.len());
 
@@ -423,7 +513,7 @@ impl OpenAIProvider {
             object.remove("definitions");
         }
 
-        Ok(schema)
+        super::schema::sanitize(&schema)
     }
 
     fn sanitize_schema_node(
@@ -438,28 +528,25 @@ impl OpenAIProvider {
             .get("$ref")
             .and_then(Value::as_str)
             .map(str::to_owned)
-        {
-            if let Some(name) = reference
+            && let Some(name) = reference
                 .strip_prefix("#/$defs/")
                 .or_else(|| reference.strip_prefix("#/definitions/"))
-            {
-                if let Some(definition) = definitions.get(name) {
-                    let annotations = std::mem::take(object);
-                    let mut resolved = definition.clone();
-                    Self::sanitize_schema_node(&mut resolved, definitions)?;
+            && let Some(definition) = definitions.get(name)
+        {
+            let annotations = std::mem::take(object);
+            let mut resolved = definition.clone();
+            Self::sanitize_schema_node(&mut resolved, definitions)?;
 
-                    let Value::Object(resolved) = resolved else {
-                        anyhow::bail!(
-                            "OpenAI tool schema reference {reference:?} did not resolve to an object"
-                        );
-                    };
+            let Value::Object(resolved) = resolved else {
+                anyhow::bail!(
+                    "OpenAI tool schema reference {reference:?} did not resolve to an object"
+                );
+            };
 
-                    *object = resolved;
-                    for (keyword, value) in annotations {
-                        if keyword != "$ref" {
-                            object.insert(keyword, value);
-                        }
-                    }
+            *object = resolved;
+            for (keyword, value) in annotations {
+                if keyword != "$ref" {
+                    object.insert(keyword, value);
                 }
             }
         }
@@ -1158,8 +1245,6 @@ fn patch(v: &mut Value) {
 
 #[async_trait::async_trait]
 impl Provider for OpenAIProvider {
-    type StreamEvent = ResponseStreamEvent;
-
     fn model(&self) -> &str {
         &self.config.model
     }
@@ -1251,104 +1336,7 @@ impl Provider for OpenAIProvider {
         Ok(Some(Compaction::new(state, Some(total_tokens))))
     }
 
-    async fn handle(&mut self, event: Self::StreamEvent) -> anyhow::Result<ProviderSignal> {
-        match &event {
-            /* ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
-                delta.
-            } */
-            ResponseStreamEvent::ResponseOutputItemDone(done) => match &done.item {
-                OutputItem::FunctionCall(call) => {
-                    tracing::info!(
-                        event = "provider.tool_call.requested",
-                        provider = "openai",
-                        tool_name = call.name
-                    );
-                    let arguments = serde_json::from_str(&call.arguments)?;
-
-                    Ok(ProviderSignal::ToolCallStarted(ToolCall::new(
-                        call.call_id.clone(),
-                        call.name.clone(),
-                        arguments,
-                    )))
-                }
-                OutputItem::FunctionCallOutput(call) => {
-                    let output = match &call.output {
-                        FunctionCallOutput::Text(text) => serde_json::from_str(text)
-                            .unwrap_or_else(|_| Value::String(text.clone())),
-                        FunctionCallOutput::Content(content) => serde_json::to_value(content)?,
-                    };
-
-                    Ok(ProviderSignal::ToolCallCompleted(ToolCallResult::success(
-                        call.call_id.clone(),
-                        output,
-                    )))
-                }
-                OutputItem::Reasoning(_) => {
-                    Ok(ProviderSignal::Reasoning(serde_json::to_vec(&done.item)?))
-                }
-                OutputItem::WebSearchCall(call) => {
-                    Ok(ProviderSignal::Search(search(call.clone())?))
-                }
-                _ => Ok(ProviderSignal::Unsupported),
-            },
-            ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
-                return Ok(ProviderSignal::TextDelta(delta.delta.clone()));
-            }
-            ResponseStreamEvent::ResponseCompleted(completed) => {
-                let need_call = completed
-                    .response
-                    .output
-                    .iter()
-                    .any(|e| matches!(e, OutputItem::FunctionCall(_)));
-                tracing::info!(
-                    event = "provider.response.completed",
-                    provider = "openai",
-                    completion_reason = if need_call {
-                        "needs_tool_call"
-                    } else {
-                        "final"
-                    },
-                );
-
-                Ok(ProviderSignal::Completed {
-                    reason: if need_call {
-                        CompletedReason::NeedCall
-                    } else {
-                        CompletedReason::Final
-                    },
-                })
-            }
-            ResponseStreamEvent::ResponseFailed(failed) => {
-                let message = failed
-                    .response
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.as_str())
-                    .unwrap_or("provider response failed");
-
-                anyhow::bail!(message.to_owned())
-            }
-            ResponseStreamEvent::ResponseIncomplete(incomplete) => {
-                let reason = incomplete
-                    .response
-                    .incomplete_details
-                    .as_ref()
-                    .map(|details| details.reason.as_str())
-                    .unwrap_or("unknown reason");
-
-                anyhow::bail!("provider response incomplete: {reason}")
-            }
-            ResponseStreamEvent::ResponseError(error) => {
-                anyhow::bail!("provider stream error: {}", error.message)
-            }
-            _ => Ok(ProviderSignal::Unsupported),
-        }
-    }
-
-    async fn stream(
-        &self,
-        messages: &[Message],
-    ) -> anyhow::Result<ProviderEventStream<Self::StreamEvent>> {
+    async fn stream(&self, messages: &[Message]) -> anyhow::Result<ProviderEventStream> {
         let message_count = messages.len();
         let tool_count = self.tools.len();
         let input = Self::input(messages)?;
@@ -1374,7 +1362,7 @@ impl Provider for OpenAIProvider {
             })
             .filter_map(|result| async move {
                 match result {
-                    Ok(event) => Some(Ok(event)),
+                    Ok(event) => Some(Self::signal(event)),
                     Err(err) if is_ignorable_stream_event(&err) => None,
                     Err(error) => Some(Err(anyhow::Error::from(error))),
                 }
@@ -1638,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_items_are_replayed_before_their_tool_call_and_result() {
+    fn reasoning_items_are_replayed_before_their_tool_calls_and_results() {
         let reasoning = json!({
             "type": "reasoning",
             "id": "rs-1",
@@ -1653,21 +1641,35 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
             },
+            Message::ToolCall {
+                call_id: "call-2".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"src/lib.rs\"}".to_owned(),
+            },
             Message::ToolCallResult {
                 call_id: "call-1".to_owned(),
                 output: "{\"content\":\"fn main() {}\"}".to_owned(),
+                summary: None,
+            },
+            Message::ToolCallResult {
+                call_id: "call-2".to_owned(),
+                output: "{\"content\":\"pub mod agent;\"}".to_owned(),
                 summary: None,
             },
         ];
 
         let input = OpenAIProvider::input(&messages).unwrap();
 
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 5);
         assert_eq!(input[0], reasoning);
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["call_id"], "call-1");
-        assert_eq!(input[2]["type"], "function_call_output");
-        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call-2");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call-1");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call-2");
     }
 
     #[test]
@@ -1692,8 +1694,8 @@ mod tests {
         assert_eq!(input, [item]);
     }
 
-    #[tokio::test]
-    async fn completed_reasoning_items_emit_an_opaque_reasoning_signal() {
+    #[test]
+    fn completed_reasoning_items_emit_an_opaque_reasoning_signal() {
         let reasoning = json!({
             "type": "reasoning",
             "id": "rs-1",
@@ -1708,9 +1710,7 @@ mod tests {
             "item": reasoning.clone()
         }))
         .unwrap();
-        let mut provider = provider(ReasoningEffort::High);
-
-        let signal = provider.handle(event).await.unwrap();
+        let signal = OpenAIProvider::signal(event).unwrap();
 
         assert!(matches!(
             signal,
@@ -1719,8 +1719,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn completed_search_items_emit_a_search_signal_with_sources() {
+    #[test]
+    fn completed_search_items_emit_a_search_signal_with_sources() {
         let item = json!({
             "type": "web_search_call",
             "id": "ws-1",
@@ -1741,9 +1741,7 @@ mod tests {
             "item": item.clone()
         }))
         .unwrap();
-        let mut provider = provider(ReasoningEffort::High);
-
-        let signal = provider.handle(event).await.unwrap();
+        let signal = OpenAIProvider::signal(event).unwrap();
 
         let ProviderSignal::Search(search) = signal else {
             panic!("expected a search signal");

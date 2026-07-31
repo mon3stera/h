@@ -5,7 +5,10 @@ use h_core::{
     agent::Agent,
     event::AgentCommand,
     interaction::Bridge,
-    provider::openai::{OpenAIProvider, OpenAIProviderConfig},
+    provider::{
+        anthropic::{AnthropicProvider, AnthropicProviderConfig},
+        openai::{OpenAIProvider, OpenAIProviderConfig},
+    },
 };
 use h_memory::{
     Store as MemoryStore,
@@ -17,6 +20,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod logger;
+mod provider;
 
 use bootstrap::Bootstrap;
 use config::{Config, ProviderConfig};
@@ -130,16 +134,31 @@ async fn build_agent(
     id: Option<&str>,
     bootstrap: Bootstrap,
     bridge: Bridge,
-) -> anyhow::Result<(Agent<OpenAIProvider>, usize, h_mcp::Runtime)> {
+) -> anyhow::Result<(Agent<provider::Client>, usize, h_mcp::Runtime)> {
     let config = Config::load().await?;
-    let ProviderConfig::OpenAI(openai) = config.provider();
-
-    let provider = OpenAIProvider::from_config(OpenAIProviderConfig::new(
-        openai.base_url(),
-        openai.bearer_token(),
-        config.model(),
-        config.reasoning_effort(),
-    ));
+    let (provider, provider_name) = match config.provider() {
+        ProviderConfig::OpenAI(openai) => (
+            provider::Client::OpenAI(OpenAIProvider::from_config(OpenAIProviderConfig::new(
+                openai.base_url(),
+                openai.bearer_token(),
+                config.model(),
+                config.reasoning_effort(),
+            ))),
+            openai.name().to_owned(),
+        ),
+        ProviderConfig::Anthropic(anthropic) => (
+            provider::Client::Anthropic(AnthropicProvider::from_config(
+                AnthropicProviderConfig::new(
+                    anthropic.base_url(),
+                    anthropic.api_key().map(str::to_owned),
+                    anthropic.auth_token().map(str::to_owned),
+                    config.model(),
+                    config.reasoning_effort(),
+                ),
+            )?),
+            anthropic.name().to_owned(),
+        ),
+    };
     let (context_window, auto_compact_token_limit, tool_summary_turn_interval, mcp_config) = (
         config.context_window(),
         config.auto_compact_token_limit(),
@@ -150,7 +169,7 @@ async fn build_agent(
     tracing::info!(
         event = "config.loaded",
         provider_id = config.provider_id(),
-        provider_name = openai.name(),
+        provider_name,
         model = config.model(),
         context_window,
         auto_compact_token_limit,

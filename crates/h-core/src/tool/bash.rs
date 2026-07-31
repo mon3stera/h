@@ -970,6 +970,12 @@ impl BashTool {
     }
 }
 
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 async fn run_blocking(command: String, brief: bool) -> anyhow::Result<BashToolOutput> {
     if command.split_whitespace().next().is_none() {
         anyhow::bail!("Empty command");

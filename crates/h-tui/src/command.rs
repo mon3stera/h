@@ -57,6 +57,10 @@ impl CommandMenu {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> CommandEvent {
         if self.dismissed || self.matches.is_empty() {
             return CommandEvent::Ignored;

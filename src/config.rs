@@ -16,6 +16,8 @@ const DEFAULT_PATH: &str = "~/.h/config.toml";
 pub enum ProviderConfig {
     #[serde(rename = "openai")]
     OpenAI(OpenAIConfig),
+    #[serde(rename = "anthropic")]
+    Anthropic(AnthropicConfig),
 }
 
 #[derive(Deserialize)]
@@ -24,6 +26,15 @@ pub struct OpenAIConfig {
     name: String,
     base_url: String,
     bearer_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicConfig {
+    name: String,
+    base_url: String,
+    api_key: Option<String>,
+    auth_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +127,7 @@ impl ProviderConfig {
     fn validate(&self, id: &str) -> anyhow::Result<()> {
         match self {
             Self::OpenAI(config) => config.validate(id),
+            Self::Anthropic(config) => config.validate(id),
         }
     }
 }
@@ -142,12 +154,54 @@ impl OpenAIConfig {
     }
 }
 
+impl AnthropicConfig {
+    fn validate(&self, id: &str) -> anyhow::Result<()> {
+        require_text(&format!("providers.{id}.name"), &self.name)?;
+        require_text(&format!("providers.{id}.base_url"), &self.base_url)?;
+        validate_optional_text(&format!("providers.{id}.api_key"), self.api_key.as_deref())?;
+        validate_optional_text(
+            &format!("providers.{id}.auth_token"),
+            self.auth_token.as_deref(),
+        )?;
+
+        if self.api_key.is_none() && self.auth_token.is_none() {
+            anyhow::bail!("providers.{id} must define at least one of api_key or auth_token");
+        }
+
+        Ok(())
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    pub fn auth_token(&self) -> Option<&str> {
+        self.auth_token.as_deref()
+    }
+}
+
 pub fn default_path() -> PathBuf {
     PathBuf::from(shellexpand::tilde(DEFAULT_PATH).into_owned())
 }
 
 fn require_text(field: &str, value: &str) -> anyhow::Result<()> {
     if value.trim().is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+
+    Ok(())
+}
+
+fn validate_optional_text(field: &str, value: Option<&str>) -> anyhow::Result<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
         anyhow::bail!("{field} must not be empty");
     }
 
@@ -198,12 +252,49 @@ bearer_token = "secret"
             DEFAULT_TOOL_SUMMARY_TURN_INTERVAL
         );
 
-        let ProviderConfig::OpenAI(provider) = config.provider();
+        let ProviderConfig::OpenAI(provider) = config.provider() else {
+            panic!("expected OpenAI provider");
+        };
 
         assert_eq!(provider.name(), "OpenAI");
         assert_eq!(provider.base_url(), "https://api.openai.com/v1");
         assert_eq!(provider.bearer_token(), "secret");
         assert!(config.mcp().servers().is_empty());
+    }
+
+    #[test]
+    fn parses_an_anthropic_provider_with_bearer_authentication() {
+        let source = VALID
+            .replace("model = \"gpt-5.6-sol\"", "model = \"deepseek-v4-flash\"")
+            .replace(
+                "type = \"openai\"\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\nbearer_token = \"secret\"",
+                "type = \"anthropic\"\nname = \"DeepSeek\"\nbase_url = \"https://api.deepseek.com/anthropic\"\nauth_token = \"secret\"",
+            );
+        let config = Config::parse(&source).unwrap();
+        let ProviderConfig::Anthropic(provider) = config.provider() else {
+            panic!("expected Anthropic provider");
+        };
+
+        assert_eq!(config.model(), "deepseek-v4-flash");
+        assert_eq!(provider.name(), "DeepSeek");
+        assert_eq!(provider.base_url(), "https://api.deepseek.com/anthropic");
+        assert_eq!(provider.api_key(), None);
+        assert_eq!(provider.auth_token(), Some("secret"));
+    }
+
+    #[test]
+    fn parses_an_anthropic_provider_with_api_key_authentication() {
+        let source = VALID.replace(
+            "type = \"openai\"\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\nbearer_token = \"secret\"",
+            "type = \"anthropic\"\nname = \"Anthropic\"\nbase_url = \"https://api.anthropic.com\"\napi_key = \"secret\"",
+        );
+        let config = Config::parse(&source).unwrap();
+        let ProviderConfig::Anthropic(provider) = config.provider() else {
+            panic!("expected Anthropic provider");
+        };
+
+        assert_eq!(provider.api_key(), Some("secret"));
+        assert_eq!(provider.auth_token(), None);
     }
 
     #[test]
@@ -301,10 +392,21 @@ bearer_token = "secret"
 
     #[test]
     fn rejects_unsupported_provider_types() {
-        let source = VALID.replace("type = \"openai\"", "type = \"anthropic\"");
+        let source = VALID.replace("type = \"openai\"", "type = \"unsupported\"");
         let error = parse_error(&source);
 
-        assert!(error.contains("unknown variant `anthropic`"));
+        assert!(error.contains("unknown variant `unsupported`"));
+    }
+
+    #[test]
+    fn rejects_an_anthropic_provider_without_authentication() {
+        let source = VALID.replace(
+            "type = \"openai\"\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\nbearer_token = \"secret\"",
+            "type = \"anthropic\"\nname = \"Anthropic\"\nbase_url = \"https://api.anthropic.com\"",
+        );
+        let error = parse_error(&source);
+
+        assert!(error.contains("must define at least one of api_key or auth_token"));
     }
 
     #[test]

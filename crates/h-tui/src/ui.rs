@@ -260,10 +260,10 @@ pub fn explore_presentation(run: &[&Presentation]) -> Presentation {
         };
 
         // The same file read twice is one file, not two.
-        if let Some(target) = presentation.target.as_deref() {
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
+        if let Some(target) = presentation.target.as_deref()
+            && !targets.contains(&target)
+        {
+            targets.push(target);
         }
     }
 
@@ -331,10 +331,10 @@ pub fn group_units(units: &[RenderUnit]) -> Vec<RenderGroup<'_>> {
 
     // A run of one was never a run; give the tool its own detailed row back.
     for group in &mut groups {
-        if let RenderGroup::Explore(run) = group {
-            if let [only] = run.as_slice() {
-                *group = RenderGroup::Tool(only);
-            }
+        if let RenderGroup::Explore(run) = group
+            && let [only] = run.as_slice()
+        {
+            *group = RenderGroup::Tool(only);
         }
     }
 

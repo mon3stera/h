@@ -43,10 +43,7 @@ fn theme() -> &'static Theme {
     THEMES.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults();
 
-        themes
-            .themes
-            .remove(THEME)
-            .unwrap_or_else(|| Theme::default())
+        themes.themes.remove(THEME).unwrap_or_default()
     })
 }
 
