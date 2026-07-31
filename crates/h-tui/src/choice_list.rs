@@ -12,6 +12,7 @@ use ratatui::{
 pub enum ChoiceItem {
     /// A fixed option. Enter submits it as-is.
     Choice {
+        prefix: Option<String>,
         label: String,
         description: Option<String>,
     },
@@ -23,6 +24,7 @@ pub enum ChoiceItem {
 impl ChoiceItem {
     pub fn choice(label: impl Into<String>) -> Self {
         Self::Choice {
+            prefix: None,
             label: label.into(),
             description: None,
         }
@@ -30,8 +32,17 @@ impl ChoiceItem {
 
     pub fn described(label: impl Into<String>, description: impl Into<String>) -> Self {
         Self::Choice {
+            prefix: None,
             label: label.into(),
             description: Some(description.into()),
+        }
+    }
+
+    pub fn prefixed(label: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self::Choice {
+            prefix: Some(prefix.into()),
+            label: label.into(),
+            description: None,
         }
     }
 
@@ -230,7 +241,15 @@ impl ChoiceList {
         let mut spans = vec![Span::styled(marker, selected_style)];
 
         match &self.items[index] {
-            ChoiceItem::Choice { label, description } => {
+            ChoiceItem::Choice {
+                prefix,
+                label,
+                description,
+            } => {
+                if let Some(prefix) = prefix {
+                    spans.push(Span::styled(prefix.clone(), muted));
+                }
+
                 spans.push(Span::styled(label.clone(), selected_style));
 
                 if let Some(description) = description {
@@ -460,6 +479,13 @@ mod tests {
             drawn(&mut list, 3),
             ["❯ first", "  second  with detail", "  something else"]
         );
+    }
+
+    #[test]
+    fn a_prefix_leads_the_label() {
+        let mut list = ChoiceList::new(vec![ChoiceItem::prefixed("Hi!", " 20h ago   ")]);
+
+        assert_eq!(drawn(&mut list, 1), ["❯  20h ago   Hi!"]);
     }
 
     #[test]

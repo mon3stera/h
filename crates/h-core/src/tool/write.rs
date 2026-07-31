@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
 };
 
 use super::{
-    DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome, ToolCallResult,
-    ToolCallStatus, ToolOutput, TypedTool, file_buffer::FileBufferStore,
+    DiffLine, DiffLineKind, DisplayBlock, Presentation, Presenter, ToolCall, ToolCallOutcome,
+    ToolCallResult, ToolCallStatus, ToolOutput, TypedTool, file_buffer::FileBufferStore,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -38,6 +38,7 @@ pub struct WriteFileToolArgs {
 #[derive(Serialize)]
 pub struct WriteFileToolOutput {
     pub(super) status: String,
+    pub(super) start_line: usize,
 }
 
 pub struct WriteFileTool {
@@ -66,25 +67,52 @@ impl TypedTool for WriteFileTool {
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let path = PathBuf::from(&arguments.path);
 
-        match arguments.mode {
-            WriteFileMode::Overwrite => fs::write(&path, arguments.content).await?,
+        let start_line = match arguments.mode {
+            WriteFileMode::Overwrite => {
+                fs::write(&path, arguments.content).await?;
+
+                1
+            }
             WriteFileMode::Append => {
                 let mut file = OpenOptions::new()
                     .create(true)
+                    .read(true)
                     .append(true)
                     .open(&path)
                     .await?;
+                let start_line = append_start_line(&mut file).await?;
+
                 file.write_all(arguments.content.as_bytes()).await?;
                 file.flush().await?;
+
+                start_line
             }
-        }
+        };
 
         self.buffers.invalidate(&path).await;
 
         Ok(ToolOutput::new(WriteFileToolOutput {
             status: "Ok".to_owned(),
+            start_line,
         }))
     }
+}
+
+async fn append_start_line(file: &mut fs::File) -> anyhow::Result<usize> {
+    let mut start_line = 1_usize;
+    let mut buf = [0_u8; 8 * 1024];
+
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+
+        let newlines = buf[..read].iter().filter(|byte| **byte == b'\n').count();
+        start_line = start_line.saturating_add(newlines);
+    }
+
+    Ok(start_line)
 }
 
 pub struct WriteFilePresenter;
@@ -116,19 +144,30 @@ impl Presenter for WriteFilePresenter {
         };
 
         let (status, blocks) = match &result.outcome {
-            ToolCallOutcome::Success(_) => (
-                ToolCallStatus::Succeeded,
-                vec![
-                    DisplayBlock::Summary(format!("{action} {lines_cnt} lines")),
-                    DisplayBlock::CodeBlock {
-                        language: Some("raw".to_owned()),
-                        content: content.to_owned(),
-                        truncated_lines: 10,
-                        show_line_numbers: true,
-                        start_line_number: 1,
-                    },
-                ],
-            ),
+            ToolCallOutcome::Success(output) => {
+                let start_line = output
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| usize::try_from(line).ok())
+                    .unwrap_or(1);
+                let lines = content
+                    .lines()
+                    .enumerate()
+                    .map(|(offset, text)| DiffLine {
+                        number: start_line.saturating_add(offset),
+                        kind: DiffLineKind::Added,
+                        text: text.to_owned(),
+                    })
+                    .collect();
+
+                (
+                    ToolCallStatus::Succeeded,
+                    vec![
+                        DisplayBlock::Summary(format!("{action} {lines_cnt} lines")),
+                        DisplayBlock::Diff { lines },
+                    ],
+                )
+            }
             ToolCallOutcome::Failure { message } => (
                 ToolCallStatus::Failed {
                     message: message.clone(),

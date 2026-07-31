@@ -11,6 +11,8 @@ use ratatui::{
 
 use crate::choice_list::{ChoiceEvent, ChoiceItem, ChoiceList, ChoiceOutcome};
 
+const AGE_WIDTH: usize = 10;
+
 #[derive(Debug, Default, Clone)]
 pub struct ResumeEntry {
     pub id: String,
@@ -20,9 +22,11 @@ pub struct ResumeEntry {
 
 impl From<&ResumeEntry> for ChoiceItem {
     fn from(value: &ResumeEntry) -> Self {
-        Self::described(
+        let age = Elapsed::from(value.duration).to_string();
+
+        Self::prefixed(
             value.title.clone(),
-            Elapsed::from(value.duration).to_string(),
+            format!(" {age:<width$}", width = AGE_WIDTH),
         )
     }
 }
@@ -31,8 +35,8 @@ const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 
-/// An age rounded down to the coarsest unit it still fills, so a session list
-/// reads as "3 minutes ago" rather than "184 seconds ago".
+/// An age rounded down to the coarsest unit it still fills, so the session list
+/// can keep it in a compact fixed-width column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Elapsed {
     Seconds(u64),
@@ -60,16 +64,13 @@ impl From<Duration> for Elapsed {
 impl fmt::Display for Elapsed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (amount, unit) = match *self {
-            Self::Seconds(amount) => (amount, "second"),
-            Self::Minutes(amount) => (amount, "minute"),
-            Self::Hours(amount) => (amount, "hour"),
-            Self::Days(amount) => (amount, "day"),
+            Self::Seconds(amount) => (amount, 's'),
+            Self::Minutes(amount) => (amount, 'm'),
+            Self::Hours(amount) => (amount, 'h'),
+            Self::Days(amount) => (amount, 'd'),
         };
 
-        match amount {
-            1 => write!(f, "1 {unit} ago"),
-            _ => write!(f, "{amount} {unit}s ago"),
-        }
+        write!(f, "{amount}{unit} ago")
     }
 }
 
@@ -186,23 +187,23 @@ mod tests {
     }
 
     #[test]
-    fn a_single_unit_reads_as_singular() {
-        assert_eq!(elapsed(1).to_string(), "1 second ago");
-        assert_eq!(elapsed(60).to_string(), "1 minute ago");
-        assert_eq!(elapsed(3600).to_string(), "1 hour ago");
-        assert_eq!(elapsed(86_400).to_string(), "1 day ago");
+    fn each_unit_uses_a_compact_suffix() {
+        assert_eq!(elapsed(1).to_string(), "1s ago");
+        assert_eq!(elapsed(60).to_string(), "1m ago");
+        assert_eq!(elapsed(3600).to_string(), "1h ago");
+        assert_eq!(elapsed(86_400).to_string(), "1d ago");
     }
 
     #[test]
-    fn other_amounts_read_as_plural() {
-        assert_eq!(elapsed(0).to_string(), "0 seconds ago");
-        assert_eq!(elapsed(42).to_string(), "42 seconds ago");
-        assert_eq!(elapsed(300).to_string(), "5 minutes ago");
-        assert_eq!(elapsed(86_400 * 3).to_string(), "3 days ago");
+    fn other_amounts_keep_the_same_compact_suffix() {
+        assert_eq!(elapsed(0).to_string(), "0s ago");
+        assert_eq!(elapsed(42).to_string(), "42s ago");
+        assert_eq!(elapsed(300).to_string(), "5m ago");
+        assert_eq!(elapsed(86_400 * 3).to_string(), "3d ago");
     }
 
     #[test]
-    fn an_entry_describes_itself_with_its_age() {
+    fn an_entry_puts_its_padded_age_before_the_title() {
         let entry = ResumeEntry {
             id: "session-1".to_owned(),
             title: "teach me borrow checking".to_owned(),
@@ -211,7 +212,7 @@ mod tests {
 
         assert_eq!(
             ChoiceItem::from(&entry),
-            ChoiceItem::described("teach me borrow checking", "5 minutes ago")
+            ChoiceItem::prefixed("teach me borrow checking", " 5m ago    ")
         );
     }
 

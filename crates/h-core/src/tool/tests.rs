@@ -514,7 +514,7 @@ async fn write_file_invalidates_the_shared_read_buffer() {
     assert_eq!(before.content, "old");
     assert_eq!(buffers.files.read().await.len(), 1);
 
-    TypedTool::call(
+    let written = TypedTool::call(
         &writer,
         WriteFileToolArgs {
             path: path.to_string_lossy().into_owned(),
@@ -525,6 +525,7 @@ async fn write_file_invalidates_the_shared_read_buffer() {
     .await
     .unwrap()
     .into_value();
+    assert_eq!(written.start_line, 1);
     assert!(buffers.files.read().await.is_empty());
 
     let after = TypedTool::call(
@@ -566,7 +567,7 @@ async fn write_file_appends_and_invalidates_the_shared_read_buffer() {
     .into_value();
     assert_eq!(buffers.files.read().await.len(), 1);
 
-    TypedTool::call(
+    let appended = TypedTool::call(
         &writer,
         WriteFileToolArgs {
             path: path.to_string_lossy().into_owned(),
@@ -575,7 +576,9 @@ async fn write_file_appends_and_invalidates_the_shared_read_buffer() {
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_value();
+    assert_eq!(appended.start_line, 2);
     assert!(buffers.files.read().await.is_empty());
 
     let output = TypedTool::call(
@@ -1175,26 +1178,40 @@ fn write_file_mode_defaults_to_overwrite() {
 }
 
 #[test]
-fn write_file_presenter_describes_append_mode() {
+fn write_file_presenter_renders_added_lines_at_absolute_positions() {
+    let content = (1..=12)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let call = call(
         "write_file",
         json!({
             "path": "example.txt",
-            "content": "one\ntwo",
+            "content": content,
             "mode": "append",
         }),
     );
     let result = ToolCallResult {
         id: call.id.clone(),
-        outcome: ToolCallOutcome::Success(json!({ "status": "Ok" })),
+        outcome: ToolCallOutcome::Success(json!({
+            "status": "Ok",
+            "start_line": 41,
+        })),
         summary: None,
     };
     let presentation = WriteFilePresenter.completed(&call, &result);
 
     assert!(matches!(
         &presentation.blocks[0],
-        DisplayBlock::Summary(summary) if summary == "Appended 2 lines"
+        DisplayBlock::Summary(summary) if summary == "Appended 12 lines"
     ));
+
+    let lines = diff_of(&presentation);
+
+    assert_eq!(lines.len(), 12);
+    assert_eq!(lines.first().unwrap().number, 41);
+    assert_eq!(lines.last().unwrap().number, 52);
+    assert!(lines.iter().all(|line| line.kind == DiffLineKind::Added));
 }
 
 #[test]
