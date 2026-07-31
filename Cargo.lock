@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "h"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "h-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "h-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "h-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "h-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
