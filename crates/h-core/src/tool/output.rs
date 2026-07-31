@@ -4,7 +4,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 pub(super) const MAX_OUTPUT_LINES: usize = 500;
-pub(super) const MAX_OUTPUT_CHARS: usize = 2_048;
+pub(super) const MAX_OUTPUT_CHARS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {

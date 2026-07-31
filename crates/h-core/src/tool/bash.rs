@@ -1500,7 +1500,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_brief_success_saves_full_output_when_the_preview_is_truncated() {
-        let command = "i=0; while [ \"$i\" -lt 3000 ]; do printf x; i=$((i + 1)); done";
+        let command = "i=0; while [ \"$i\" -lt 20000 ]; do printf x; i=$((i + 1)); done";
         let result = run_blocking(command.to_owned(), false).await.unwrap();
         let BashToolOutput::RanBlocking {
             output,
@@ -1518,7 +1518,7 @@ mod tests {
         assert!(output.contains("bytes omitted"));
         assert_eq!(
             fs::read_to_string(output_path).await.unwrap(),
-            "x".repeat(3_000)
+            "x".repeat(20_000)
         );
 
         fs::remove_file(output_path).await.unwrap();

@@ -1009,7 +1009,7 @@ async fn grep_groups_lines_under_a_single_file_heading() {
 #[tokio::test]
 async fn grep_saves_full_results_and_summarizes_before_truncation() {
     let path = temporary_file("grep-output");
-    let content = (1..=300)
+    let content = (1..=600)
         .map(|line| format!("needle {line}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1038,16 +1038,16 @@ async fn grep_saves_full_results_and_summarizes_before_truncation() {
 
     assert_eq!(full_output.matches(&source_path).count(), 1);
     assert!(full_output.starts_with(&format!("{source_path}\n1:needle 1\n")));
-    assert!(full_output.contains("\n300:needle 300"));
+    assert!(full_output.contains("\n600:needle 600"));
     assert!(output.value().results.contains("\n1:needle 1\n"));
-    assert!(output.value().results.contains("\n300:needle 300"));
+    assert!(output.value().results.contains("\n600:needle 600"));
     assert!(output.value().results.contains("bytes omitted"));
 
     let compact = TypedTool::compact(&tool, output.summary().unwrap())
         .unwrap()
         .unwrap();
 
-    assert!(compact.contains("Matched 300 lines"));
+    assert!(compact.contains("Matched 600 lines"));
     assert!(compact.contains(output_path));
 
     fs::remove_file(output_path).await.unwrap();
@@ -1058,7 +1058,7 @@ async fn grep_saves_full_results_and_summarizes_before_truncation() {
 async fn fetch_saves_full_raw_output_when_the_preview_is_truncated() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let body = (1..=300)
+    let body = (1..=1200)
         .map(|line| format!("fetch line {line}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1098,14 +1098,14 @@ async fn fetch_saves_full_raw_output_when_the_preview_is_truncated() {
 
     assert_eq!(full_output, body);
     assert!(output.value().result.contains("fetch line 1\n"));
-    assert!(output.value().result.contains("fetch line 300"));
+    assert!(output.value().result.contains("fetch line 1200"));
     assert!(output.value().result.contains("bytes omitted"));
 
     let compact = TypedTool::compact(&tool, output.summary().unwrap())
         .unwrap()
         .unwrap();
 
-    assert!(compact.contains("Fetched 300 lines"));
+    assert!(compact.contains("Fetched 1200 lines"));
     assert!(compact.contains(output_path));
 
     fs::remove_file(output_path).await.unwrap();
