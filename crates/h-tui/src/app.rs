@@ -535,11 +535,14 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let indicator_height = u16::from(self.state.turn_in_progress)
             .saturating_add(u16::from(self.pending_command.is_some()));
-        let spinner_gap = u16::from(self.state.turn_in_progress);
-        let [transcript, indicator, _gap, bottom] = Layout::vertical([
+        // A gap on each side keeps the indicator from touching either the
+        // transcript above or the input box below.
+        let indicator_gap = u16::from(self.state.turn_in_progress);
+        let [transcript, _above_gap, indicator, _below_gap, bottom] = Layout::vertical([
             Constraint::Min(0),
+            Constraint::Length(indicator_gap),
             Constraint::Length(indicator_height),
-            Constraint::Length(spinner_gap),
+            Constraint::Length(indicator_gap),
             Constraint::Length(self.bottom_height(frame.area().width)),
         ])
         .areas(frame.area());
@@ -1310,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_leaves_a_gap_before_the_input() {
+    fn the_spinner_is_flanked_by_gaps() {
         let (mut app, mut terminal) = app_with_size(40, 8);
         app.state.turn_in_progress = true;
 
@@ -1320,7 +1323,14 @@ mod tests {
             .position(|row| row.contains("h-..."))
             .expect("the spinner should be visible");
 
-        assert!(rows[spinner + 1].is_empty(), "{rows:?}");
+        assert!(
+            rows[spinner - 1].is_empty(),
+            "a gap should separate the display above: {rows:?}"
+        );
+        assert!(
+            rows[spinner + 1].is_empty(),
+            "a gap should separate the input below: {rows:?}"
+        );
         assert!(rows[spinner + 2].contains('─'), "{rows:?}");
     }
 
