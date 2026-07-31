@@ -499,6 +499,11 @@ impl OpenAIProvider {
             Self::lower_one_of(object, definitions)?;
         }
 
+        if Self::is_open_schema(object) {
+            object.insert("type".to_owned(), Value::String("object".to_owned()));
+            return Ok(());
+        }
+
         let is_object = Self::has_type(object, "object") || object.contains_key("properties");
         if is_object {
             Self::sanitize_object_schema(object, definitions)?;
@@ -517,6 +522,58 @@ impl OpenAIProvider {
         }
 
         Ok(())
+    }
+
+    fn is_open_schema(schema: &Map<String, Value>) -> bool {
+        [
+            "type",
+            "$ref",
+            "const",
+            "enum",
+            "oneOf",
+            "anyOf",
+            "allOf",
+            "properties",
+            "items",
+        ]
+        .iter()
+        .all(|keyword| !schema.contains_key(*keyword))
+    }
+
+    fn supports_strict(schema: &Value) -> bool {
+        let Value::Object(schema) = schema else {
+            return true;
+        };
+
+        if Self::has_type(schema, "object")
+            && schema.get("additionalProperties") != Some(&Value::Bool(false))
+        {
+            return false;
+        }
+
+        if let Some(Value::Object(properties)) = schema.get("properties")
+            && properties
+                .values()
+                .any(|property| !Self::supports_strict(property))
+        {
+            return false;
+        }
+
+        if let Some(items) = schema.get("items")
+            && !Self::supports_strict(items)
+        {
+            return false;
+        }
+
+        for keyword in ["anyOf", "allOf"] {
+            if let Some(Value::Array(branches)) = schema.get(keyword)
+                && branches.iter().any(|branch| !Self::supports_strict(branch))
+            {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn sanitize_object_schema(
@@ -966,10 +1023,13 @@ impl OpenAIProvider {
     }
 
     fn compile_tool(spec: ToolDefinition) -> anyhow::Result<OpenAITool> {
+        let parameters = Self::sanitize_schema(&spec.arguments)?;
+        let strict = Self::supports_strict(&parameters);
+
         Ok(FunctionTool {
             name: spec.name,
-            parameters: Some(Self::sanitize_schema(&spec.arguments)?),
-            strict: Some(true),
+            parameters: Some(parameters),
+            strict: Some(strict),
             description: Some(spec.description),
             defer_loading: Some(false),
         }
@@ -1828,6 +1888,31 @@ mod tests {
                 "additionalProperties": false
             })
         );
+    }
+
+    #[test]
+    fn uses_non_strict_mode_for_open_object_properties() {
+        let tool = OpenAIProvider::compile_tool(ToolDefinition {
+            name: "get_outgoing_calls".to_owned(),
+            description: "Get outgoing calls.".to_owned(),
+            arguments: json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "item": {
+                        "description": "The call hierarchy item to get calls for."
+                    }
+                },
+                "required": ["item"]
+            }),
+        })
+        .unwrap();
+        let tool = serde_json::to_value(tool).unwrap();
+        let item = &tool["parameters"]["properties"]["item"];
+
+        assert_eq!(item["type"], "object");
+        assert!(item.get("additionalProperties").is_none());
+        assert_eq!(tool["strict"], false);
     }
 
     #[test]

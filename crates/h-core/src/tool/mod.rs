@@ -112,9 +112,9 @@ pub trait TypedTool: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait DynTool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
 
     fn input_schema(&self) -> Value;
 
@@ -132,11 +132,11 @@ impl<T> DynTool for T
 where
     T: TypedTool,
 {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         TypedTool::name(self)
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         TypedTool::description(self)
     }
 

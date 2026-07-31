@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::task::JoinHandle;
 
-use crate::Client;
+use crate::{Client, Config};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoRequest {
@@ -127,7 +127,7 @@ where
     Ok((client, server))
 }
 
-async fn close(mut client: Client, server: JoinHandle<Result<()>>) -> Result<()> {
+async fn close(client: Client, server: JoinHandle<Result<()>>) -> Result<()> {
     client.close().await?;
     server.await??;
 
@@ -206,13 +206,118 @@ async fn rejects_non_object_arguments() -> Result<()> {
 
 #[tokio::test]
 async fn closes_explicitly_and_idempotently() -> Result<()> {
-    let (mut client, server) = start(TestServer::new()).await?;
+    let (client, server) = start(TestServer::new()).await?;
+    let clone = client.clone();
 
     assert!(!client.is_closed());
-    client.close().await?;
+    let (first, second) = tokio::join!(client.close(), clone.close());
+
+    first?;
+    second?;
     assert!(client.is_closed());
     client.close().await?;
     server.await??;
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connects_to_a_configured_stdio_process() -> Result<()> {
+    let script = r#"
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1.0.0"}}}\n' "$id"
+            ;;
+        *'"method":"tools/list"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object"}}]}}\n' "$id"
+            ;;
+        *'"method":"tools/call"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+    let client = Client::connect(crate::Stdio::new("sh").args(["-c", script])).await?;
+
+    let tools = client.tools().await?;
+    let output = client.call("echo", json!({ "text": "hello" })).await?;
+
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "echo");
+    assert_eq!(output.value()["content"][0]["text"], "ok");
+    client.close().await
+}
+
+#[test]
+fn parses_server_configuration_and_builds_stdio() {
+    let config = serde_json::from_value::<Config>(json!({
+        "servers": {
+            "search": {
+                "command": "node",
+                "args": ["server.mjs", "--stdio"],
+                "env": { "API_KEY": "secret" },
+                "cwd": "/srv/search"
+            },
+            "disabled": {
+                "command": "false",
+                "enabled": false
+            }
+        }
+    }))
+    .unwrap();
+
+    config.validate().unwrap();
+
+    let search = &config.servers()["search"];
+    let stdio = search.stdio();
+
+    assert!(search.enabled());
+    assert_eq!(stdio.program, "node");
+    assert_eq!(stdio.args, ["server.mjs", "--stdio"]);
+    assert_eq!(
+        stdio.env[std::ffi::OsStr::new("API_KEY")],
+        std::ffi::OsStr::new("secret")
+    );
+    assert_eq!(
+        stdio.cwd.as_deref(),
+        Some(std::path::Path::new("/srv/search"))
+    );
+    assert!(!config.servers()["disabled"].enabled());
+}
+
+#[test]
+fn rejects_empty_server_commands() {
+    let config = serde_json::from_value::<Config>(json!({
+        "servers": {
+            "search": { "command": " " }
+        }
+    }))
+    .unwrap();
+
+    let error = config.validate().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "mcp.servers.search.command must not be empty"
+    );
+}
+
+#[test]
+fn rejects_server_ids_that_cannot_namespace_tools() {
+    let config = serde_json::from_value::<Config>(json!({
+        "servers": {
+            "web.search": {
+                "command": "node"
+            }
+        }
+    }))
+    .unwrap();
+
+    let error = config.validate().unwrap_err();
+
+    assert!(error.to_string().contains("MCP server id \"web.search\""));
+    assert!(error.to_string().contains("ASCII letters"));
 }

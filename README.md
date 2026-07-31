@@ -29,6 +29,8 @@ may still change.
   `.agents/skills` layout.
 - Persistent user and project memory with bounded startup indexes and on-demand
   search, read, and write tools.
+- Config-driven stdio MCP servers with automatic tool discovery and lifecycle
+  management.
 - Project and user instruction files for persistent guidance.
 
 ## What It Can Do
@@ -90,6 +92,29 @@ and endpoint.
 
 The bearer token is currently stored directly in the configuration file. Keep
 the file private and do not commit it to a repository.
+
+### MCP servers
+
+Add stdio MCP servers under `[mcp.servers.<id>]`:
+
+```toml
+[mcp.servers.search]
+command = "node"
+args = ["/path/to/search-server.mjs"]
+cwd = "/path/to/server"
+
+[mcp.servers.search.env]
+API_KEY = "YOUR_API_KEY"
+```
+
+Configured servers are enabled by default. Set `enabled = false` in a server
+table to keep its configuration without starting it. Discovered tools are
+registered as `<server>__<tool>`, such as `search__query`. Server and tool names
+must therefore contain only ASCII letters, digits, underscores, and hyphens.
+
+`h` fails startup when an enabled MCP server cannot start or list its tools,
+rather than silently ignoring a configured integration. MCP subprocesses are
+closed when the interactive or headless session finishes.
 
 ## Usage
 
@@ -154,6 +179,7 @@ Persistent instructions can be placed in `.h/AGENTS.md`, `~/.h/AGENTS.md`, or
 .
 ├── src/             CLI entry point, configuration wiring, and logging
 ├── crates/h-core/   Agent runtime, context, providers, tools, and Skills
+├── crates/h-mcp/    MCP configuration, stdio clients, and Agent tool adapters
 ├── crates/h-memory/ Persistent user and project memory
 └── crates/h-tui/    Terminal UI and rendering
 ```

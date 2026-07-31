@@ -3,7 +3,6 @@ use std::io::Write;
 use clap::Parser;
 use h_core::{
     agent::Agent,
-    config::{Config, ProviderConfig},
     event::AgentCommand,
     interaction::Bridge,
     provider::openai::{OpenAIProvider, OpenAIProviderConfig},
@@ -15,7 +14,10 @@ use h_memory::{
 use tokio::sync::mpsc;
 
 mod cli;
+mod config;
 mod logger;
+
+use config::{Config, ProviderConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 /// where it left off; `None` starts a fresh one.
 async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
     let (bridge, interaction_rx) = Bridge::new();
-    let (mut agent, context_window) = build_agent(id.as_deref(), bridge).await?;
+    let (mut agent, context_window, mcp) = build_agent(id.as_deref(), bridge).await?;
     let bus_rx = agent.subscribe_view();
 
     agent.initialize()?;
@@ -76,14 +78,19 @@ async fn main_loop(id: Option<String>) -> anyhow::Result<()> {
         archived
     });
 
-    h_tui::app::run(commands, bus_rx, interaction_rx, history, context_window).await?;
+    let ui = h_tui::app::run(commands, bus_rx, interaction_rx, history, context_window).await;
 
     tracing::info!(event = "app.ui.closed");
 
     // Quitting the UI dropped the last command sender, so the worker is either
     // done or finishing the turn it was in the middle of. Wait for it, both to
     // let that turn land in the archive and to surface a failed write.
-    worker.await??;
+    let worker = worker.await;
+    let mcp = mcp.close().await;
+
+    ui?;
+    worker??;
+    mcp?;
 
     tracing::info!(event = "app.archived");
     Ok(())
@@ -93,11 +100,14 @@ async fn run_prompt(prompt: String) -> anyhow::Result<()> {
     let (bridge, interaction_rx) = Bridge::new();
     drop(interaction_rx);
 
-    let (agent, _) = build_agent(None, bridge).await?;
+    let (agent, _, mcp) = build_agent(None, bridge).await?;
 
     tracing::info!(event = "app.ready", mode = "headless");
 
-    let response = h_core::headless::run(agent, prompt).await?;
+    let response = h_core::headless::run(agent, prompt).await;
+    let closed = mcp.close().await;
+    let response = response?;
+    closed?;
 
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(response.as_bytes())?;
@@ -116,7 +126,7 @@ async fn run_prompt(prompt: String) -> anyhow::Result<()> {
 async fn build_agent(
     id: Option<&str>,
     bridge: Bridge,
-) -> anyhow::Result<(Agent<OpenAIProvider>, usize)> {
+) -> anyhow::Result<(Agent<OpenAIProvider>, usize, h_mcp::Runtime)> {
     let config = Config::load().await?;
     let ProviderConfig::OpenAI(openai) = config.provider();
 
@@ -126,10 +136,11 @@ async fn build_agent(
         config.model(),
         config.reasoning_effort(),
     ));
-    let (context_window, auto_compact_token_limit, tool_summary_turn_interval) = (
+    let (context_window, auto_compact_token_limit, tool_summary_turn_interval, mcp_config) = (
         config.context_window(),
         config.auto_compact_token_limit(),
         config.tool_summary_turn_interval(),
+        config.mcp().clone(),
     );
 
     tracing::info!(
@@ -180,5 +191,26 @@ async fn build_agent(
         }
     }
 
-    Ok((agent, context_window))
+    let mcp = h_mcp::Runtime::start(&mcp_config).await?;
+    let mcp_tool_count = match mcp.register(&mut agent) {
+        Ok(count) => count,
+        Err(error) => {
+            if let Err(close_error) = mcp.close().await {
+                tracing::warn!(
+                    event = "mcp.runtime.close.failed",
+                    error = close_error.to_string(),
+                );
+            }
+
+            return Err(error);
+        }
+    };
+
+    tracing::info!(
+        event = "mcp.runtime.started",
+        server_count = mcp.server_count(),
+        tool_count = mcp_tool_count,
+    );
+
+    Ok((agent, context_window, mcp))
 }

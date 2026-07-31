@@ -13,9 +13,13 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.3", features = ["derive"] }
 h-core = { path = "crates/h-core" }
+h-mcp = { path = "crates/h-mcp" }
 h-memory = { path = "crates/h-memory" }
 h-tui = { path = "crates/h-tui" }
+serde = { version = "1.0.229", features = ["derive"] }
+shellexpand = "3.1.2"
 tokio = { version = "1.53.0", features = ["full"] }
+toml = "1.1.2"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

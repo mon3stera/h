@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Instant};
 
 use super::{
     DefaultPresenter, DynTool, Presentation, Presenter, Summary, ToolCall, ToolCallResult,
-    ToolDefinition, TypedTool,
+    ToolDefinition,
 };
 
 struct RegisteredTool {
@@ -11,7 +11,7 @@ struct RegisteredTool {
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<&'static str, RegisteredTool>,
+    tools: HashMap<String, RegisteredTool>,
 }
 
 impl ToolRegistry {
@@ -21,20 +21,23 @@ impl ToolRegistry {
         }
     }
 
-    pub fn register<T: TypedTool>(&mut self, tool: T) -> &mut Self {
+    pub fn register<T>(&mut self, tool: T) -> &mut Self
+    where
+        T: DynTool + 'static,
+    {
         self.register_with_presenter(tool, DefaultPresenter)
     }
 
     pub fn register_with_presenter<T, P>(&mut self, tool: T, presenter: P) -> &mut Self
     where
-        T: TypedTool,
+        T: DynTool + 'static,
         P: Presenter + 'static,
     {
-        let name = tool.name();
+        let name = tool.name().to_owned();
         let replaced = self
             .tools
             .insert(
-                name,
+                name.clone(),
                 RegisteredTool {
                     tool: Box::new(tool),
                     presenter: Box::new(presenter),

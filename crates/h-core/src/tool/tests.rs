@@ -21,6 +21,58 @@ fn temporary_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("h-{name}-{}", uuid::Uuid::new_v4()))
 }
 
+struct DynamicTool {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl DynTool for DynamicTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "A dynamically named tool"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn definition(&self) -> anyhow::Result<ToolDefinition> {
+        Ok(ToolDefinition {
+            name: self.name.clone(),
+            description: self.description().to_owned(),
+            arguments: self.input_schema(),
+        })
+    }
+
+    async fn call(&self, arguments: Value) -> anyhow::Result<ToolOutput<Value>> {
+        Ok(ToolOutput::new(arguments))
+    }
+
+    fn compact(&self, _summary: &Summary) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn cancel(&self, _arguments: Value) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn registry_owns_dynamic_tool_names() {
+    let mut registry = ToolRegistry::new();
+    registry.register(DynamicTool {
+        name: "server__tool".to_owned(),
+    });
+
+    let definitions = registry.definitions().unwrap();
+
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].name, "server__tool");
+}
+
 #[tokio::test]
 async fn read_file_defaults_to_a_bounded_first_page() {
     let path = temporary_file("bounded-read");

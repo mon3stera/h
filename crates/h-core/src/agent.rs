@@ -17,8 +17,8 @@ use crate::{
     provider::{Provider, ProviderEventStream},
     skill::Registry as SkillRegistry,
     tool::{
-        AskTool, BashTool, EditTool, FetchTool, FileBufferStore, GrepTool, Presenter, ReadFileTool,
-        ToolCall, ToolCallResult, ToolRegistry, TypedTool, WriteFileTool,
+        AskTool, BashTool, DynTool, EditTool, FetchTool, FileBufferStore, GrepTool, Presenter,
+        ReadFileTool, ToolCall, ToolCallResult, ToolRegistry, WriteFileTool,
     },
 };
 use futures::StreamExt;
@@ -252,7 +252,7 @@ where
 
     pub fn register_tool<T>(&mut self, tool: T) -> &mut Self
     where
-        T: TypedTool,
+        T: DynTool + 'static,
     {
         self.tool.register(tool);
         self
@@ -260,7 +260,7 @@ where
 
     pub fn register_tool_with_presenter<T, R>(&mut self, tool: T, presenter: R) -> &mut Self
     where
-        T: TypedTool,
+        T: DynTool + 'static,
         R: Presenter + 'static,
     {
         self.tool.register_with_presenter(tool, presenter);

@@ -1,4 +1,10 @@
-use std::process::Stdio as ProcessStdio;
+use std::{
+    process::Stdio as ProcessStdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, bail};
 use rmcp::{
@@ -8,14 +14,22 @@ use rmcp::{
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
+    sync::{Mutex, RwLock},
     task::JoinHandle,
 };
 
 use crate::{Output, Stdio, Tool};
 
+#[derive(Clone)]
 pub struct Client {
-    service: RunningService<RoleClient, ()>,
-    stderr: Option<JoinHandle<std::io::Result<()>>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    service: RwLock<RunningService<RoleClient, ()>>,
+    stderr: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
+    close: Mutex<()>,
+    closed: AtomicBool,
 }
 
 impl Client {
@@ -38,12 +52,12 @@ impl Client {
             .await
             .with_context(|| format!("failed to initialize MCP server `{program}`"))?;
 
-        Ok(Self { service, stderr })
+        Ok(Self::new(service, stderr))
     }
 
     pub async fn tools(&self) -> Result<Vec<Tool>> {
-        let tools = self
-            .service
+        let service = self.inner.service.read().await;
+        let tools = service
             .list_all_tools()
             .await
             .context("failed to list MCP tools")?;
@@ -73,8 +87,8 @@ impl Client {
             request = request.with_arguments(arguments);
         }
 
-        let result = self
-            .service
+        let service = self.inner.service.read().await;
+        let result = service
             .call_tool(request)
             .await
             .with_context(|| format!("failed to call MCP tool `{name}`"))?;
@@ -83,16 +97,33 @@ impl Client {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.service.is_closed()
+        if self.inner.closed.load(Ordering::Acquire) {
+            return true;
+        }
+
+        self.inner
+            .service
+            .try_read()
+            .is_ok_and(|service| service.is_closed())
     }
 
-    pub async fn close(&mut self) -> Result<()> {
-        self.service
+    pub async fn close(&self) -> Result<()> {
+        let _close = self.inner.close.lock().await;
+
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        self.inner
+            .service
+            .write()
+            .await
             .close()
             .await
             .context("failed to close MCP client service")?;
+        self.inner.closed.store(true, Ordering::Release);
 
-        if let Some(stderr) = self.stderr.take() {
+        if let Some(stderr) = self.inner.stderr.lock().await.take() {
             stderr
                 .await
                 .context("failed to join MCP stderr task")?
@@ -104,9 +135,20 @@ impl Client {
 
     #[cfg(test)]
     pub(crate) fn from_service(service: RunningService<RoleClient, ()>) -> Self {
+        Self::new(service, None)
+    }
+
+    fn new(
+        service: RunningService<RoleClient, ()>,
+        stderr: Option<JoinHandle<std::io::Result<()>>>,
+    ) -> Self {
         Self {
-            service,
-            stderr: None,
+            inner: Arc::new(Inner {
+                service: RwLock::new(service),
+                stderr: Mutex::new(stderr),
+                close: Mutex::new(()),
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 }
