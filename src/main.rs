@@ -23,7 +23,7 @@ mod logger;
 mod provider;
 
 use bootstrap::Bootstrap;
-use config::{Config, ProviderConfig};
+use config::{Config, ProfileConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,12 +34,14 @@ async fn main() -> anyhow::Result<()> {
     let (prompt, bootstrap) = (args.prompt.take(), Bootstrap::from(args.instruction.take()));
 
     if let Some(prompt) = prompt {
-        return run_prompt(prompt, bootstrap).await;
+        return run_prompt(prompt, args.profile.as_deref(), bootstrap).await;
     }
 
+    let profile = args.profile.as_deref();
+
     match cli::resolve_session(&args).await? {
-        cli::Session::New => main_loop(None, bootstrap).await,
-        cli::Session::Resume(id) => main_loop(Some(id), Bootstrap::Default).await,
+        cli::Session::New => main_loop(None, profile, bootstrap).await,
+        cli::Session::Resume(id) => main_loop(Some(id), profile, Bootstrap::Default).await,
         cli::Session::Quit => {
             tracing::info!(event = "app.exited_without_session");
             Ok(())
@@ -48,10 +50,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Runs one session to completion. `id` names an archived session to pick up
-/// where it left off; `None` starts a fresh one.
-async fn main_loop(id: Option<String>, bootstrap: Bootstrap) -> anyhow::Result<()> {
+/// where it left off; `None` starts a fresh one. `profile` is the `--profile`
+/// override, ignored when resuming because `--profile` and `--resume` conflict.
+async fn main_loop(
+    id: Option<String>,
+    profile: Option<&str>,
+    bootstrap: Bootstrap,
+) -> anyhow::Result<()> {
     let (bridge, interaction_rx) = Bridge::new();
-    let (mut agent, context_window, mcp) = build_agent(id.as_deref(), bootstrap, bridge).await?;
+    let (mut agent, context_window, mcp) =
+        build_agent(id.as_deref(), profile, bootstrap, bridge).await?;
     let bus_rx = agent.subscribe_view();
 
     agent.initialize()?;
@@ -103,11 +111,15 @@ async fn main_loop(id: Option<String>, bootstrap: Bootstrap) -> anyhow::Result<(
     Ok(())
 }
 
-async fn run_prompt(prompt: String, bootstrap: Bootstrap) -> anyhow::Result<()> {
+async fn run_prompt(
+    prompt: String,
+    profile: Option<&str>,
+    bootstrap: Bootstrap,
+) -> anyhow::Result<()> {
     let (bridge, interaction_rx) = Bridge::new();
     drop(interaction_rx);
 
-    let (agent, _, mcp) = build_agent(None, bootstrap, bridge).await?;
+    let (agent, _, mcp) = build_agent(None, profile, bootstrap, bridge).await?;
 
     tracing::info!(event = "app.ready", mode = "headless");
 
@@ -132,12 +144,14 @@ async fn run_prompt(prompt: String, bootstrap: Bootstrap) -> anyhow::Result<()> 
 /// first events.
 async fn build_agent(
     id: Option<&str>,
+    profile: Option<&str>,
     bootstrap: Bootstrap,
     bridge: Bridge,
 ) -> anyhow::Result<(Agent<provider::Client>, usize, h_mcp::Runtime)> {
-    let config = Config::load().await?;
-    let (provider, provider_name) = match config.provider() {
-        ProviderConfig::OpenAI(openai) => (
+    let mut config = Config::load().await?;
+    config.select(profile)?;
+    let (provider, provider_name) = match config.profile() {
+        ProfileConfig::OpenAI(openai) => (
             provider::Client::OpenAI(OpenAIProvider::from_config(OpenAIProviderConfig::new(
                 openai.base_url(),
                 openai.bearer_token(),
@@ -146,7 +160,7 @@ async fn build_agent(
             ))),
             openai.name().to_owned(),
         ),
-        ProviderConfig::Anthropic(anthropic) => (
+        ProfileConfig::Anthropic(anthropic) => (
             provider::Client::Anthropic(AnthropicProvider::from_config(
                 AnthropicProviderConfig::new(
                     anthropic.base_url(),
@@ -168,8 +182,8 @@ async fn build_agent(
 
     tracing::info!(
         event = "config.loaded",
-        provider_id = config.provider_id(),
-        provider_name,
+        profile_id = config.profile_id(),
+        profile_name = provider_name,
         model = config.model(),
         context_window,
         auto_compact_token_limit,

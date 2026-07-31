@@ -23,6 +23,12 @@ pub struct Args {
     /// Resume a previous session. Omit the id to pick one interactively.
     #[arg(short, long, value_name = "SESSION_ID", num_args = 0..=1)]
     pub resume: Option<Option<String>>,
+
+    /// Run with this profile instead of the configured default. A resumed
+    /// session always replays under the profile it was archived with, so the
+    /// flag only applies to new sessions.
+    #[arg(long, value_name = "PROFILE", conflicts_with = "resume", value_parser = non_blank)]
+    pub profile: Option<String>,
 }
 
 fn non_blank(value: &str) -> Result<String, String> {
@@ -164,6 +170,37 @@ mod tests {
     fn bare_flag_defers_the_session_choice() {
         assert_eq!(parse(&["h", "--resume"]).resume, Some(None));
         assert_eq!(parse(&["h", "-r"]).resume, Some(None));
+    }
+
+    #[test]
+    fn profile_flag_selects_a_profile() {
+        assert_eq!(
+            parse(&["h", "--profile", "deepseek"]).profile.as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            parse(&["h", "--profile=deepseek"]).profile.as_deref(),
+            Some("deepseek")
+        );
+    }
+
+    #[test]
+    fn profile_rejects_blank_values() {
+        assert!(Args::try_parse_from(["h", "--profile", "  \n  "]).is_err());
+    }
+
+    #[test]
+    fn profile_cannot_combine_with_resume() {
+        assert!(Args::try_parse_from(["h", "--profile", "deepseek", "--resume", "01JQ2X"]).is_err());
+        assert!(Args::try_parse_from(["h", "--profile", "deepseek", "--resume"]).is_err());
+    }
+
+    #[test]
+    fn profile_can_combine_with_prompt() {
+        let args = parse(&["h", "--profile", "deepseek", "-p", "hello"]);
+
+        assert_eq!(args.profile.as_deref(), Some("deepseek"));
+        assert_eq!(args.prompt.as_deref(), Some("hello"));
     }
 
     #[test]

@@ -70,50 +70,47 @@ cargo run --release
 ## Configuration
 
 `h` reads its configuration from `~/.h/config.toml`. Create the directory and
-configuration file before starting the CLI:
+configuration file before starting the CLI. Named profiles bundle an endpoint,
+its model, and the reasoning effort; `profile` selects the default, and
+`--profile <id>` overrides it for one run:
 
 ```toml
-provider = "openai"
-model = "gpt-5.6-sol"
-reasoning_effort = "medium"
-context_window = 200000
-auto_compact_token_limit = 160000
+profile = "openai"
 tool_summary_turn_interval = 8
 
-[providers.openai]
+[profiles.openai]
 type = "openai"
 name = "OpenAI"
 base_url = "https://api.openai.com/v1"
 bearer_token = "YOUR_API_KEY"
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
 ```
 
 `reasoning_effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
 or `max`. Provider support for individual values depends on the selected model
-and endpoint.
+and endpoint. `context_window` and `auto_compact_token_limit` are optional
+globally and per profile; a profile's values win, then the global ones, then
+the defaults (`258000` / `220000`).
 
-The bearer token is currently stored directly in the configuration file. Keep
-the file private and do not commit it to a repository.
-
-Anthropic-compatible endpoints use the same top-level settings with an
-`anthropic` provider. Set `base_url` to the prefix before `/v1/messages`:
+Anthropic-compatible endpoints use `type = "anthropic"`. Set `base_url` to the
+prefix before `/v1/messages`:
 
 ```toml
-provider = "deepseek"
-model = "deepseek-v4-flash"
-reasoning_effort = "medium"
-context_window = 128000
-auto_compact_token_limit = 100000
-tool_summary_turn_interval = 8
-
-[providers.deepseek]
+[profiles.deepseek]
 type = "anthropic"
 name = "DeepSeek"
 base_url = "https://api.deepseek.com/anthropic"
 auth_token = "YOUR_BEARER_TOKEN"
+model = "deepseek-v4-flash"
+reasoning_effort = "medium"
 ```
 
 Use `api_key` instead of `auth_token` for endpoints that authenticate through
 the Anthropic `x-api-key` header.
+
+The bearer token is currently stored directly in the configuration file. Keep
+the file private and do not commit it to a repository.
 
 ### MCP servers
 

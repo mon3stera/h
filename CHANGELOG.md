@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--profile` flag**: run with a named profile instead of the configured
+  default, e.g. `h --profile deepseek`. It cannot be combined with `--resume`.
+
+### Changed
+
+- **Profiles**: `[providers.<id>]` is now `[profiles.<id>]`, and each profile
+  carries its own `model` and `reasoning_effort`. `context_window` and
+  `auto_compact_token_limit` may be set per profile (optional) and fall back
+  to the global values. The top-level `provider` key is renamed to `profile`.
+  This is a breaking change: migrate `~/.h/config.toml` by moving `model` and
+  `reasoning_effort` into each profile block.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
