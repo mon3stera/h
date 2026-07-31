@@ -25,6 +25,7 @@ use tokio::sync::{
     mpsc::{Receiver, Sender, UnboundedReceiver},
     oneshot,
 };
+use unicode_width::UnicodeWidthStr;
 
 use h_core::{
     command::Command,
@@ -582,7 +583,16 @@ impl App {
             self.command_menu.render(frame, command_menu);
         }
 
-        frame.render_widget(Paragraph::new(self.context_line()), status);
+        let context_width = self
+            .context_spans()
+            .iter()
+            .map(|span| span.content.width())
+            .sum::<usize>() as u16;
+        let [left, right] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Max(context_width)]).areas(status);
+
+        frame.render_widget(Paragraph::new(self.model_line()), left);
+        frame.render_widget(Paragraph::new(self.context_line()), right);
     }
 
     fn bottom_height(&self, width: u16) -> u16 {
@@ -696,7 +706,23 @@ impl App {
         ])
     }
 
-    fn context_line(&self) -> Line<'static> {
+    /// The left end of the status line: the model name, with the thinking
+    /// effort when the provider reports one.
+    fn model_line(&self) -> Line<'static> {
+        let muted = Style::default().fg(Color::DarkGray);
+        let mut spans = Vec::new();
+
+        if let Some(startup) = &self.state.startup {
+            spans.push(Span::raw(startup.model.clone()));
+            if let Some(effort) = &startup.thinking_effort {
+                spans.push(Span::styled(format!(" · {effort}"), muted));
+            }
+        }
+
+        Line::from(spans)
+    }
+
+    fn context_spans(&self) -> Vec<Span<'static>> {
         let (current, percent) = match self.state.context_tokens {
             Some(current) if self.context_window > 0 => {
                 let remaining = self.context_window.saturating_sub(current);
@@ -719,7 +745,11 @@ impl App {
         spans.extend(rainbow_spans(&percent, Style::default()));
         spans.push(Span::styled(")", muted));
 
-        Line::from(spans).alignment(Alignment::Right)
+        spans
+    }
+
+    fn context_line(&self) -> Line<'static> {
+        Line::from(self.context_spans()).alignment(Alignment::Right)
     }
 }
 
@@ -1523,6 +1553,43 @@ mod tests {
                 .is_some_and(|row| row.ends_with("context 2.4K/200K (98.8% left)")),
             "the status belongs on the bottom row: {rows:?}"
         );
+    }
+
+    #[test]
+    fn the_status_line_names_the_model_and_effort_on_the_left() {
+        let (mut app, mut terminal) = app_with_size(80, 8);
+
+        app.handle_agent_event(AgentViewEvent::Startup {
+            model: "gpt-5.6-sol".to_owned(),
+            thinking_effort: Some("medium".to_owned()),
+        });
+
+        let rows = drawn(&mut app, &mut terminal);
+
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.starts_with("gpt-5.6-sol · medium")),
+            "the model belongs on the bottom row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_model_alone_has_no_dangling_separator() {
+        let mut app = App::default();
+
+        app.handle_agent_event(AgentViewEvent::Startup {
+            model: "claude".to_owned(),
+            thinking_effort: None,
+        });
+
+        let text = app
+            .model_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "claude");
     }
 
     #[test]
