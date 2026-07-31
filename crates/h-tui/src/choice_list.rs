@@ -200,7 +200,18 @@ impl ChoiceList {
     /// The drawn rows, and where the caret belongs among them.
     fn lines(&self, area: Rect) -> (Vec<Line<'static>>, Option<Position>) {
         let count = self.items.len();
-        let (start, end) = visible_window(self.selected, count, self.max_visible);
+        let max_visible = self.max_visible.unwrap_or_else(|| {
+            // Without a fixed window, fit the rows the terminal actually
+            // provides. A list that fits is shown whole; an overflowing one
+            // leaves room for the up to two overflow hints.
+            let budget = area.height as usize;
+            if count > budget {
+                budget.saturating_sub(2).max(1)
+            } else {
+                budget
+            }
+        });
+        let (start, end) = visible_window(self.selected, count, Some(max_visible));
 
         let mut lines = Vec::new();
         let mut caret = None;
@@ -501,6 +512,74 @@ mod tests {
             drawn(&mut list, 5),
             ["  ⋯", "  item 2", "❯ item 3", "  item 4", "  ⋯"]
         );
+    }
+
+    #[test]
+    fn a_long_list_without_a_fixed_window_fits_the_terminal_and_hints_at_the_rest() {
+        let items = (0..50)
+            .map(|index| ChoiceItem::choice(format!("item {index}")))
+            .collect::<Vec<_>>();
+        let mut list = ChoiceList::new(items);
+
+        drive(&mut list, vec![KeyCode::Down; 25]);
+
+        let rows = drawn(&mut list, 10);
+
+        assert_eq!(rows[0], "  ⋯", "the window hints at the rows above");
+        assert_eq!(
+            rows[5], "❯ item 25",
+            "the selection stays visible and centered"
+        );
+        assert_eq!(rows[9], "  ⋯", "the window hints at the rows below");
+    }
+
+    #[test]
+    fn the_window_starts_at_the_first_row_without_a_top_hint() {
+        let items = (0..50)
+            .map(|index| ChoiceItem::choice(format!("item {index}")))
+            .collect::<Vec<_>>();
+        let mut list = ChoiceList::new(items);
+
+        let rows = drawn(&mut list, 10);
+
+        assert_eq!(rows[0], "❯ item 0");
+        assert_eq!(rows[7], "  item 7");
+        assert_eq!(rows[8], "  ⋯", "the window hints at the rows below");
+        assert_eq!(rows[9], "", "nothing is drawn past the window");
+    }
+
+    #[test]
+    fn the_window_follows_the_selection_to_the_last_row() {
+        let items = (0..50)
+            .map(|index| ChoiceItem::choice(format!("item {index}")))
+            .collect::<Vec<_>>();
+        let mut list = ChoiceList::new(items);
+
+        drive(&mut list, vec![KeyCode::Down; 49]);
+
+        let rows = drawn(&mut list, 10);
+
+        assert_eq!(rows[0], "  ⋯", "the window hints at the rows above");
+        assert_eq!(
+            rows[8], "❯ item 49",
+            "the last item stays selected and visible"
+        );
+        assert_eq!(rows[9], "", "no hint below the last item");
+    }
+
+    #[test]
+    fn a_list_shorter_than_the_terminal_is_not_windowed() {
+        let items = (0..3)
+            .map(|index| ChoiceItem::choice(format!("item {index}")))
+            .collect::<Vec<_>>();
+        let mut list = ChoiceList::new(items);
+
+        let rows = drawn(&mut list, 10);
+
+        assert_eq!(rows[0], "❯ item 0");
+        assert_eq!(rows[1], "  item 1");
+        assert_eq!(rows[2], "  item 2");
+        assert_eq!(rows[3], "", "a list that fits is shown whole");
     }
 
     #[test]
