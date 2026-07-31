@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+anthropic-rust-sdk = { version = "0.112.3", path = "../../vendor/anthropic-rust-sdk" }
 async-openai = { version = "0.41.1", features = ["_api", "model", "responses", "image", "byot"] }
 async-trait = "0.1.91"
 base64 = "0.22.1"

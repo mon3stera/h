@@ -1,0 +1,10 @@
+.cursor/*
+!.cursor/skills/
+/target/
+**/*.rs.bk
+*.pdb
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
