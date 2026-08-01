@@ -1,0 +1,58 @@
+{
+  "name": "h-vscode",
+  "displayName": "h",
+  "description": "h agentic coding chat inside VS Code",
+  "version": "0.1.0",
+  "publisher": "h-dev",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:h.openChat"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "h.openChat",
+        "title": "h: Open Chat"
+      }
+    ],
+    "configuration": {
+      "title": "h",
+      "properties": {
+        "h.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `h` binary. Leave empty to use `h` from PATH."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build:extension && npm run build:webview",
+    "build:extension": "tsc -p tsconfig.json",
+    "build:webview": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "package": "npm run build && vsce package --out h-vscode.vsix"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@types/vscode": "^1.85.0",
+    "@vitejs/plugin-react": "^6.0.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.0"
+  }
+}

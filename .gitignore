@@ -1,3 +1,6 @@
 /target
 /.h
 /.claude
+/extensions/h-vscode/node_modules
+/extensions/h-vscode/dist
+/extensions/h-vscode/.h
