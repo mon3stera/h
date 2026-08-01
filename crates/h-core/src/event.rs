@@ -12,6 +12,10 @@ pub enum AgentCommand {
     Prompt(UserInput),
     Run(Command),
     Cancel,
+    /// Replays the whole conversation onto the view bus, so a frontend that
+    /// missed part of the stream (a reconnected IDE webview) can rebuild its
+    /// transcript without restarting the session.
+    Rebroadcast,
 }
 
 #[derive(Debug, Clone, Copy)]

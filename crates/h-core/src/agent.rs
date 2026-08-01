@@ -291,8 +291,7 @@ where
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_archive_dir(&mut self, directory: impl Into<PathBuf>) -> &mut Self {
+    pub fn with_archive_dir(&mut self, directory: impl Into<PathBuf>) -> &mut Self {
         self.archive_dir = directory.into();
         self
     }
@@ -438,6 +437,7 @@ where
                     let _ = self.run_command(command).await;
                 }
                 AgentCommand::Cancel => {}
+                AgentCommand::Rebroadcast => self.rebroadcast_all_view(),
             }
 
             // If the turn and a queued cancellation become ready together, the
@@ -1032,6 +1032,11 @@ where
     /// offer back on recall.
     pub fn prompts(&self) -> Vec<String> {
         self.context.prompts()
+    }
+
+    /// The id under which this session will be archived, or already was.
+    pub fn session_id(&self) -> String {
+        self.context.id()
     }
 
     pub async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {

@@ -21,6 +21,7 @@ mod cli;
 mod config;
 mod logger;
 mod provider;
+mod serve;
 
 use bootstrap::Bootstrap;
 use config::{Config, ProfileConfig};
@@ -31,6 +32,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(event = "app.starting");
 
     let mut args = cli::Args::parse();
+
+    if let Some(cli::Command::Serve(serve_args)) = args.command.take() {
+        return serve::run(serve_args).await;
+    }
+
     let (prompt, bootstrap) = (args.prompt.take(), Bootstrap::from(args.instruction.take()));
 
     if let Some(prompt) = prompt {
@@ -142,7 +148,7 @@ async fn run_prompt(
 /// Builds a session up to, but not including, provider initialization. Callers
 /// can subscribe to the event stream they need before initialization emits its
 /// first events.
-async fn build_agent(
+pub(crate) async fn build_agent(
     id: Option<&str>,
     profile: Option<&str>,
     bootstrap: Bootstrap,

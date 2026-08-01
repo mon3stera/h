@@ -1,5 +1,5 @@
 use chrono::Utc;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use h_core::{
     context::{SessionMeta, list_sessions},
     provider::Identity,
@@ -10,7 +10,7 @@ use crate::config::Config;
 
 /// An agentic coding CLI.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "h", version, about)]
+#[command(name = "h", version, about, args_conflicts_with_subcommands = true)]
 pub struct Args {
     /// Run one prompt without opening the terminal interface.
     #[arg(short, long, value_name = "TEXT", conflicts_with = "resume")]
@@ -33,6 +33,24 @@ pub struct Args {
     /// session must match the current profile's protocol and provider, so the
     /// flag only applies to new sessions.
     #[arg(long, value_name = "PROFILE", conflicts_with = "resume", value_parser = non_blank)]
+    pub profile: Option<String>,
+
+    /// The subcommand to run; absent means the interactive terminal interface.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Serve a JSON-RPC API over stdio for IDE integration.
+    Serve(ServeArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ServeArgs {
+    /// The profile new sessions default to. A session may override this per
+    /// create request.
+    #[arg(long, value_name = "PROFILE", value_parser = non_blank)]
     pub profile: Option<String>,
 }
 

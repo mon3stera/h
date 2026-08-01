@@ -41,7 +41,7 @@ impl Image {
         })
     }
 
-    fn from_base64(
+    pub fn from_base64(
         media_type: String,
         data: String,
         width: u32,
