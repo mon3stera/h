@@ -1,7 +1,11 @@
+use serde::Serialize;
+
 /// A command entered through the prompt box instead of sent to the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Command {
+    #[serde(rename = "/clear")]
     Clear,
+    #[serde(rename = "/compact")]
     Compact,
 }
 

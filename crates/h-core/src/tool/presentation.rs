@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::Value;
 
 use super::{ToolCall, ToolCallId, ToolCallOutcome, ToolCallResult};
@@ -8,20 +9,22 @@ pub trait Presenter: Send + Sync {
     fn completed(&self, call: &ToolCall, result: &ToolCallResult) -> Presentation;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ToolCallStatus {
     Running,
     Succeeded,
     Failed { message: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct KeyValueEntry {
     pub key: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiffLineKind {
     Removed,
     Added,
@@ -31,7 +34,7 @@ pub enum DiffLineKind {
 /// One line of a diff, carrying its own kind so the view never has to recover it
 /// from the rendered text. A context line whose content begins with `-` would be
 /// indistinguishable from a removal otherwise.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiffLine {
     /// The line's number in the file: the pre-edit number for a removal, the
     /// post-edit number otherwise.
@@ -40,7 +43,8 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DisplayBlock {
     Summary(String),
     CodeBlock {
@@ -68,7 +72,7 @@ pub enum DisplayBlock {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Presentation {
     pub call_id: ToolCallId,
     pub name: String,

@@ -205,7 +205,7 @@ impl<T> ToolOutput<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ToolCallId(pub String);
 
 impl ToolCallId {
@@ -226,7 +226,7 @@ impl From<&str> for ToolCallId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCall {
     id: ToolCallId,
     name: String,
@@ -255,13 +255,14 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ToolCallOutcome {
     Success(Value),
     Failure { message: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCallResult {
     id: ToolCallId,
     outcome: ToolCallOutcome,

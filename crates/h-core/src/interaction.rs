@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 /// Requests queue here while the user works through them, so a burst never
@@ -5,13 +6,13 @@ use tokio::sync::{mpsc, oneshot};
 const REQUEST_CAPACITY: usize = 8;
 
 /// A question that requires an answer from outside the agent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AskQuestion {
     pub question: String,
     pub options: Vec<AskOption>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AskOption {
     pub label: String,
     pub description: Option<String>,
@@ -19,7 +20,8 @@ pub struct AskOption {
 
 /// The reply to an [`AskQuestion`]. `Option` carries the index into its options;
 /// `FreeText` is what was written when none of them fit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AskAnswer {
     Option { index: usize, label: String },
     FreeText(String),
@@ -129,5 +131,29 @@ mod tests {
         });
 
         assert!(bridge.ask(question()).await.is_err());
+    }
+
+    #[test]
+    fn ask_answers_round_trip_through_json() {
+        let option = AskAnswer::Option {
+            index: 0,
+            label: "run".to_owned(),
+        };
+        let free_text = AskAnswer::FreeText("do it".to_owned());
+
+        for answer in [option.clone(), free_text.clone()] {
+            let wire = serde_json::to_value(&answer).unwrap();
+            let back: AskAnswer = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, answer);
+        }
+
+        assert_eq!(
+            serde_json::to_value(&option).unwrap(),
+            serde_json::json!({"type": "option", "data": {"index": 0, "label": "run"}})
+        );
+        assert_eq!(
+            serde_json::to_value(&free_text).unwrap(),
+            serde_json::json!({"type": "free_text", "data": "do it"})
+        );
     }
 }
