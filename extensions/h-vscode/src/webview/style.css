@@ -8,7 +8,8 @@ body {
   background: var(--vscode-editor-background);
   color: var(--vscode-editor-foreground);
   font-family: var(--vscode-font-family);
-  font-size: var(--vscode-font-size);
+  /* `h.fontSize` (injected as --h-font-size) wins; the editor size is the fallback. */
+  font-size: var(--h-font-size, var(--vscode-font-size));
 }
 
 .app {

@@ -34,6 +34,16 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Path to the `h` binary. Leave empty to use `h` from PATH."
+        },
+        "h.fontSize": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 6,
+          "maximum": 64,
+          "markdownDescription": "Font size (px) for the h chat panel. Leave empty to follow the editor font size."
         }
       }
     }

@@ -17,8 +17,18 @@ const execFileAsync = promisify(execFile);
 /** One server per extension host, reused across panels. */
 let server: HServer | null = null;
 
+/** Open chat panels, so a font-size setting change can reach all of them. */
+const panels = new Set<vscode.WebviewPanel>();
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   context.subscriptions.push(vscode.commands.registerCommand('h.openChat', () => openChat(context)));
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('h.fontSize')) return;
+      const fontSize = readFontSize();
+      for (const panel of panels) post(panel, { type: 'font-size', fontSize });
+    }),
+  );
 }
 
 export function deactivate(): void {
@@ -63,7 +73,9 @@ async function openChat(context: vscode.ExtensionContext): Promise<void> {
     },
   );
 
-  panel.webview.html = await webviewHtml(panel.webview, webviewRoot);
+  panel.webview.html = await webviewHtml(panel.webview, webviewRoot, readFontSize());
+
+  panels.add(panel);
 
   const unsubscribe: Array<() => void> = [
     server.onNotification('session/event', (params) =>
@@ -77,6 +89,7 @@ async function openChat(context: vscode.ExtensionContext): Promise<void> {
     ),
   ];
   panel.onDidDispose(() => {
+    panels.delete(panel);
     for (const off of unsubscribe) off();
   }, null, context.subscriptions);
 
@@ -133,12 +146,22 @@ function post(panel: vscode.WebviewPanel, message: unknown): void {
   void panel.webview.postMessage(message);
 }
 
-async function webviewHtml(webview: vscode.Webview, root: vscode.Uri): Promise<string> {
+async function webviewHtml(
+  webview: vscode.Webview,
+  root: vscode.Uri,
+  fontSize: number | null,
+): Promise<string> {
   let html = await readFile(vscode.Uri.joinPath(root, 'index.html').fsPath, 'utf8');
 
   // Relative asset URLs in the built bundle resolve against this base, which
   // maps to the webview root on disk (vite builds with base: './').
   html = html.replace('<head>', `<head>\n<base href="${webview.asWebviewUri(root).toString()}/">`);
+
+  // `h.fontSize` overrides the inherited editor font size; without it the
+  // stylesheet falls back to `--vscode-font-size`.
+  if (fontSize !== null) {
+    html = html.replace('<head>', `<head>\n<style>:root { --h-font-size: ${fontSize}px; }</style>`);
+  }
 
   const csp = [
     "default-src 'none'",
@@ -149,6 +172,12 @@ async function webviewHtml(webview: vscode.Webview, root: vscode.Uri): Promise<s
   ].join('; ');
   html = html.replace('</head>', `<meta http-equiv="Content-Security-Policy" content="${csp}">\n</head>`);
   return html;
+}
+
+/** `h.fontSize` in px, or null to follow the editor font size. */
+function readFontSize(): number | null {
+  const size = vscode.workspace.getConfiguration('h').get<number | null>('fontSize', null);
+  return typeof size === 'number' && size > 0 ? size : null;
 }
 
 async function resolveHPath(): Promise<string | undefined> {
