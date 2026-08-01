@@ -73,6 +73,11 @@ export function respond(id: number, result: unknown): void {
   vscode.postMessage({ type: 'respond', id, result });
 }
 
+/** Asks the extension host to open a URL in the system browser. */
+export function openExternal(url: string): void {
+  vscode.postMessage({ type: 'open-external', url });
+}
+
 export function onNotification(method: string, handler: (params: unknown) => void): () => void {
   return subscribe(notificationHandlers, method, handler);
 }

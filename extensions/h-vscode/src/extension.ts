@@ -93,9 +93,19 @@ interface WebviewMessage {
   method?: string;
   params?: unknown;
   result?: unknown;
+  url?: string;
 }
 
 async function handleWebviewMessage(panel: vscode.WebviewPanel, message: WebviewMessage): Promise<void> {
+  if (message.type === 'open-external' && typeof message.url === 'string') {
+    try {
+      void vscode.env.openExternal(vscode.Uri.parse(message.url, true));
+    } catch {
+      // Ignore malformed URLs from the webview.
+    }
+    return;
+  }
+
   if (!server) return;
 
   if (message.type === 'request' && typeof message.id === 'number' && typeof message.method === 'string') {

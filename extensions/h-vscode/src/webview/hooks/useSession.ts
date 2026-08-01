@@ -7,6 +7,7 @@ import type {
   TokenUsage,
   ToolPresentation,
   ViewEvent,
+  WireImage,
 } from '../../protocol';
 import { onNotification, onRequest, request, respond } from '../rpc';
 
@@ -39,7 +40,7 @@ export interface Session {
   attach: (id: string) => void;
   closeSession: (id: string) => void;
   refreshList: () => void;
-  send: (text: string) => void;
+  send: (text: string, images?: WireImage[]) => void;
   cancel: () => void;
   answer: (answer: AskAnswer) => void;
   dismissQuestion: () => void;
@@ -256,10 +257,10 @@ export function useSession(): Session {
   );
 
   const send = useCallback(
-    (text: string) => {
+    (text: string, images: WireImage[] = []) => {
       const trimmed = text.trim();
       const id = sessionIdRef.current;
-      if (!id || !trimmed || busy) return;
+      if (!id || (!trimmed && images.length === 0) || busy) return;
 
       if (SLASH_COMMANDS.has(trimmed)) {
         void request('command/run', { session_id: id, command: trimmed }).catch((cause) =>
@@ -268,17 +269,20 @@ export function useSession(): Session {
         return;
       }
 
-      append('user', trimmed);
+      append('user', trimmed || '(image)');
       turnActive.current = true;
       setBusy(true);
       setError(null);
-      void request<{ accepted: boolean }>('turn/submit', { session_id: id, text: trimmed }).catch(
-        (cause) => {
-          turnActive.current = false;
-          setBusy(false);
-          setError(describe(cause));
-        },
-      );
+      const params: { session_id: string; text: string; images?: WireImage[] } = {
+        session_id: id,
+        text: trimmed,
+      };
+      if (images.length > 0) params.images = images;
+      void request<{ accepted: boolean }>('turn/submit', params).catch((cause) => {
+        turnActive.current = false;
+        setBusy(false);
+        setError(describe(cause));
+      });
     },
     [busy, append],
   );

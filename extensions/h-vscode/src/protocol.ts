@@ -100,6 +100,14 @@ export interface Accepted {
   accepted: boolean;
 }
 
+/** One pasted image for `turn/submit.images`; `data` is the raw base64 payload. */
+export interface WireImage {
+  media_type: string;
+  data: string;
+  width: number;
+  height: number;
+}
+
 export interface Replayed {
   replayed: boolean;
 }
