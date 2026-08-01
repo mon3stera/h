@@ -17,6 +17,13 @@ body {
   height: 100vh;
 }
 
+.app.center {
+  align-items: center;
+  justify-content: center;
+}
+
+/* --- header -------------------------------------------------------------- */
+
 .header {
   display: flex;
   align-items: baseline;
@@ -42,6 +49,28 @@ body {
   font-style: italic;
 }
 
+.header-spacer {
+  flex: 1;
+}
+
+.header-button {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: 1px solid var(--vscode-button-secondaryBorder, transparent);
+  border-radius: 4px;
+  padding: 0.25rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
+.token-usage {
+  color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+}
+
+/* --- chat ----------------------------------------------------------------- */
+
 .chat {
   display: flex;
   flex-direction: column;
@@ -62,8 +91,15 @@ body {
   max-width: 85%;
   padding: 0.5rem 0.75rem;
   border-radius: 6px;
+}
+
+.message .message-text {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.message > * + * {
+  margin-top: 0.5rem;
 }
 
 .message.user {
@@ -76,11 +112,19 @@ body {
   align-self: flex-start;
   background: var(--vscode-editorWidget-background);
   border: 1px solid var(--vscode-panel-border);
+  max-width: 92%;
 }
 
 .message.typing {
   font-style: italic;
   color: var(--vscode-descriptionForeground);
+}
+
+.system-message {
+  align-self: center;
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
 }
 
 .error {
@@ -131,7 +175,216 @@ body {
   cursor: default;
 }
 
-.ask-overlay {
+/* --- tool cards ------------------------------------------------------------ */
+
+.tool-card {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--vscode-editor-background);
+}
+
+.tool-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.35rem 0.6rem;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tool-status {
+  width: 1em;
+  text-align: center;
+}
+
+.tool-card.status-running .tool-status {
+  color: var(--vscode-charts-blue, #4fc1ff);
+}
+
+.tool-card.status-succeeded .tool-status {
+  color: var(--vscode-testing-iconPassed, #4ec9b0);
+}
+
+.tool-card.status-failed .tool-status {
+  color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.tool-label {
+  font-weight: 600;
+}
+
+.tool-name {
+  color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+  flex: 1;
+}
+
+.tool-chevron {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.8em;
+}
+
+.tool-error {
+  padding: 0.35rem 0.6rem;
+  color: var(--vscode-errorForeground);
+  border-top: 1px solid var(--vscode-panel-border);
+  font-size: 0.9em;
+}
+
+.tool-blocks {
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.tool-blocks > * + * {
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.block-summary {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.95em;
+}
+
+.block-text-output {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+}
+
+.truncation-note {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+.code-block-header {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8em;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editorWidget-background);
+}
+
+.code-language {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.code-content {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  overflow-x: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+
+.code-line {
+  display: flex;
+  gap: 1rem;
+}
+
+.code-line-number {
+  color: var(--vscode-descriptionForeground);
+  text-align: right;
+  min-width: 2.5em;
+  user-select: none;
+}
+
+.diff-block {
+  margin: 0;
+  padding: 0.5rem 0;
+  overflow-x: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+
+.diff-line {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0 0.6rem;
+}
+
+.diff-line.kind-added {
+  background: rgba(46, 160, 67, 0.18);
+}
+
+.diff-line.kind-removed {
+  background: rgba(248, 81, 73, 0.18);
+}
+
+.diff-number {
+  color: var(--vscode-descriptionForeground);
+  min-width: 2.5em;
+  text-align: right;
+  user-select: none;
+}
+
+.diff-marker {
+  color: var(--vscode-descriptionForeground);
+  min-width: 1em;
+  user-select: none;
+}
+
+.tool-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9em;
+}
+
+.tool-table th,
+.tool-table td {
+  border: 1px solid var(--vscode-panel-border);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}
+
+.tool-table th {
+  background: var(--vscode-editorWidget-background);
+  font-weight: 600;
+}
+
+.key-value-block {
+  padding: 0.25rem 0;
+}
+
+.key-value-row {
+  display: flex;
+  gap: 1rem;
+  padding: 0.2rem 0.6rem;
+}
+
+.key-value-key {
+  color: var(--vscode-descriptionForeground);
+  min-width: 8rem;
+  text-align: right;
+  font-size: 0.9em;
+}
+
+.key-value-value {
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+}
+
+/* --- ask modal ------------------------------------------------------------- */
+
+.ask-overlay,
+.picker-overlay {
   position: fixed;
   inset: 0;
   display: flex;
@@ -226,4 +479,126 @@ body {
 .ask-dismiss-button {
   background: transparent;
   color: var(--vscode-descriptionForeground);
+}
+
+/* --- session picker -------------------------------------------------------- */
+
+.picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1.5rem;
+  max-width: 36rem;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.picker-overlay .picker {
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.picker-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.picker-title {
+  font-size: 1.2em;
+  font-weight: 600;
+  flex: 1;
+}
+
+.picker-back,
+.picker-refresh {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: 1px solid var(--vscode-button-secondaryBorder, transparent);
+  border-radius: 4px;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+.picker-new {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  border-radius: 4px;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.picker-section h2 {
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--vscode-descriptionForeground);
+  margin: 0.75rem 0 0.4rem;
+}
+
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  margin-bottom: 0.4rem;
+}
+
+.picker-id {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+  flex: 1;
+}
+
+.picker-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.picker-title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-sub {
+  font-size: 0.8em;
+  color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.picker-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.picker-row button {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: 1px solid var(--vscode-button-secondaryBorder, transparent);
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.85em;
+}
+
+.picker-row button.picker-danger {
+  color: var(--vscode-errorForeground);
+}
+
+.picker-empty {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
 }

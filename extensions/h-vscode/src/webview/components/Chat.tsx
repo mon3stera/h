@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { ChatMessage } from '../hooks/useSession';
+import { ToolCard } from './ToolCard';
 
 interface ChatProps {
   messages: ChatMessage[];
@@ -35,11 +36,25 @@ export function Chat({ messages, busy, error, onSend, onCancel }: ChatProps) {
   return (
     <div className="chat">
       <div className="messages">
-        {messages.map((message) => (
-          <div key={message.id} className={`message ${message.role}`}>
-            {message.text}
-          </div>
-        ))}
+        {messages.map((message) =>
+          message.role === 'system' ? (
+            <div key={message.id} className="system-message">
+              {message.content.map((block) => (block.kind === 'text' ? block.text : '')).join('')}
+            </div>
+          ) : (
+            <div key={message.id} className={`message ${message.role}`}>
+              {message.content.map((block, index) =>
+                block.kind === 'text' ? (
+                  <div key={index} className="message-text">
+                    {block.text}
+                  </div>
+                ) : (
+                  <ToolCard key={index} tool={block.tool} />
+                ),
+              )}
+            </div>
+          ),
+        )}
         {busy && <div className="message assistant typing">…</div>}
         {error && <div className="error">{error}</div>}
         <div ref={bottomRef} />
@@ -49,9 +64,8 @@ export function Chat({ messages, busy, error, onSend, onCancel }: ChatProps) {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Message h…"
+          placeholder="Message h… (enter to send, /clear, /compact)"
           rows={2}
-          disabled={!busy ? false : undefined}
         />
         <div className="composer-actions">
           {busy ? (

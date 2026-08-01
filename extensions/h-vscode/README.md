@@ -6,10 +6,12 @@ protocol documented in [`docs/vscode-integration.md`](../../docs/vscode-integrat
 
 ## Status
 
-M2 (extension skeleton end-to-end): spawn + `server/hello` handshake, one
-session per panel, streaming text, cancel, and minimal `ask/question` handling
-(option buttons + free text). Tool cards, session picker/resume, markdown, and
-packaging land in M3/M4.
+M3 (full chat surface): spawn + `server/hello` handshake, streaming text,
+cancel, `ask/question` modal (options + free text), tool cards (Presentation
+blocks: summary/code/diff/table/key-value), session picker
+(create/resume/attach/close), `/clear` `/compact`, and token usage in the
+header. Remaining M4 polish: markdown rendering, image paste, packaging
+readiness.
 
 ## Prerequisites
 
@@ -43,6 +45,10 @@ node scripts/smoke.cjs /path/to/h   # defaults to `h` on PATH
 Exercises the full loop against a real `h serve`: hello handshake,
 `session/create`, `turn/submit` with streamed `text_delta`, `turn_finished`,
 `session/close`, and graceful `server/shutdown`.
+
+`node scripts/smoke-sessions.cjs /path/to/h` additionally exercises the M3
+session lifecycle: list, close→archive, resume and attach transcript replay
+(`prompt` → `text_delta` → `completed`), `/clear`, and `/compact`.
 
 ## Layout
 
