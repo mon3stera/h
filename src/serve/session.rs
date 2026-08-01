@@ -36,6 +36,9 @@ use super::protocol::{self, RpcError};
 pub struct SessionChannels {
     /// The id under which the session will be archived, or already was.
     pub session_id: String,
+    /// The configured context window, so frontends can render the TUI-style
+    /// `context current/limit` indicator against a real limit.
+    pub context_window: usize,
     pub command_tx: mpsc::Sender<AgentCommand>,
     pub bus_rx: mpsc::UnboundedReceiver<AgentViewEvent>,
     pub worker: JoinHandle<anyhow::Result<()>>,
@@ -66,7 +69,7 @@ impl SessionBuilder for AgentSessionBuilder {
         bootstrap: Bootstrap,
         bridge: Bridge,
     ) -> anyhow::Result<SessionChannels> {
-        let (mut agent, _context_window, mcp) =
+        let (mut agent, context_window, mcp) =
             crate::build_agent(id, profile, bootstrap, bridge).await?;
         let session_id = agent.session_id();
         let bus_rx = agent.subscribe_view();
@@ -102,6 +105,7 @@ impl SessionBuilder for AgentSessionBuilder {
 
         Ok(SessionChannels {
             session_id,
+            context_window,
             command_tx,
             bus_rx,
             worker,
@@ -111,6 +115,7 @@ impl SessionBuilder for AgentSessionBuilder {
 
 struct Session {
     command_tx: mpsc::Sender<AgentCommand>,
+    context_window: usize,
     worker: JoinHandle<anyhow::Result<()>>,
     forwarder: JoinHandle<()>,
     bridge_task: JoinHandle<()>,
@@ -215,14 +220,15 @@ impl SessionManager {
             None => Bootstrap::Default,
         };
 
-        let session_id = self.build_session(None, profile, bootstrap).await?;
-        Ok(json!({ "session_id": session_id }))
+        let (session_id, context_window) = self.build_session(None, profile, bootstrap).await?;
+        Ok(json!({ "session_id": session_id, "context_window": context_window }))
     }
 
     async fn resume(&mut self, params: &Value) -> anyhow::Result<Value> {
         let id = required_str(params, "session_id")?;
-        let session_id = self.build_session(Some(id), None, Bootstrap::Default).await?;
-        Ok(json!({ "session_id": session_id }))
+        let (session_id, context_window) =
+            self.build_session(Some(id), None, Bootstrap::Default).await?;
+        Ok(json!({ "session_id": session_id, "context_window": context_window }))
     }
 
     async fn build_session(
@@ -230,7 +236,7 @@ impl SessionManager {
         id: Option<&str>,
         profile: Option<&str>,
         bootstrap: Bootstrap,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, usize)> {
         let (bridge, interaction_rx) = Bridge::new();
         let channels = self
             .builder
@@ -238,6 +244,7 @@ impl SessionManager {
             .await?;
 
         let session_id = channels.session_id.clone();
+        let context_window = channels.context_window;
 
         let line_tx = self.line_tx.clone();
         let session_event_session_id = session_id.clone();
@@ -252,6 +259,7 @@ impl SessionManager {
                         &session_event_session_id,
                         &model,
                         thinking_effort.as_deref(),
+                        context_window,
                     ),
                     other => protocol::session_event(&session_event_session_id, &other),
                 };
@@ -283,6 +291,7 @@ impl SessionManager {
             session_id.clone(),
             Session {
                 command_tx: channels.command_tx,
+                context_window,
                 worker: channels.worker,
                 forwarder,
                 bridge_task,
@@ -291,7 +300,7 @@ impl SessionManager {
 
         tracing::info!(event = "serve.session.started", session_id);
 
-        Ok(session_id)
+        Ok((session_id, context_window))
     }
 
     async fn list(&self) -> anyhow::Result<Value> {
@@ -346,7 +355,10 @@ impl SessionManager {
             .await
             .map_err(|_| session_not_found(id))?;
 
-        Ok(json!({ "replayed": true }))
+        Ok(json!({
+            "replayed": true,
+            "context_window": session.context_window,
+        }))
     }
 
     async fn submit(&self, params: &Value) -> anyhow::Result<Value> {
@@ -560,6 +572,7 @@ mod tests {
             .unwrap();
 
         let create_reply = next_matching(&mut rx, |value| is_response_to(value, 1)).await;
+        assert_eq!(create_reply["result"]["context_window"], 100_000);
         let session_id = create_reply["result"]["session_id"]
             .as_str()
             .unwrap()
@@ -571,6 +584,7 @@ mod tests {
         .await;
         assert_eq!(started["params"]["session_id"], session_id);
         assert_eq!(started["params"]["model"], "fake-model");
+        assert_eq!(started["params"]["context_window"], 100_000);
 
         manager
             .handle(&format!(
@@ -749,10 +763,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(
-            next_matching(&mut rx, |value| is_response_to(value, 3)).await["result"]["replayed"]
-                == true
-        );
+        let attach_reply = next_matching(&mut rx, |value| is_response_to(value, 3)).await;
+        assert!(attach_reply["result"]["replayed"] == true);
+        assert_eq!(attach_reply["result"]["context_window"], 100_000);
 
         // The replay carries the user prompt and the assistant reply back out.
         let prompt = next_matching(&mut rx, |value| event_of(value, "prompt")).await;
@@ -847,6 +860,7 @@ mod tests {
 
             Ok(SessionChannels {
                 session_id,
+                context_window: 100_000,
                 command_tx,
                 bus_rx,
                 worker,

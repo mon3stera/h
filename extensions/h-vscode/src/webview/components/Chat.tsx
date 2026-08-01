@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type FormEvent, type KeyboardEvent } from 'react';
-import type { WireImage } from '../../protocol';
+import type { TokenUsage, WireImage } from '../../protocol';
 import type { ChatMessage } from '../hooks/useSession';
+import { ContextBar } from './ContextBar';
 import { Markdown } from './Markdown';
 import { ToolCard } from './ToolCard';
 
@@ -8,6 +9,8 @@ interface ChatProps {
   messages: ChatMessage[];
   busy: boolean;
   error: string | null;
+  tokenUsage: TokenUsage | null;
+  contextWindow: number | null;
   onSend: (text: string, images?: WireImage[]) => void;
   onCancel: () => void;
 }
@@ -24,7 +27,7 @@ interface Attachment {
   height: number;
 }
 
-export function Chat({ messages, busy, error, onSend, onCancel }: ChatProps) {
+export function Chat({ messages, busy, error, tokenUsage, contextWindow, onSend, onCancel }: ChatProps) {
   const [draft, setDraft] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [highlight, setHighlight] = useState(0);
@@ -201,6 +204,7 @@ export function Chat({ messages, busy, error, onSend, onCancel }: ChatProps) {
           rows={2}
         />
         <div className="composer-actions">
+          <ContextBar usage={tokenUsage} window={contextWindow} />
           {busy ? (
             <button type="button" onClick={onCancel}>
               Cancel

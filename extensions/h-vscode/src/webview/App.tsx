@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { AskModal } from './components/AskModal';
 import { Chat } from './components/Chat';
 import { SessionPicker } from './components/SessionPicker';
-import { StatusBar } from './components/StatusBar';
 import { useSession } from './hooks/useSession';
 
 export default function App() {
@@ -37,7 +36,6 @@ export default function App() {
       <header className="header">
         <span className="title">h</span>
         {session.sessionId && <span className="session-id">{shortId(session.sessionId)}</span>}
-        <StatusBar usage={session.tokenUsage} />
         {session.busy && <span className="busy">working…</span>}
         <span className="header-spacer" />
         <button className="header-button" onClick={() => setPickerOpen(true)}>
@@ -48,6 +46,8 @@ export default function App() {
         messages={session.messages}
         busy={session.busy}
         error={session.error}
+        tokenUsage={session.tokenUsage}
+        contextWindow={session.contextWindow}
         onSend={session.send}
         onCancel={session.cancel}
       />

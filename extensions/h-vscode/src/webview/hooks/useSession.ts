@@ -4,6 +4,7 @@ import type {
   AskQuestionParams,
   ArchivedSession,
   SessionEventParams,
+  SessionStartedParams,
   TokenUsage,
   ToolPresentation,
   ViewEvent,
@@ -32,6 +33,7 @@ export interface Session {
   busy: boolean;
   error: string | null;
   tokenUsage: TokenUsage | null;
+  contextWindow: number | null;
   pendingQuestion: PendingQuestion | null;
   archived: ArchivedSession[];
   active: { id: string }[];
@@ -63,6 +65,7 @@ export function useSession(): Session {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
+  const [contextWindow, setContextWindow] = useState<number | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [archived, setArchived] = useState<ArchivedSession[]>([]);
   const [active, setActive] = useState<{ id: string }[]>([]);
@@ -165,6 +168,14 @@ export function useSession(): Session {
   }, [handleEvent]);
 
   useEffect(() => {
+    return onNotification('session/started', (params) => {
+      const { session_id, context_window } = params as SessionStartedParams;
+      if (session_id !== sessionIdRef.current) return;
+      setContextWindow(context_window ?? null);
+    });
+  }, []);
+
+  useEffect(() => {
     return onRequest('ask/question', (params, id) => {
       const ask = params as AskQuestionParams;
       if (ask.session_id !== sessionIdRef.current) return;
@@ -191,9 +202,10 @@ export function useSession(): Session {
     setMessages([]);
     setError(null);
     setPendingQuestion(null);
-    void request<{ session_id: string }>('session/create', {})
+    void request<{ session_id: string; context_window?: number }>('session/create', {})
       .then((result) => {
         setCurrentSession(result.session_id);
+        setContextWindow(result.context_window ?? null);
         setPhase('chat');
       })
       .catch((cause) => {
@@ -207,9 +219,12 @@ export function useSession(): Session {
     setMessages([]);
     setError(null);
     setPendingQuestion(null);
-    void request<{ session_id: string }>('session/resume', { session_id: id })
+    void request<{ session_id: string; context_window?: number }>('session/resume', {
+      session_id: id,
+    })
       .then((result) => {
         setCurrentSession(result.session_id);
+        setContextWindow(result.context_window ?? null);
         setPhase('chat');
       })
       .catch((cause) => {
@@ -223,9 +238,12 @@ export function useSession(): Session {
     setMessages([]);
     setError(null);
     setPendingQuestion(null);
-    void request<{ replayed: boolean }>('session/attach', { session_id: id })
-      .then(() => {
+    void request<{ replayed: boolean; context_window?: number }>('session/attach', {
+      session_id: id,
+    })
+      .then((result) => {
         setCurrentSession(id);
+        setContextWindow(result.context_window ?? null);
         setPhase('chat');
       })
       .catch((cause) => {
@@ -243,6 +261,7 @@ export function useSession(): Session {
             setCurrentSession(null);
             setMessages([]);
             setTokenUsage(null);
+            setContextWindow(null);
             setPendingQuestion(null);
             setPhase('idle');
           }
@@ -316,6 +335,7 @@ export function useSession(): Session {
     busy,
     error,
     tokenUsage,
+    contextWindow,
     pendingQuestion,
     archived,
     active,

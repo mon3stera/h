@@ -52,20 +52,20 @@
 
 | method | params | result | 说明 |
 |---|---|---|---|
-| `session/create` | `{profile?: str, instruction?: str}` | `{session_id}` | 新会话，走 `build_agent(None, profile, Bootstrap)`；`instruction` 映射 `Bootstrap::Instruction` |
-| `session/resume` | `{session_id}` | `{session_id}` | 走 `build_agent(Some(id), None, Default)`，identity 不符则报错 `-32002` |
+| `session/create` | `{profile?: str, instruction?: str}` | `{session_id, context_window}` | 新会话，走 `build_agent(None, profile, Bootstrap)`；`instruction` 映射 `Bootstrap::Instruction`；`context_window` 同时见于 `session/started` 通知 |
+| `session/resume` | `{session_id}` | `{session_id, context_window}` | 走 `build_agent(Some(id), None, Default)`，identity 不符则报错 `-32002` |
 | `session/list` | `{}` | `{archived: [{id,title,last_modified}], active: [{id}]}` | archived 来自 `list_sessions()`，active 来自会话池 |
 | `session/close` | `{session_id}` | `{archived: true}` | 优雅关闭：drop 命令通道 → worker 收尾 → archive → 关 mcp → 移除；回合进行中则等它结束 |
 | `turn/submit` | `{session_id, text, images?: [{media_type, data, width, height}]}` | `{accepted: true}` | `images` 经 `Image::from_base64` 校验后构造 `UserInput`；回合进行中的提交按 agent 现有队列语义排队 |
 | `turn/cancel` | `{session_id}` | `{accepted: true}` | 映射 `AgentCommand::Cancel`（取消当前回合；排队中的 prompt 仍会执行） |
 | `command/run` | `{session_id, command: "/clear"\|"/compact"}` | `{finished: true}` | 映射 `AgentCommand::Run`，等服务端 `command_finished` 事件后回包 |
-| `session/attach` | `{session_id}` | `{replayed: true}` | 触发 `agent.rebroadcast_all_view()`，供 Webview 重开时重建视图 |
+| `session/attach` | `{session_id}` | `{replayed: true, context_window}` | 触发 `agent.rebroadcast_all_view()`，供 Webview 重开时重建视图 |
 | `server/shutdown` | `{}` | `{ok: true}` | 触发优雅关闭并退出 |
 
 ### 3.4 服务端通知 → 客户端
 
 - `server/hello`（无 session_id）
-- `session/started` `{session_id, model, thinking_effort}`（来自 Startup 与 /clear 的 SessionStarted）
+- `session/started` `{session_id, model, thinking_effort, context_window}`（来自 Startup 与 /clear 的 SessionStarted；`context_window` 为配置的上下文窗口，供前端渲染 `context current/limit` 指示器）
 - `session/event` `{session_id, event: {…}}` —— 单一方法 + 统一形状 `{type, data}`（adjacent tagging），与 `AgentViewEvent` 一一对应：
 
 | event.type | data |

@@ -63,12 +63,6 @@ body {
   font-size: 0.9em;
 }
 
-.token-usage {
-  color: var(--vscode-descriptionForeground);
-  font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 0.9em;
-}
-
 /* --- chat ----------------------------------------------------------------- */
 
 .chat {
@@ -158,16 +152,39 @@ body {
 
 .composer-actions {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
 }
 
 .composer-actions button {
+  margin-left: auto;
   background: var(--vscode-button-background);
   color: var(--vscode-button-foreground);
   border: none;
   border-radius: 4px;
   padding: 0.35rem 1rem;
   cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* The TUI-style `context current/limit ([bar % left])` indicator, bottom-left. */
+.context-bar {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+}
+
+.context-bar .cb-muted {
+  color: var(--vscode-descriptionForeground);
+}
+
+.context-bar .cb-turn {
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.8;
 }
 
 .composer-actions button:disabled {

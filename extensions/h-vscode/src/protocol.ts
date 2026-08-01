@@ -37,6 +37,7 @@ export interface SessionStartedParams {
   session_id: string;
   model: string;
   thinking_effort?: string | null;
+  context_window?: number;
 }
 
 export interface SessionEventParams {

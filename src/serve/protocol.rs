@@ -94,7 +94,12 @@ pub fn error_response(id: Option<&Value>, code: i64, message: &str) -> String {
     .to_string()
 }
 
-pub fn session_started(session_id: &str, model: &str, thinking_effort: Option<&str>) -> String {
+pub fn session_started(
+    session_id: &str,
+    model: &str,
+    thinking_effort: Option<&str>,
+    context_window: usize,
+) -> String {
     json!({
         "jsonrpc": "2.0",
         "method": "session/started",
@@ -102,6 +107,7 @@ pub fn session_started(session_id: &str, model: &str, thinking_effort: Option<&s
             "session_id": session_id,
             "model": model,
             "thinking_effort": thinking_effort,
+            "context_window": context_window,
         },
     })
     .to_string()
