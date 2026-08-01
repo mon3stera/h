@@ -357,6 +357,48 @@ impl Search {
     }
 }
 
+/// The view-facing projection of a [`Search`]: everything a UI can render,
+/// with none of the provider-native replay bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SearchView {
+    id: String,
+    status: SearchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<SearchAction>,
+}
+
+impl SearchView {
+    pub fn new(id: impl Into<String>, status: SearchStatus, action: Option<SearchAction>) -> Self {
+        Self {
+            id: id.into(),
+            status,
+            action,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn status(&self) -> SearchStatus {
+        self.status
+    }
+
+    pub fn action(&self) -> Option<&SearchAction> {
+        self.action.as_ref()
+    }
+}
+
+impl From<&Search> for SearchView {
+    fn from(search: &Search) -> Self {
+        Self::new(
+            search.id().to_owned(),
+            search.status(),
+            search.action().cloned(),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
     System(String),

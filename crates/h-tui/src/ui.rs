@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use h_core::{
-    context::Search,
+    context::SearchView,
     event::AgentViewEvent,
     tool::{DisplayBlock, Presentation, ToolCallId, ToolCallStatus},
 };
@@ -144,7 +144,7 @@ pub enum RenderUnit {
     /// turn summary survives scrolling away from it.
     Done(Duration, Option<usize>),
     ParsedMarkdown(Vec<MarkdownBlock>),
-    Search(Search),
+    Search(SearchView),
     Tool(Presentation),
     Prompt(String),
     Notice(String),
@@ -710,15 +710,14 @@ mod view_event_tests {
 
     #[test]
     fn search_events_replace_an_existing_search_with_the_same_id() {
-        let running = Search::new("ws-1", SearchStatus::Running, None, Vec::new());
-        let completed = Search::new(
+        let running = SearchView::new("ws-1", SearchStatus::Running, None);
+        let completed = SearchView::new(
             "ws-1",
             SearchStatus::Succeeded,
             Some(SearchAction::Query {
                 query: "Rust async runtimes".to_owned(),
                 sources: Vec::new(),
             }),
-            Vec::new(),
         );
         let mut state = ViewState::default();
 

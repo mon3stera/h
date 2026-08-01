@@ -3,7 +3,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use h_core::context::{Search, SearchAction, SearchStatus};
+use h_core::context::{SearchAction, SearchStatus, SearchView};
 
 use crate::{
     banner, format_tokens, markdown, text, tool,
@@ -158,7 +158,7 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
 
 const SEARCH_SOURCE_LIMIT: usize = 5;
 
-fn render_search(search: &Search, width: usize) -> Vec<Line<'static>> {
+fn render_search(search: &SearchView, width: usize) -> Vec<Line<'static>> {
     let (indicator, indicator_style) = match search.status() {
         SearchStatus::Running => ("⟳ ", Style::default().fg(Color::Yellow)),
         SearchStatus::Succeeded => ("● ", Style::default().fg(Color::Cyan)),
@@ -382,14 +382,13 @@ mod tests {
         let sources = (1..=7)
             .map(|index| SearchSource::new(format!("https://example.com/{index}"), None))
             .collect();
-        let search = Search::new(
+        let search = SearchView::new(
             "ws-1",
             SearchStatus::Succeeded,
             Some(SearchAction::Query {
                 query: "Rust async runtimes".to_owned(),
                 sources,
             }),
-            Vec::new(),
         );
         let mut transcript = Transcript::default();
 

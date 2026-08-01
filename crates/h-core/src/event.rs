@@ -1,6 +1,6 @@
 use crate::{
     command::Command,
-    context::Search,
+    context::{Search, SearchView},
     input::UserInput,
     tool::{Presentation, ToolCall, ToolCallResult},
 };
@@ -40,7 +40,7 @@ pub enum AgentViewEvent {
     /// session has no other way to put the user's own turns back on screen.
     Prompt(String),
     TextDelta(String),
-    Search(Search),
+    Search(SearchView),
     Tool(Presentation),
     TurnStart,
     /// Both values are local estimates. `context` is the next request size,

@@ -765,7 +765,7 @@ where
                 }
 
                 self.view_bus
-                    .broadcast(AgentViewEvent::Search(search.clone()));
+                    .broadcast(AgentViewEvent::Search(search.into()));
             }
             ProviderSignal::ToolCallStarted(call) => {
                 metrics.tool_call_count += 1;
@@ -1103,7 +1103,7 @@ where
                 | Message::ToolCallResult { .. } => continue,
                 Message::Search(search) => {
                     self.view_bus
-                        .broadcast(AgentViewEvent::Search(search.clone()));
+                        .broadcast(AgentViewEvent::Search(search.into()));
                 }
                 Message::User(prompt) => {
                     self.view_bus
@@ -1402,7 +1402,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        context::{Search, SearchAction},
+        context::{Search, SearchAction, SearchView},
         provider::{Compaction, Identity, Protocol},
         tool::{
             FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition,
@@ -2421,13 +2421,13 @@ mod tests {
         ));
         assert!(
             std::iter::from_fn(|| events.try_recv().ok())
-                .any(|event| matches!(event, AgentViewEvent::Search(item) if item == search))
+                .any(|event| matches!(event, AgentViewEvent::Search(item) if item == SearchView::from(&search)))
         );
 
         agent.rebroadcast_all_view();
         assert!(matches!(
             events.try_recv(),
-            Ok(AgentViewEvent::Search(item)) if item == search
+            Ok(AgentViewEvent::Search(item)) if item == SearchView::from(&search)
         ));
     }
 
