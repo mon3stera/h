@@ -66,22 +66,24 @@
 
 - `server/hello`（无 session_id）
 - `session/started` `{session_id, model, thinking_effort}`（来自 Startup 与 /clear 的 SessionStarted）
-- `session/event` `{session_id, event: {…}}` —— 单一方法 + 带 tag 的载荷，与 `AgentViewEvent` 一一对应：
+- `session/event` `{session_id, event: {…}}` —— 单一方法 + 统一形状 `{type, data}`（adjacent tagging），与 `AgentViewEvent` 一一对应：
 
-| event.type | 载荷 |
+| event.type | data |
 |---|---|
-| `prompt` | `{text}`（resume 重放用） |
-| `text_delta` | `{delta}` |
-| `search` | `{search: {id, status, action}}`（view 投影，无 provider 私有字节，见 §3.7） |
-| `tool` | `{presentation}` |
-| `turn_start` | `{}` |
-| `token_usage` | `{context?, turn?}` |
-| `session_started` | `{}` |
-| `command_finished` | `{command}` |
-| `context_compacted` | `{}` |
+| `prompt` | 字符串（resume 重放用） |
+| `text_delta` | 字符串增量 |
+| `search` | `{id, status, action}`（view 投影，无 provider 私有字节，见 §3.7） |
+| `tool` | `Presentation`（`{call_id, name, label, target?, status, blocks}`） |
+| `turn_start` | `null` |
+| `token_usage` | `{context?, turn?}`（None 字段省略） |
+| `session_started` | `null` |
+| `command_finished` | `"/clear"` \| `"/compact"` |
+| `context_compacted` | `null` |
 | `turn_finished` | `{completed}` |
-| `completed` | `{}` |
-| `error` | `{message}` |
+| `completed` | `null` |
+| `error` | 错误消息字符串 |
+
+> 注意：`search.data` 的 `status` 与 `action` 沿用存档格式——`SearchStatus` 序列化为帕斯卡字符串（`"Succeeded"`）、`SearchAction` 为外部标签（`{"Query": {…}}`）。这两个类型被 `Message::Search` 存档绑定，改 serde 属性会破坏旧存档兼容，故不做 wire 层美化。
 
 > 备选：每个事件一个 method（`text/delta`、`tool/completed`…）。差别只在协议表面；客户端都是同一个 switch。选单方法 + tag 是更小的协议面，未来加事件不破坏客户端。
 
@@ -97,8 +99,8 @@
 客户端回复（`AskAnswer` 直接映射）：
 
 ```json
-{"jsonrpc":"2.0","id":17,"result":{"answer":{"type":"option","index":0,"label":"…"}}}
-{"jsonrpc":"2.0","id":17,"result":{"answer":{"type":"free_text","text":"…"}}}
+{"jsonrpc":"2.0","id":17,"result":{"answer":{"type":"option","data":{"index":0,"label":"…"}}}}
+{"jsonrpc":"2.0","id":17,"result":{"answer":{"type":"free_text","data":"…"}}}
 ```
 
 serve 持有该请求的 oneshot，把 answer 送回正在等待的 `Bridge::ask` 调用方，agent 继续。
@@ -124,7 +126,8 @@ serve 持有该请求的 oneshot，把 answer 送回正在等待的 `Bridge::ask
   - `ToolCall` 族（`tool/mod.rs`）：`ToolCallId`、`ToolCall`、`ToolCallOutcome`、`ToolCallResult`（`Summary` 已 serde）。
   - `Command`（`command.rs`）：wire 上输出 `/clear`/`/compact` 标签。
   - `AskQuestion` / `AskOption` / `AskAnswer`（`interaction.rs`）：双向 serde（回包需要）。
-- `AgentViewEvent` 整体 `#[derive(Serialize)]` + `#[serde(tag = "type", rename_all = "snake_case")]`，wire 上 `search` 事件天然只有 `{id, status, action}`。
+- 所有 tag 化枚举用 **adjacent tagging**：`#[serde(tag = "type", content = "data", rename_all = "snake_case")]`，统一产出 `{type, data}`。原因：serde 的 internal tagging 无法序列化**含字符串的 newtype 变体**（`TextDelta(String)`、`DisplayBlock::Summary(String)`、`AskAnswer::FreeText(String)` 会直接报错），adjacent tagging 支持全部变体形状且零手写代码。`Err` 变体显式 `#[serde(rename = "error")]`（`rename_all` 会给它 `"err"`）。
+- 已落地并测试锁定（`event.rs` 新增 wire 形状断言测试 + `interaction.rs` 往返测试）：`AgentViewEvent`、`DisplayBlock`、`ToolCallStatus`、`ToolCallOutcome`、`AskAnswer` 全部 `{type, data}` 形状；`Command` 输出 `/clear`/`/compact`；`DiffLineKind` 输出 `"removed"`/`"added"`/`"context"`。
 
 ## 4. `h serve` 实现设计
 
