@@ -189,6 +189,7 @@ export function useSession(): Session {
     setPhase('loading');
     setMessages([]);
     setError(null);
+    setPendingQuestion(null);
     void request<{ session_id: string }>('session/create', {})
       .then((result) => {
         setCurrentSession(result.session_id);
@@ -204,6 +205,7 @@ export function useSession(): Session {
     setPhase('loading');
     setMessages([]);
     setError(null);
+    setPendingQuestion(null);
     void request<{ session_id: string }>('session/resume', { session_id: id })
       .then((result) => {
         setCurrentSession(result.session_id);
@@ -219,6 +221,7 @@ export function useSession(): Session {
     setPhase('loading');
     setMessages([]);
     setError(null);
+    setPendingQuestion(null);
     void request<{ replayed: boolean }>('session/attach', { session_id: id })
       .then(() => {
         setCurrentSession(id);
@@ -239,6 +242,7 @@ export function useSession(): Session {
             setCurrentSession(null);
             setMessages([]);
             setTokenUsage(null);
+            setPendingQuestion(null);
             setPhase('idle');
           }
           refreshList();
