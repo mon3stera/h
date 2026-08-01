@@ -1,9 +1,9 @@
 /**
  * Extension host: owns one `h serve` child process shared by every chat panel.
  *
- * Lifecycle per docs/vscode-integration.md §5.2: closing a panel does not
- * close sessions; only VS Code exiting (or an explicit shutdown) tears the
- * server down, at which point stdin EOF makes `h serve` archive every session.
+ * Lifecycle: closing a panel does not close sessions; only VS Code exiting
+ * (or an explicit shutdown) tears the server down, at which point stdin EOF
+ * makes `h serve` archive every session.
  */
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';

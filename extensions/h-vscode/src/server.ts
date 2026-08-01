@@ -1,8 +1,8 @@
 /**
  * A running `h serve` process with a JSON-RPC 2.0 client over stdio.
  *
- * Frame discipline follows docs/vscode-integration.md §3.1: one JSON object
- * per line, UTF-8, on stdout only. This module is pure Node — it never imports
+ * Frame discipline: one JSON object per line, UTF-8, on stdout only. This
+ * module is pure Node — it never imports
  * `vscode` — so it can be exercised standalone (see scripts/smoke.cjs).
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';

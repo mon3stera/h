@@ -2,8 +2,7 @@
  * Wire types for the `h serve` JSON-RPC protocol.
  *
  * Mirrors `src/serve/protocol.rs` and the event shapes derived in
- * `crates/h-core/src/event.rs`. Keep in sync with
- * docs/vscode-integration.md §3 — do not let this file drift.
+ * `crates/h-core/src/event.rs` — do not let this file drift.
  */
 
 export const PROTOCOL_VERSION = 1;
@@ -47,7 +46,7 @@ export interface SessionEventParams {
 
 /**
  * Adjacent-tagged view events: `{type, data}`, one per `AgentViewEvent`
- * variant. See docs/vscode-integration.md §3.4.
+ * variant.
  */
 export type ViewEvent =
   | { type: 'prompt'; data: string }

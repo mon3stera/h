@@ -1,17 +1,18 @@
 # h VS Code extension
 
 Chat with [h](https://github.com/) inside VS Code through a Webview panel. The
-extension spawns `h serve` as a stdio child process and speaks the JSON-RPC
-protocol documented in [`docs/vscode-integration.md`](../../docs/vscode-integration.md).
+extension spawns `h serve` as a stdio child process and speaks the `h serve`
+JSON-RPC protocol (see `src/protocol.ts` in this extension and
+`src/serve/protocol.rs` in the h repository).
 
 ## Status
 
-M3 (full chat surface): spawn + `server/hello` handshake, streaming text,
-cancel, `ask/question` modal (options + free text), tool cards (Presentation
-blocks: summary/code/diff/table/key-value), session picker
-(create/resume/attach/close), `/clear` `/compact`, and token usage in the
-header. Remaining M4 polish: markdown rendering, image paste, packaging
-readiness.
+Full chat surface: spawn + `server/hello` handshake, streaming text, cancel,
+`ask/question` modal (options + free text), tool cards (Presentation blocks:
+summary/code/diff/table/key-value), session picker
+(create/resume/attach/close), `/clear` `/compact`, markdown rendering with
+external links, image paste, TUI-style context indicator, and a `h.fontSize`
+setting for the panel.
 
 ## Prerequisites
 
