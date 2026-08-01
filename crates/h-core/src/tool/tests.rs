@@ -598,6 +598,45 @@ async fn write_file_appends_and_invalidates_the_shared_read_buffer() {
     fs::remove_file(path).await.unwrap();
 }
 
+#[tokio::test]
+async fn write_file_creates_missing_parent_directories() {
+    let base = std::env::temp_dir().join(format!("h-write-nested-{}", uuid::Uuid::new_v4()));
+    let writer = WriteFileTool::new(FileBufferStore::default());
+
+    let nested = base.join("a").join("b").join("notes.txt");
+    let written = TypedTool::call(
+        &writer,
+        WriteFileToolArgs {
+            path: nested.to_string_lossy().into_owned(),
+            content: "hello".to_owned(),
+            mode: WriteFileMode::Overwrite,
+        },
+    )
+    .await
+    .unwrap()
+    .into_value();
+    assert_eq!(written.start_line, 1);
+    assert_eq!(fs::read_to_string(&nested).await.unwrap(), "hello");
+
+    // Append mode gets the same guard: a missing directory chain is created.
+    let append_target = base.join("c").join("log.txt");
+    let appended = TypedTool::call(
+        &writer,
+        WriteFileToolArgs {
+            path: append_target.to_string_lossy().into_owned(),
+            content: "line\n".to_owned(),
+            mode: WriteFileMode::Append,
+        },
+    )
+    .await
+    .unwrap()
+    .into_value();
+    assert_eq!(appended.start_line, 1);
+    assert_eq!(fs::read_to_string(&append_target).await.unwrap(), "line\n");
+
+    fs::remove_dir_all(base).await.unwrap();
+}
+
 #[test]
 fn bash_arguments_deserialize_by_action() {
     let run_blocking: BashToolArgs = serde_json::from_value(json!({

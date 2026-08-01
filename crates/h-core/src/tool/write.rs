@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -61,11 +61,13 @@ impl TypedTool for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "write content to a file by overwriting it or appending to its end"
+        "write content to a file by overwriting it or appending to its end, creating missing parent directories as needed"
     }
 
     async fn call(&self, arguments: Self::Arguments) -> anyhow::Result<ToolOutput<Self::Output>> {
         let path = PathBuf::from(&arguments.path);
+
+        ensure_parent_dir(&path).await?;
 
         let start_line = match arguments.mode {
             WriteFileMode::Overwrite => {
@@ -96,6 +98,19 @@ impl TypedTool for WriteFileTool {
             start_line,
         }))
     }
+}
+
+/// Create the parent directory of `path` when it is missing. Both write modes
+/// already create the file itself; this covers the `NotFound` case where the
+/// directory chain above it does not exist yet.
+async fn ensure_parent_dir(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).await?;
+    }
+
+    Ok(())
 }
 
 async fn append_start_line(file: &mut fs::File) -> anyhow::Result<usize> {
