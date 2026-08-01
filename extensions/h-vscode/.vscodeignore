@@ -1,0 +1,10 @@
+# Only the compiled extension host and webview bundle ship in the VSIX.
+node_modules/**
+src/**
+scripts/**
+tsconfig*.json
+vite.config.mts
+.vscode/**
+.gitignore
+.h/**
+**/*.map

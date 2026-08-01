@@ -6,6 +6,10 @@
   "publisher": "h-dev",
   "private": true,
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mon3stera/h.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -52,6 +56,7 @@
     "@types/react-dom": "^19.2.4",
     "@types/vscode": "^1.85.0",
     "@vitejs/plugin-react": "^6.0.5",
+    "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2",
     "vite": "^8.2.0"
   }
