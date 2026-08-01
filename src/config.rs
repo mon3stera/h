@@ -5,7 +5,11 @@ use std::{
 };
 
 use anyhow::Context as _;
-use h_core::{config::ReasoningEffort, context::DEFAULT_TOOL_SUMMARY_TURN_INTERVAL};
+use h_core::{
+    config::ReasoningEffort,
+    context::DEFAULT_TOOL_SUMMARY_TURN_INTERVAL,
+    provider::{Identity, Protocol},
+};
 use serde::Deserialize;
 use tokio::fs;
 
@@ -138,6 +142,21 @@ impl Config {
 
     pub fn model(&self) -> &str {
         self.profile().model()
+    }
+
+    /// The upstream the selected profile addresses: its request format and
+    /// provider. Archived sessions can only be resumed under a matching one.
+    pub fn identity(&self) -> Identity {
+        match self.profile() {
+            ProfileConfig::OpenAI(config) => Identity {
+                protocol: Protocol::OpenAI,
+                base_url: config.base_url().to_owned(),
+            },
+            ProfileConfig::Anthropic(config) => Identity {
+                protocol: Protocol::Anthropic,
+                base_url: config.base_url().to_owned(),
+            },
+        }
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {

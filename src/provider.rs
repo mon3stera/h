@@ -1,7 +1,7 @@
 use h_core::{
     context::Message,
     provider::{
-        Compaction, Provider, ProviderEventStream, anthropic::AnthropicProvider,
+        Compaction, Identity, Provider, ProviderEventStream, anthropic::AnthropicProvider,
         openai::OpenAIProvider,
     },
     tool::ToolDefinition,
@@ -18,6 +18,13 @@ impl Provider for Client {
         match self {
             Self::OpenAI(provider) => provider.model(),
             Self::Anthropic(provider) => provider.model(),
+        }
+    }
+
+    fn identity(&self) -> Option<Identity> {
+        match self {
+            Self::OpenAI(provider) => provider.identity(),
+            Self::Anthropic(provider) => provider.identity(),
         }
     }
 

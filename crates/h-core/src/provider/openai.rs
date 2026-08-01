@@ -24,7 +24,7 @@ use crate::{
     context::{Message, Search, SearchAction, SearchSource, SearchStatus},
     event::{CompletedReason, ProviderSignal},
     input::{InputPart, UserInput},
-    provider::{Compaction, Provider, ProviderEventStream},
+    provider::{Compaction, Identity, Protocol, Provider, ProviderEventStream},
     tool::{ToolCall, ToolCallResult, ToolDefinition},
 };
 
@@ -1247,6 +1247,13 @@ fn patch(v: &mut Value) {
 impl Provider for OpenAIProvider {
     fn model(&self) -> &str {
         &self.config.model
+    }
+
+    fn identity(&self) -> Option<Identity> {
+        Some(Identity {
+            protocol: Protocol::OpenAI,
+            base_url: self.config.base_url.clone(),
+        })
     }
 
     fn thinking_effort(&self) -> Option<&str> {

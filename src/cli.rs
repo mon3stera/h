@@ -1,7 +1,12 @@
 use chrono::Utc;
 use clap::Parser;
-use h_core::context::list_sessions;
+use h_core::{
+    context::{SessionMeta, list_sessions},
+    provider::Identity,
+};
 use h_tui::resume::{ResumeEntry, pick_session};
+
+use crate::config::Config;
 
 /// An agentic coding CLI.
 #[derive(Parser, Debug, Clone)]
@@ -25,7 +30,7 @@ pub struct Args {
     pub resume: Option<Option<String>>,
 
     /// Run with this profile instead of the configured default. A resumed
-    /// session always replays under the profile it was archived with, so the
+    /// session must match the current profile's protocol and provider, so the
     /// flag only applies to new sessions.
     #[arg(long, value_name = "PROFILE", conflicts_with = "resume", value_parser = non_blank)]
     pub profile: Option<String>,
@@ -39,15 +44,18 @@ fn non_blank(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-/// The archived sessions, most recently modified first, each carrying how long
-/// ago it was touched.
-async fn collect_resume_entries() -> anyhow::Result<Vec<ResumeEntry>> {
+/// The archived sessions the current profile may resume, most recently
+/// modified first, each carrying how long ago it was touched, plus the total
+/// number of archived sessions before filtering and the current upstream.
+async fn collect_resume_entries() -> anyhow::Result<(Vec<ResumeEntry>, usize, Identity)> {
     // One `now` for the whole list, so two rows archived at the same moment
     // cannot disagree about their age.
     let now = Utc::now();
-
-    Ok(list_sessions()
-        .await?
+    let config = Config::load().await?;
+    let current = config.identity();
+    let sessions = list_sessions().await?;
+    let total = sessions.len();
+    let entries: Vec<ResumeEntry> = resumable_sessions(sessions, &current)
         .into_iter()
         .map(|session| ResumeEntry {
             id: session.id,
@@ -55,7 +63,27 @@ async fn collect_resume_entries() -> anyhow::Result<Vec<ResumeEntry>> {
             // A clock that jumped backwards should read as brand new, not fail.
             duration: (now - session.last_modified).to_std().unwrap_or_default(),
         })
-        .collect())
+        .collect();
+
+    tracing::info!(event = "cli.resume.filtered", total, shown = entries.len(),);
+
+    Ok((entries, total, current))
+}
+
+/// The archived sessions the current upstream may resume: those recorded under
+/// a matching identity. Sessions from another provider or protocol, and
+/// sessions archived before identity tracking, are hidden — resuming them is
+/// refused anyway, so the picker never offers them.
+fn resumable_sessions(sessions: Vec<SessionMeta>, current: &Identity) -> Vec<SessionMeta> {
+    sessions
+        .into_iter()
+        .filter(|session| {
+            session
+                .identity
+                .as_ref()
+                .is_some_and(|archived| archived.compatible_with(current))
+        })
+        .collect()
 }
 
 /// What the flags and the picker settled on.
@@ -81,11 +109,22 @@ pub async fn resolve_session(args: &Args) -> anyhow::Result<Session> {
         Some(None) => {}
     }
 
-    let entries = collect_resume_entries().await?;
+    let (entries, total, current) = collect_resume_entries().await?;
 
-    if entries.is_empty() {
+    if total == 0 {
         tracing::info!(event = "cli.resume.nothing_archived");
         println!("No archived session to resume. Run `h` to start one.");
+        return Ok(Session::Quit);
+    }
+
+    if entries.is_empty() {
+        tracing::info!(event = "cli.resume.nothing_compatible");
+        println!(
+            "No archived session is compatible with the current profile \
+             ({} @ {}). Start a new session with `h`, or restore the profile \
+             the session was archived under.",
+            current.protocol, current.base_url,
+        );
         return Ok(Session::Quit);
     }
 
@@ -102,8 +141,9 @@ pub async fn resolve_session(args: &Args) -> anyhow::Result<Session> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use h_core::provider::Protocol;
 
-    use super::Args;
+    use super::*;
 
     fn parse(argv: &[&str]) -> Args {
         Args::try_parse_from(argv).expect("argv should parse")
@@ -191,7 +231,9 @@ mod tests {
 
     #[test]
     fn profile_cannot_combine_with_resume() {
-        assert!(Args::try_parse_from(["h", "--profile", "deepseek", "--resume", "01JQ2X"]).is_err());
+        assert!(
+            Args::try_parse_from(["h", "--profile", "deepseek", "--resume", "01JQ2X"]).is_err()
+        );
         assert!(Args::try_parse_from(["h", "--profile", "deepseek", "--resume"]).is_err());
     }
 
@@ -235,6 +277,61 @@ mod tests {
         assert_eq!(
             super::resolve_session(&args).await.unwrap(),
             super::Session::Resume("01JQ2X".to_owned())
+        );
+    }
+
+    fn session_meta(id: &str, title: &str, identity: Option<Identity>) -> SessionMeta {
+        SessionMeta {
+            id: id.to_owned(),
+            last_modified: Utc::now(),
+            title: title.to_owned(),
+            identity,
+        }
+    }
+
+    #[test]
+    fn picker_hides_sessions_that_cannot_be_resumed() {
+        let current = Identity {
+            protocol: Protocol::Anthropic,
+            base_url: "https://api.deepseek.com/anthropic".to_owned(),
+        };
+        let sessions = vec![
+            session_meta("same", "from this provider", Some(current.clone())),
+            session_meta(
+                "trailing-slash",
+                "same upstream, slash ignored",
+                Some(Identity {
+                    protocol: Protocol::Anthropic,
+                    base_url: "https://api.deepseek.com/anthropic/".to_owned(),
+                }),
+            ),
+            session_meta(
+                "other-provider",
+                "another provider",
+                Some(Identity {
+                    protocol: Protocol::Anthropic,
+                    base_url: "https://api.anthropic.com".to_owned(),
+                }),
+            ),
+            session_meta(
+                "other-protocol",
+                "another protocol",
+                Some(Identity {
+                    protocol: Protocol::OpenAI,
+                    base_url: "https://api.openai.com/v1".to_owned(),
+                }),
+            ),
+            session_meta("legacy", "before identity tracking", None),
+        ];
+
+        let shown = resumable_sessions(sessions, &current);
+
+        assert_eq!(
+            shown
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["same", "trailing-slash"]
         );
     }
 }

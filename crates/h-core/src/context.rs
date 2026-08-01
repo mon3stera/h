@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     input::UserInput,
-    provider::Compaction,
+    provider::{Compaction, Identity},
     tool::{Summary, ToolRegistry},
 };
 
@@ -390,6 +390,10 @@ pub struct Context {
     token_count: Option<usize>,
     #[serde(default)]
     tool_compaction: ToolCompaction,
+    /// The upstream this conversation belongs to, recorded so a resumed
+    /// session can be matched to the profile that archived it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<Identity>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -415,18 +419,28 @@ struct PersistHistories {
     token_count: Option<usize>,
     #[serde(default)]
     tool_compaction: ToolCompaction,
+    /// The upstream that recorded this session; absent only for archives
+    /// written before identity tracking existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<Identity>,
 }
 
-/// The listing view of an archived session, stored in its own file so a session
-/// picker never has to deserialize the conversation to learn a title.
+/// The index of an archived session, stored in its own file so a session
+/// picker never has to deserialize the conversation to learn a title or
+/// whether the current profile may resume it.
 ///
-/// Both fields are derivable from the histories, which makes this file a cache:
-/// losing it costs a listing entry, never a session.
+/// The index is kept in step with the archive: neither the title nor the
+/// upstream identity can be derived from the conversation alone, so losing it
+/// hides the session from the picker even though the archive stays intact.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SessionMeta {
     pub id: String,
     pub last_modified: DateTime<Utc>,
     pub title: String,
+    /// The upstream that recorded this session; absent only for archives
+    /// written before identity tracking existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
 }
 
 impl Context {
@@ -516,6 +530,7 @@ impl Context {
             histories: Vec::new(),
             token_count: None,
             tool_compaction: ToolCompaction::default(),
+            identity: None,
         }
     }
 
@@ -728,7 +743,8 @@ impl Context {
     }
 
     /// Keeps the session instructions while dropping the old conversation and
-    /// assigning a new archive identity.
+    /// assigning a new archive identity. The upstream identity survives: a
+    /// fresh session still belongs to the same provider.
     pub fn start_session(&mut self) {
         let system = self
             .histories
@@ -736,15 +752,26 @@ impl Context {
             .filter(|message| matches!(message, Message::System(_)))
             .cloned()
             .collect();
+        let identity = self.identity.clone();
 
         *self = Self {
             histories: system,
+            identity,
             ..Self::new()
         };
     }
 
     pub fn histories_mut(&mut self) -> &mut Vec<Message> {
         &mut self.histories
+    }
+
+    /// The upstream this conversation is bound to, when one was recorded.
+    pub(crate) fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
+    }
+
+    pub(crate) fn set_identity(&mut self, identity: Option<Identity>) {
+        self.identity = identity;
     }
 }
 
@@ -853,6 +880,7 @@ impl Context {
             histories: self.histories.clone(),
             token_count: self.token_count,
             tool_compaction: self.tool_compaction.clone(),
+            identity: self.identity.clone(),
         }
     }
 
@@ -861,6 +889,7 @@ impl Context {
             id: self.id.clone(),
             last_modified: Utc::now(),
             title: self.title(),
+            identity: self.identity.clone(),
         }
     }
 
@@ -921,6 +950,7 @@ impl Context {
             histories: deserialized.histories,
             token_count: deserialized.token_count,
             tool_compaction: deserialized.tool_compaction,
+            identity: deserialized.identity,
         })
     }
 }
@@ -1008,7 +1038,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::tool::{FetchTool, FileBufferStore, GrepTool, ReadFileTool, Summary, WriteFileTool};
+    use crate::{
+        provider::Protocol,
+        tool::{FetchTool, FileBufferStore, GrepTool, ReadFileTool, Summary, WriteFileTool},
+    };
 
     fn exploratory_tools() -> ToolRegistry {
         let buffers = FileBufferStore::default();
@@ -1125,6 +1158,7 @@ mod tests {
             histories: vec![Message::User(prompt.into())],
             token_count: None,
             tool_compaction: ToolCompaction::default(),
+            identity: None,
         }
     }
 
@@ -1630,6 +1664,7 @@ mod tests {
             ],
             token_count: None,
             tool_compaction: ToolCompaction::default(),
+            identity: None,
         };
 
         assert_eq!(context.prompts(), ["first", "second"]);
@@ -1646,6 +1681,7 @@ mod tests {
             ],
             token_count: None,
             tool_compaction: ToolCompaction::default(),
+            identity: None,
         };
 
         assert!(!context.has_exchange());
@@ -1776,6 +1812,7 @@ mod tests {
                 completed_turns: 3,
                 ..ToolCompaction::default()
             },
+            identity: None,
         };
 
         context.start_session();
@@ -1803,6 +1840,61 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-1");
+    }
+
+    #[tokio::test]
+    async fn identity_survives_archive_and_resume() {
+        let archive = TempArchive::new();
+        let mut context = context_with_prompt("session-1", "teach me borrow checking");
+        context.set_identity(Some(Identity {
+            protocol: Protocol::Anthropic,
+            base_url: "https://api.deepseek.com/anthropic".to_owned(),
+        }));
+        context.archive_in(&archive.path).await.unwrap();
+
+        let resumed = Context::resume_in(&archive.path, "session-1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resumed.identity(),
+            Some(&Identity {
+                protocol: Protocol::Anthropic,
+                base_url: "https://api.deepseek.com/anthropic".to_owned(),
+            })
+        );
+
+        // The index carries the same identity, so the picker can filter
+        // without reading the archive.
+        let sessions = list_sessions_in(&archive.path).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].identity,
+            Some(Identity {
+                protocol: Protocol::Anthropic,
+                base_url: "https://api.deepseek.com/anthropic".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn start_session_keeps_the_upstream_identity() {
+        let mut context = context_with_prompt("session-1", "teach me borrow checking");
+        context.set_identity(Some(Identity {
+            protocol: Protocol::OpenAI,
+            base_url: "https://api.openai.com/v1".to_owned(),
+        }));
+        context.inject_system_prompt("system prompt".to_owned());
+        context.start_session();
+
+        assert_eq!(
+            context.identity(),
+            Some(&Identity {
+                protocol: Protocol::OpenAI,
+                base_url: "https://api.openai.com/v1".to_owned(),
+            })
+        );
+        assert_eq!(context.prompts(), Vec::<String>::new());
     }
 
     /// The whole point of splitting the files: a listing must not read histories.

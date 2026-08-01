@@ -171,6 +171,10 @@ Choose an archived session to resume:
 h --resume
 ```
 
+The picker only lists sessions recorded under the current profile's protocol
+and provider; sessions from another upstream are hidden, and resuming one by id
+is refused.
+
 Resume a known session directly:
 
 ```bash

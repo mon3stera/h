@@ -240,10 +240,13 @@ where
     P: Provider,
 {
     pub fn new(provider: P) -> Self {
+        let mut context = Context::new();
+        context.set_identity(provider.identity());
+
         Self {
             event_bus: EventBus::new(),
             view_bus: EventBus::new(),
-            context: Context::new(),
+            context,
             tool: ToolRegistry::new(),
             provider,
             turn: NextTurn::Continue,
@@ -1033,6 +1036,36 @@ where
 
     pub async fn resume(&mut self, id: impl AsRef<str>) -> anyhow::Result<&mut Self> {
         let context = Context::resume_in(&self.archive_dir, id.as_ref()).await?;
+
+        // A session belongs to the upstream that recorded it: replaying it
+        // under a different protocol or provider would mangle or mislead the
+        // history. Refuse unless both sides can be matched.
+        let Some(current) = self.provider.identity() else {
+            anyhow::bail!(
+                "refusing to resume {}: the current provider does not report an upstream identity",
+                id.as_ref()
+            );
+        };
+        let Some(archived) = context.identity() else {
+            anyhow::bail!(
+                "refusing to resume {}: the session predates upstream identity tracking; \
+                 start a new session with `h`",
+                id.as_ref(),
+            );
+        };
+
+        if !archived.compatible_with(&current) {
+            anyhow::bail!(
+                "refusing to resume {}: the session belongs to {} @ {}, but the current profile \
+                 is {} @ {}; restore the original profile or start a new session with `h`",
+                id.as_ref(),
+                archived.protocol,
+                archived.base_url,
+                current.protocol,
+                current.base_url,
+            );
+        }
+
         self.context = context;
         Ok(self)
     }
@@ -1370,7 +1403,7 @@ mod tests {
     use super::*;
     use crate::{
         context::{Search, SearchAction},
-        provider::Compaction,
+        provider::{Compaction, Identity, Protocol},
         tool::{
             FileBufferStore, ReadFileTool, Summary, ToolCall, ToolCallStatus, ToolDefinition,
             ToolOutput, TypedTool,
@@ -1402,6 +1435,36 @@ mod tests {
 
     fn completed(reason: CompletedReason) -> ProviderSignal {
         ProviderSignal::Completed { reason }
+    }
+
+    /// A provider that can say which upstream it addresses, for resume
+    /// constraint tests. Its stream is empty because those tests never run a
+    /// turn.
+    struct IdentifiedProvider {
+        identity: Identity,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for IdentifiedProvider {
+        fn model(&self) -> &str {
+            "identified-model"
+        }
+
+        fn thinking_effort(&self) -> Option<&str> {
+            None
+        }
+
+        fn define_tools(&mut self, _specs: Vec<ToolDefinition>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn identity(&self) -> Option<Identity> {
+            Some(self.identity.clone())
+        }
+
+        async fn stream(&self, _input: &[Message]) -> anyhow::Result<ProviderEventStream> {
+            Ok(Box::pin(stream::empty()))
+        }
     }
 
     struct TestProvider;
@@ -2147,6 +2210,99 @@ mod tests {
             .unwrap();
 
         assert_eq!(saved.prompts(), ["save this prompt"]);
+    }
+
+    fn identified(protocol: Protocol, base_url: &str) -> Identity {
+        Identity {
+            protocol,
+            base_url: base_url.to_owned(),
+        }
+    }
+
+    /// Archives a one-prompt session and resumes it under the same upstream.
+    /// The archived base_url keeps its trailing slash while the current one
+    /// drops it, exercising the tolerance.
+    #[tokio::test]
+    async fn resume_accepts_an_archive_from_the_same_upstream() {
+        let archive = TempArchive::new();
+        let mut agent = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::Anthropic, "https://api.deepseek.com/anthropic/"),
+        });
+        agent.with_archive_dir(&archive.path);
+        *agent.context.histories_mut() = vec![Message::User("hello".into())];
+        agent.archive().await.unwrap();
+        let id = agent.context.id();
+
+        let mut resumed = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::Anthropic, "https://api.deepseek.com/anthropic"),
+        });
+        resumed.with_archive_dir(&archive.path);
+        resumed.resume(&id).await.unwrap();
+
+        assert_eq!(resumed.context.prompts(), ["hello"]);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_an_archive_from_another_protocol() {
+        let archive = TempArchive::new();
+        let mut agent = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::Anthropic, "https://api.deepseek.com/anthropic"),
+        });
+        agent.with_archive_dir(&archive.path);
+        *agent.context.histories_mut() = vec![Message::User("hello".into())];
+        agent.archive().await.unwrap();
+        let id = agent.context.id();
+
+        let mut resumed = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::OpenAI, "https://api.deepseek.com/v1"),
+        });
+        resumed.with_archive_dir(&archive.path);
+        let error = resumed.resume(&id).await.err().unwrap().to_string();
+
+        assert!(error.contains("refusing to resume"));
+        assert!(error.contains("anthropic @ https://api.deepseek.com/anthropic"));
+        assert!(error.contains("openai @ https://api.deepseek.com/v1"));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_an_archive_from_another_provider() {
+        let archive = TempArchive::new();
+        let mut agent = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::Anthropic, "https://api.anthropic.com"),
+        });
+        agent.with_archive_dir(&archive.path);
+        *agent.context.histories_mut() = vec![Message::User("hello".into())];
+        agent.archive().await.unwrap();
+        let id = agent.context.id();
+
+        let mut resumed = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::Anthropic, "https://api.deepseek.com/anthropic"),
+        });
+        resumed.with_archive_dir(&archive.path);
+        let error = resumed.resume(&id).await.err().unwrap().to_string();
+
+        assert!(error.contains("refusing to resume"));
+        assert!(error.contains("https://api.anthropic.com"));
+        assert!(error.contains("https://api.deepseek.com/anthropic"));
+    }
+
+    /// A legacy archive carries no identity, so nothing can be matched; the
+    /// strict policy rejects it outright.
+    #[tokio::test]
+    async fn resume_rejects_an_archive_without_identity_tracking() {
+        let archive = TempArchive::new();
+        let mut context = Context::new();
+        *context.histories_mut() = vec![Message::User("hello".into())];
+        context.archive_in(&archive.path).await.unwrap();
+        let id = context.id();
+
+        let mut resumed = Agent::new(IdentifiedProvider {
+            identity: identified(Protocol::Anthropic, "https://api.deepseek.com/anthropic"),
+        });
+        resumed.with_archive_dir(&archive.path);
+        let error = resumed.resume(&id).await.err().unwrap().to_string();
+
+        assert!(error.contains("predates upstream identity tracking"));
     }
 
     fn seed_read_summary<P: Provider>(agent: &mut Agent<P>) {
