@@ -178,7 +178,7 @@ async fn drive(
                 _ => {}
             },
             event = events.recv() => match event {
-                Some(event) => app.handle_agent_event(event),
+                Some(event) => app.handle_ready_events(event, events),
                 None => return Ok(()),
             },
             // Guarded: pulling a second question while one is unanswered would
@@ -252,8 +252,7 @@ impl App {
                     && *completed
                 {
                     self.state
-                        .units
-                        .push(RenderUnit::Done(started.elapsed(), self.state.turn_tokens));
+                        .push_unit(RenderUnit::Done(started.elapsed(), self.state.turn_tokens));
                 }
             }
             AgentViewEvent::SessionStarted => {
@@ -276,6 +275,21 @@ impl App {
                 operation = "reduce_view_event",
                 error_class = "view_event_parse_error"
             );
+        }
+    }
+
+    /// Folds everything already queued into the view before drawing again. Text
+    /// deltas are cheap to reduce, while rebuilding the transcript for each one
+    /// is not; draining here also makes rapidly superseded token counts latest-win.
+    fn handle_ready_events(
+        &mut self,
+        first: AgentViewEvent,
+        events: &mut UnboundedReceiver<AgentViewEvent>,
+    ) {
+        self.handle_agent_event(first);
+
+        while let Ok(event) = events.try_recv() {
+            self.handle_agent_event(event);
         }
     }
 
@@ -458,8 +472,7 @@ impl App {
 
         // Echo it locally: nothing on the event bus carries the user's own turn
         // back to the view.
-        self.state.units.push(RenderUnit::Prompt(input.display()));
-        self.state.revision += 1;
+        self.state.push_unit(RenderUnit::Prompt(input.display()));
 
         // A prompt is why the newest output matters, so follow it again.
         self.transcript.pin();
@@ -481,9 +494,7 @@ impl App {
             Ok(ClipboardContent::Text(text)) => self.input.insert_text(&text),
             Err(error) => {
                 self.state
-                    .units
-                    .push(RenderUnit::Err(format!("Clipboard: {error}")));
-                self.state.revision += 1;
+                    .push_unit(RenderUnit::Err(format!("Clipboard: {error}")));
                 self.transcript.pin();
             }
         }
@@ -1791,5 +1802,29 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("streamed"))
         );
+    }
+
+    #[test]
+    fn ready_agent_events_are_folded_before_the_next_draw() {
+        let mut app = App::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        tx.send(AgentViewEvent::TextDelta(" second".to_owned()))
+            .unwrap();
+        tx.send(AgentViewEvent::TokenUsage {
+            context: Some(12_000),
+            turn: Some(800),
+        })
+        .unwrap();
+
+        app.handle_ready_events(AgentViewEvent::TextDelta("first".to_owned()), &mut rx);
+
+        assert!(matches!(
+            app.state.units.as_slice(),
+            [RenderUnit::Text(text)] if text == "first second"
+        ));
+        assert_eq!(app.state.context_tokens, Some(12_000));
+        assert_eq!(app.state.revision, 2);
+        assert!(rx.try_recv().is_err());
     }
 }

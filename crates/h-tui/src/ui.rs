@@ -165,14 +165,30 @@ pub struct ViewState {
     pub turn_in_progress: bool,
     pub context_tokens: Option<usize>,
     pub turn_tokens: Option<usize>,
-    /// Bumped on every change, so a renderer can tell whether its cached lines
-    /// are still current without comparing the units themselves.
+    /// Bumped when drawable transcript content changes.
     pub revision: u64,
+    /// Bumped alongside `revision` when only the streaming response tail changed.
+    /// A renderer can then preserve every completed entry before that tail.
+    pub tail_revision: u64,
+}
+
+impl ViewState {
+    pub fn push_unit(&mut self, unit: RenderUnit) {
+        self.units.push(unit);
+        self.changed();
+    }
+
+    fn changed(&mut self) {
+        self.revision += 1;
+    }
+
+    fn tail_changed(&mut self) {
+        self.revision += 1;
+        self.tail_revision += 1;
+    }
 }
 
 pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow::Result<()> {
-    state.revision += 1;
-
     match event {
         AgentViewEvent::Startup {
             model,
@@ -182,6 +198,7 @@ pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow
                 model,
                 thinking_effort,
             });
+            state.changed();
             Ok(())
         }
         AgentViewEvent::TurnStart => {
@@ -199,6 +216,7 @@ pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow
             state.turn_in_progress = false;
             state.context_tokens = None;
             state.turn_tokens = None;
+            state.changed();
             Ok(())
         }
         AgentViewEvent::CommandFinished(_) => Ok(()),
@@ -206,7 +224,23 @@ pub fn reduce_view_event(state: &mut ViewState, event: AgentViewEvent) -> anyhow
             state.turn_in_progress = false;
             Ok(())
         }
-        event => parse_units(&mut vec![event], &mut state.units),
+        AgentViewEvent::TextDelta(delta) => {
+            if delta.is_empty() {
+                return Ok(());
+            }
+
+            parse_units(
+                &mut vec![AgentViewEvent::TextDelta(delta)],
+                &mut state.units,
+            )?;
+            state.tail_changed();
+            Ok(())
+        }
+        event => {
+            parse_units(&mut vec![event], &mut state.units)?;
+            state.changed();
+            Ok(())
+        }
     }
 }
 
@@ -647,6 +681,51 @@ mod view_event_tests {
         reduce_view_event(&mut state, AgentViewEvent::TurnStart).unwrap();
         assert_eq!(state.turn_tokens, None, "a new turn starts a fresh total");
         assert_eq!(state.context_tokens, Some(2_400));
+    }
+
+    #[test]
+    fn status_events_do_not_invalidate_the_transcript() {
+        let mut state = ViewState::default();
+
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TextDelta("streaming".to_owned()),
+        )
+        .unwrap();
+        let revision = state.revision;
+
+        reduce_view_event(&mut state, AgentViewEvent::TurnStart).unwrap();
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TokenUsage {
+                context: Some(2_400),
+                turn: Some(5_500),
+            },
+        )
+        .unwrap();
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TurnFinished { completed: false },
+        )
+        .unwrap();
+
+        assert_eq!(state.revision, revision);
+    }
+
+    #[test]
+    fn text_deltas_are_recorded_as_tail_only_changes() {
+        let mut state = ViewState::default();
+
+        reduce_view_event(&mut state, AgentViewEvent::TextDelta("one".to_owned())).unwrap();
+        reduce_view_event(&mut state, AgentViewEvent::TextDelta(" two".to_owned())).unwrap();
+
+        assert_eq!(state.revision, 2);
+        assert_eq!(state.tail_revision, 2);
+
+        reduce_view_event(&mut state, AgentViewEvent::Completed).unwrap();
+
+        assert_eq!(state.revision, 3);
+        assert_eq!(state.tail_revision, 2);
     }
 
     #[test]

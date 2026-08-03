@@ -34,23 +34,112 @@ const DONE_MARKER: &str = "❃ ";
 #[derive(Default)]
 pub struct Transcript {
     lines: Vec<Line<'static>>,
-    /// The state revision and width the lines were built from.
-    built_from: Option<(u64, usize)>,
+    built_from: Option<Build>,
+    /// The current streaming response inside `lines`, if there is one.
+    tail: Option<Tail>,
     /// First visible row. `None` follows the newest output.
     top: Option<usize>,
+    #[cfg(test)]
+    full_builds: usize,
+    #[cfg(test)]
+    tail_builds: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Build {
+    revision: u64,
+    tail_revision: u64,
+    units: usize,
+    width: usize,
+}
+
+impl Build {
+    fn new(state: &ViewState, width: usize) -> Self {
+        Self {
+            revision: state.revision,
+            tail_revision: state.tail_revision,
+            units: state.units.len(),
+            width,
+        }
+    }
+
+    fn only_tail_changed_since(self, previous: Self) -> bool {
+        let (Some(changes), Some(tail_changes)) = (
+            self.revision.checked_sub(previous.revision),
+            self.tail_revision.checked_sub(previous.tail_revision),
+        ) else {
+            return false;
+        };
+
+        changes > 0 && changes == tail_changes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tail {
+    unit: usize,
+    line: usize,
 }
 
 impl Transcript {
     /// Rebuilds the lines if the conversation or the width has changed.
     pub fn sync(&mut self, state: &ViewState, width: usize) {
-        let current = (state.revision, width);
+        let current = Build::new(state, width);
 
-        if self.built_from == Some(current) {
-            return;
+        if let Some(previous) = self.built_from {
+            if previous.revision == current.revision && previous.width == current.width {
+                return;
+            }
+
+            if previous.width == current.width
+                && current.only_tail_changed_since(previous)
+                && self.rebuild_tail(state, previous.units, width)
+            {
+                self.built_from = Some(current);
+
+                #[cfg(test)]
+                {
+                    self.tail_builds += 1;
+                }
+
+                return;
+            }
         }
 
-        self.lines = build(state, width);
+        (self.lines, self.tail) = build(state, width);
         self.built_from = Some(current);
+
+        #[cfg(test)]
+        {
+            self.full_builds += 1;
+        }
+    }
+
+    fn rebuild_tail(&mut self, state: &ViewState, previous_units: usize, width: usize) -> bool {
+        let Some((unit, RenderUnit::Text(text))) = state
+            .units
+            .len()
+            .checked_sub(1)
+            .and_then(|unit| state.units.get(unit).map(|entry| (unit, entry)))
+        else {
+            return false;
+        };
+        let line = if state.units.len() == previous_units {
+            let Some(tail) = self.tail.filter(|tail| tail.unit == unit) else {
+                return false;
+            };
+
+            self.lines.truncate(tail.line);
+            tail.line
+        } else if previous_units.checked_add(1) == Some(state.units.len()) && self.tail.is_none() {
+            self.lines.len()
+        } else {
+            return false;
+        };
+
+        append(&mut self.lines, response(&parse_markdown(text), width));
+        self.tail = Some(Tail { unit, line });
+        true
     }
 
     /// Observation points for tests; drawing goes through [`Self::visible`].
@@ -96,8 +185,9 @@ impl Transcript {
     }
 }
 
-fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
+fn build(state: &ViewState, width: usize) -> (Vec<Line<'static>>, Option<Tail>) {
     let mut lines = Vec::new();
+    let mut tail = None;
 
     if let Some(startup) = &state.startup {
         lines.extend(banner::render(
@@ -109,6 +199,12 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
     }
 
     for group in group_units(&state.units) {
+        let streamed = matches!(
+            &group,
+            RenderGroup::Unit(unit)
+                if matches!(unit, RenderUnit::Text(_))
+                    && state.units.last().is_some_and(|last| std::ptr::eq(*unit, last))
+        );
         let rendered = match group {
             RenderGroup::Tool(presentation) => tool::render(presentation, width),
             RenderGroup::Explore(run) => tool::render(&explore_presentation(&run), width),
@@ -140,20 +236,32 @@ fn build(state: &ViewState, width: usize) -> Vec<Line<'static>> {
                 RenderUnit::Tool(presentation) => tool::render(presentation, width),
             },
         };
+        let line = lines.len();
 
-        if rendered.is_empty() {
-            continue;
+        append(&mut lines, rendered);
+
+        if streamed {
+            tail = Some(Tail {
+                unit: state.units.len() - 1,
+                line,
+            });
         }
-
-        // One blank row between entries, as the old row gap gave them.
-        if !lines.is_empty() {
-            lines.push(Line::default());
-        }
-
-        lines.extend(rendered);
     }
 
-    lines
+    (lines, tail)
+}
+
+fn append(lines: &mut Vec<Line<'static>>, rendered: Vec<Line<'static>>) {
+    if rendered.is_empty() {
+        return;
+    }
+
+    // One blank row between entries, as the old row gap gave them.
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+
+    lines.extend(rendered);
 }
 
 const SEARCH_SOURCE_LIMIT: usize = 5;
@@ -295,8 +403,9 @@ fn response(blocks: &[crate::ui::markdown::MarkdownBlock], width: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::StartupInfo;
+    use crate::ui::{StartupInfo, reduce_view_event};
     use h_core::context::SearchSource;
+    use h_core::event::AgentViewEvent;
 
     fn state(units: Vec<RenderUnit>) -> ViewState {
         ViewState {
@@ -351,17 +460,33 @@ mod tests {
             }
             let idle = started.elapsed() / 100;
 
-            // Streaming: the conversation changes every frame.
+            state.push_unit(RenderUnit::Prompt("next prompt".to_owned()));
+            transcript.sync(&state, 100);
+
+            // Streaming: only the unfinished response tail changes.
+            let started = Instant::now();
+            for _ in 0..20 {
+                reduce_view_event(
+                    &mut state,
+                    AgentViewEvent::TextDelta("next chunk ".to_owned()),
+                )
+                .unwrap();
+                transcript.sync(&state, 100);
+                std::hint::black_box(transcript.visible(40));
+            }
+            let streaming = started.elapsed() / 20;
+
+            // A non-tail change still takes the conservative full path.
             let started = Instant::now();
             for _ in 0..20 {
                 state.revision += 1;
                 transcript.sync(&state, 100);
                 std::hint::black_box(transcript.visible(40));
             }
-            let changing = started.elapsed() / 20;
+            let full = started.elapsed() / 20;
 
             println!(
-                "PROBE n={count:<5} rebuild={rebuild:>10.2?}  idle frame={idle:>10.2?}  changing frame={changing:>10.2?}"
+                "PROBE n={count:<5} rebuild={rebuild:>10.2?}  idle={idle:>10.2?}  streaming={streaming:>10.2?}  full={full:>10.2?}"
             );
         }
     }
@@ -600,6 +725,65 @@ mod tests {
         state.revision += 1;
         transcript.sync(&state, 40);
         assert_ne!(transcript.built_from, built, "a change rebuilds");
+    }
+
+    #[test]
+    fn streaming_rebuilds_only_the_response_tail() {
+        let mut transcript = Transcript::default();
+        let mut state = state(vec![
+            RenderUnit::ParsedMarkdown(parse_markdown("old response")),
+            RenderUnit::Separator,
+            RenderUnit::Prompt("next prompt".to_owned()),
+        ]);
+
+        transcript.sync(&state, 40);
+        assert_eq!(transcript.full_builds, 1);
+
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TextDelta("streaming".to_owned()),
+        )
+        .unwrap();
+        transcript.sync(&state, 40);
+
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TextDelta(" response".to_owned()),
+        )
+        .unwrap();
+        transcript.sync(&state, 40);
+
+        assert_eq!(transcript.full_builds, 1);
+        assert_eq!(transcript.tail_builds, 2);
+        assert_eq!(
+            texts(transcript.visible(10)).last().unwrap(),
+            "❋ streaming response"
+        );
+
+        reduce_view_event(&mut state, AgentViewEvent::Completed).unwrap();
+        transcript.sync(&state, 40);
+
+        assert_eq!(transcript.full_builds, 2, "completion freezes the response");
+    }
+
+    #[test]
+    fn token_usage_reuses_the_cached_lines() {
+        let mut transcript = Transcript::default();
+        let mut state = state(prompts(1));
+
+        transcript.sync(&state, 40);
+        reduce_view_event(
+            &mut state,
+            AgentViewEvent::TokenUsage {
+                context: Some(12_000),
+                turn: Some(800),
+            },
+        )
+        .unwrap();
+        transcript.sync(&state, 40);
+
+        assert_eq!(transcript.full_builds, 1);
+        assert_eq!(transcript.tail_builds, 0);
     }
 
     #[test]
